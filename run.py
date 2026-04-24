@@ -79,40 +79,31 @@ from utils import (
 )
 
 # v210: ContextAwarePPOAgent helpers
-
-def process_action(raw_action, action_space):
-    """Squeeze batch dim, remap throttle [-1,1]->>[0,1], clip to bounds.
-
-    FIX: previously this lived outside the `for step in range(num_steps):`
-    loop due to mis-indentation, so it only executed on the LAST action of
-    each rollout. It must be called inside the loop, once per step.
-
-    Args:
-        raw_action: numpy array from agent.get_action_and_value(), may have
-                    leading batch dim of size 1.
-        action_space: env.action_space (Box or Discrete)
-
-    Returns:
-        Clipped float32 array for continuous spaces, or int for Discrete.
-    """
-    a = np.asarray(raw_action)
-    # Squeeze leading batch dims
+def process_action(rawaction, actionspace):
+    """Squeeze batch dim; for Discrete → argmax-then-clamp; for Box → clip."""
+    a = np.asarray(rawaction)
     while a.ndim > 1 and a.shape[0] == 1:
         a = a[0]
 
-    if hasattr(action_space, "low") and hasattr(action_space, "high"):
-        act_dim = action_space.shape[0]
+    if isinstance(actionspace, gym.spaces.Discrete):
+        # a might be logits (shape [n]) or a scalar index
+        if a.ndim >= 1 and a.size == actionspace.n:
+            # logits → pick best action
+            idx = int(np.argmax(a))
+        else:
+            # already a scalar index — just clamp it
+            idx = int(np.round(a.item() if hasattr(a, 'item') else float(a)))
+        return int(np.clip(idx, 0, actionspace.n - 1))
+    else:
+        # Continuous Box
+        actdim = actionspace.shape[0]
         if a.ndim == 0:
             a = np.array([float(a)])
         a = a.copy().astype(np.float32)
-        # Remap throttle channel from tanh [-1,1] -> env [0,1]
-        if act_dim == 2 and a.size == 2:
+        if actdim >= 2 and a.size >= 2:
+            # remap throttle channel from tanh [-1,1] → env [0,1]
             a[1] = (a[1] + 1.0) / 2.0
-        return np.clip(a, action_space.low, action_space.high).astype(np.float32)
-    else:
-        # Discrete
-        return int(a.item()) if a.size == 1 else int(a.ravel()[0])
-
+        return np.clip(a, actionspace.low, actionspace.high).astype(np.float32)
 
 def compute_track_curvature(waypoints, closest, lookahead=5):
     """Return (curvature, safe_speed). Safe for empty/short waypoint lists."""
@@ -672,11 +663,9 @@ def run(hparams):
     ).to(DEVICE)
 
     # --- v19: TD3+SAC critic ensemble ---
-    td3sac = TD3SACEnsemble(
-        obs_dim=_obs_dim, act_dim=_act_dim, hidden=256,
-        gamma=hp.get("gamma", 0.99), tau=0.005,
-        lr=hp.get("lr", 3e-4), device=DEVICE,
-    )
+    td3sac = TD3SACEnsemble(obs_dim=obs_dim, act_dim=_act_dim_agent, hidden=256,
+                            gamma=hp.get('gamma', 0.99), tau=0.005, 
+                            lr=hp.get('lr', 3e-4), device=DEVICE,)
     _td3sac_update_freq = 4
     logger.info(f"v211: TD3+SAC init obs={_obs_dim} act={_act_dim}")
     
@@ -692,9 +681,19 @@ def run(hparams):
     )
     logger.info(f"Agents: main={agent.name} baseline={_ppo_baseline.name} random={_random_agent.name}")
     if os.path.exists(checkpoint_path):
-        agent = torch.load(checkpoint_path, map_location=DEVICE, weights_only=False)
-        agent = agent.to(DEVICE)
-        logger.info(f"v3: Loaded checkpoint from {checkpoint_path}")
+        try:
+            ckpt = torch.load(checkpoint_path, map_location=DEVICE)
+            if isinstance(ckpt, dict) and 'state_dict' in ckpt:
+                agent.load_state_dict(ckpt['state_dict'])
+                logger.info(f"v3 Loaded state_dict checkpoint from {checkpoint_path}")
+            else:
+                # Legacy: full-object pickle (old format)
+                agent = ckpt.to(DEVICE)
+                logger.info(f"v3 Loaded legacy object checkpoint from {checkpoint_path}")
+        except Exception as e:
+            logger.warning(f"Checkpoint load failed ({e}), training from scratch")
+    else:
+        logger.info("v3 No checkpoint found, training from scratch")
     # NaN guard: if checkpoint has NaN weights, reinit
     _nan_params = [n for n, p in agent.named_parameters() if p.isnan().any()]
     if _nan_params:
@@ -1003,26 +1002,35 @@ def run(hparams):
         rp = {}  # Fix: init rp before step loop to avoid UnboundLocalError
         _cwps = [0, 1]  # v27: init to avoid UnboundLocalError
         for step in range(num_steps):
+            _raw_action = None
+            _step_action = None
             global_step += 1
             obs[step] = next_obs
             dones[step] = next_done
-
+            
             with torch.no_grad():
-                                    action, logprob, _, value, ctx_logits, _intermed_pred = agent.get_action_and_value(
+                action, logprob, _, value, ctx_logits, _intermed_pred = agent.get_action_and_value(
                     next_obs.unsqueeze(0)
                 )
-            actions[step] = action
+            # v212 FIX: discrete agent returns shape [1] or [26]; must reduce to scalar for storage
+            if _is_discrete:
+                _action_idx = action.argmax(-1).squeeze() if action.ndim > 0 and action.shape[-1] > 1 else action.squeeze()
+                actions[step] = _action_idx.long()
+            else:
+                actions[step] = action.squeeze(0)  # remove batch dim for continuous [1, act_dim] -> [act_dim]
             logprobs[step] = logprob
             values[step] = value
 
 
             # v40: FIX action rescaling -- env expects throttle in [0,1] but tanh outputs [-1,1]
-            _raw_action = action.cpu().numpy()
             # v40.4: proper action post-processing
             #   (1) squeeze batch dim so shape is (action_dim,)
             #   (2) detect continuous vs discrete via action_space (runtime, not cached _act_dim)
             #   (3) remap throttle [-1,1] -> [0,1] when act_dim==2 (steering, throttle)
             #   (4) clip to action_space.low/high
+            '''
+                        
+            _raw_action = action.cpu().numpy()
             _raw_action = np.asarray(_raw_action)
             while _raw_action.ndim > 1 and _raw_action.shape[0] == 1:
                 _raw_action = _raw_action[0]
@@ -1037,6 +1045,11 @@ def run(hparams):
                 _step_action = np.clip(_raw_action, _as.low, _as.high).astype(np.float32)
             else:
                 _step_action = int(_raw_action.item()) if _raw_action.size == 1 else int(_raw_action.ravel()[0])
+            '''
+
+            # --- v213 FIX: use process_action for ALL action dispatch (discrete + continuous) ---
+            rawaction = action.cpu().numpy()          # ← must be BEFORE process_action call
+            _step_action = process_action(rawaction, env.action_space)
             # v40.2: removed duplicate env.step that used un-remapped action (caused 100% stuck episodes)
             # v40.3: comprehensive action dispatch telemetry for first 20 steps of each episode
             try:
@@ -1503,7 +1516,9 @@ def run(hparams):
             # v19: off-policy replay store
             try:
                 _nobs_t = next_obs.cpu() if isinstance(next_obs, torch.Tensor) else torch.tensor(obs_to_array(observation), dtype=torch.float32)
-                td3sac.store_transition(obs[step].cpu(), actions[step].cpu(), float(reward), _nobs_t, float(terminated or truncated))
+                # Store the continuous action tensor (what the critic sees), not the discretized env action
+                _td3_action = action.squeeze(0).detach().cpu()
+                td3sac.store_transition(obs[step], _td3_action, reward, next_obs, terminated or truncated)
             except Exception:
                 pass
             # context label: 0=straight, 1=left_curve, 2=right_curve
@@ -1934,14 +1949,22 @@ def run(hparams):
                             env.close()
                         except Exception:
                             pass
-                        env = make_environment(args.environment)
+                        env = _apply_phase_env(args, _phase)  # v212 FIX: respects current phase track/variant
                 else:
                     raise RuntimeError("mid-training env.reset() unrecoverable after 3 retries")
                 next_obs = tensor(obs_to_array(observation))
                 next_done = torch.zeros(1, device=DEVICE)
             if ep_progress > 10 and ep_return > best_return:  # v41: must have >10% progress to be best
                     best_return = ep_return
-                    torch.save(agent, f'{agent.name}_best.torch')
+                    torch.save({
+                        'state_dict': agent.state_dict(),
+                        'class': agent.__class__.__name__,
+                        '_obs_dim': _obs_dim,
+                        'actdim': _act_dim_agent,
+                    }, f"{agent.name}best.torch")
+
+                    # LOAD (line ~684)
+
                     pool.add_checkpoint(agent, ep_return, episode_count)  # v8
                     logger.info(f'New best model saved: return={best_return}')
 
@@ -2076,7 +2099,12 @@ def run(hparams):
 
         # periodic save
         if update % 10 == 0:
-            torch.save(agent, f'{agent.name}.torch')
+            torch.save({
+                'state_dict': agent.state_dict(),
+                'class': agent.__class__.__name__,
+                '_obs_dim': _obs_dim,
+                'actdim': _act_dim_agent,
+            }, f"{agent.name}best.torch")
             logger.info(
                 f'Update {update}/{num_updates}, '
                 f'step={global_step}, '
@@ -2086,7 +2114,12 @@ def run(hparams):
 
     pool.save_manifest()  # v8: persist pool
     # final save
-    torch.save(agent, f'{agent.name}.torch')
+    torch.save({
+            'state_dict': agent.state_dict(),
+            'class': agent.__class__.__name__,
+            '_obs_dim': _obs_dim,
+            'actdim': _act_dim_agent,
+        }, f"{agent.name}best.torch")
     sampler.save()  # v4: Final save of failure analysis
     # --- v201 guard: detect silent empty-episode / no-sim failure ---
     try:
