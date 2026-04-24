@@ -52,7 +52,9 @@ class StuckTracker:
                     data = json.load(f)
                 for wp_str, vals in data.items():
                     wp = int(wp_str)
-                    self.stats[wp] = StuckClusterStats(**vals)
+                    _valid_fields = {f.name for f in StuckClusterStats.__dataclass_fields__.values()}
+                    filtered = {k: v for k, v in vals.items() if k in _valid_fields}
+                    self.stats[wp] = StuckClusterStats(**filtered)
                 logger.info(f"[STUCK_TRACKER] Loaded {len(data)} clusters from {self.save_path}")
             except Exception as e:
                 logger.warning(f"[STUCK_TRACKER] Failed to load: {e}")
@@ -147,8 +149,9 @@ class StuckTracker:
             data[str(wp)] = {
                 "total_episodes": s.total_episodes,
                 "breakout_episodes": s.breakout_episodes,
-                "stuck_episodes": s.total_episodes - s.breakout_episodes,
-                "breakout_rate": round(s.breakout_rate, 4),
+                "stuck_steps": s.stuck_steps,        # ← was missing; breaks reload
+                "total_steps": s.total_steps,        # ← was missing; breaks reload
+                "cumulative_reward": s.cumulative_reward,
                 "avg_return": round(s.avg_return, 2),
                 "reward_boost_factor": round(s.reward_boost_factor, 3),
                 "entropy_boost": round(s.entropy_boost, 3),

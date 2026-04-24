@@ -98,7 +98,7 @@ class BrakeField:
                 self._in_field_count += 1
         return dict(
             brake_potential=phi,
-            in_brake_field=in_field,
+            in_brake_field=(in_field and is_braking),
             is_braking=is_braking,
         )
 

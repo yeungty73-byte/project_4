@@ -233,10 +233,12 @@ class ContextAwarePPOAgent(PPOAgent):
             action = dist.sample()
         else:
             # Ensure shape is (batch, act_dim) for continuous actions
-            if action.dim() == 1 and self.act_dim > 1:
-                action = action.unsqueeze(-1).expand(-1, self.act_dim)
-            elif action.dim() == 1 and self.act_dim == 1:
-                action = action.unsqueeze(-1)
+            if action.dim() == 1 and self.act_dim == 1:
+                action = action.unsqueeze(-1)          # (batch,) → (batch, 1)
+            elif action.dim() == 1 and self.act_dim > 1:
+                # action is (batch*act_dim,) flattened — reshape, don't expand
+                action = action.view(-1, self.act_dim)  # (batch, act_dim)
+            # if already 2D: pass through
         log_prob = dist.log_prob(action).sum(dim=-1)
         entropy = dist.entropy().sum(dim=-1)
         return action, log_prob, entropy, value.squeeze(-1), ctx_logits, intermed_pred

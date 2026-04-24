@@ -18,6 +18,7 @@ import numpy as np
 from typing import List
 from config_loader import CFG
 
+_DEFAULT_N_WP = CFG.get("track", {}).get("n_waypoints", 120)  # matches stuck_tracker NUM_WAYPOINTS
 
 # ================================================================
 #  SUCCESS metrics (what the grade depends on)
@@ -166,7 +167,7 @@ def compute_intermediary(steps: List[dict], n_waypoints: int = 100,
 
 
 def compute_all(steps: List[dict], final_progress: float,
-                n_waypoints: int = 100, track_width: float = 0.6) -> dict:
+                n_waypoints: int = _DEFAULT_N_WP, track_width: float = 0.6) -> dict:
     out = {}
     out.update(compute_success(steps, final_progress, track_width))
     out.update(compute_intermediary(steps, n_waypoints, track_width))
