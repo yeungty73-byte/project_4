@@ -1,4 +1,12 @@
+---
 WORLD_NAME: Vegas_track
 RACE_TYPE: TIME_TRIAL
 NUMBER_OF_OBSTACLES: 0
 NUMBER_OF_BOT_CARS: 0
+action_space_type: continuous
+steering_angle:
+  min: -30
+  max: 30
+speed:
+  min: 0.5
+  max: 4.0

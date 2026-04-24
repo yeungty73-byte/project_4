@@ -3,3 +3,10 @@ WORLD_NAME: reInvent2019_track
 RACE_TYPE: HEAD_TO_BOT
 NUMBER_OF_OBSTACLES: 0
 NUMBER_OF_BOT_CARS: 3
+action_space_type: continuous
+steering_angle:
+  min: -30
+  max: 30
+speed:
+  min: 0.5
+  max: 4.0
