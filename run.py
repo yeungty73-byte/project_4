@@ -2,7 +2,7 @@ import sys, os; sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(
 # REF: Balaji, B. et al. (2020). DeepRacer: Autonomous Racing Platform for Sim2Real RL. IEEE ICRA.
 # REF: Salazar, J. et al. (2024). Deep RL for Autonomous Driving in AWS DeepRacer. Information, 15(2).
 # REF: Samant, N. & Deshpande, A. (2020). How we broke into the top 1% of AWS DeepRacer. Building Fynd.
-import math
+import math, socket, hashlib
 import sys; sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.dirname(__import__('os').path.abspath(__file__))))
 import yaml
 import time
@@ -36,10 +36,6 @@ from corner_analysis import (
     LineOfSightReward,    # Garlick, J., & Middleditch, A. (2022)
     CornerAnalyzer,       # Yang, S. et al. (2023). COMPSAC
     OvertakeAnalyzer,     # Yang, S. et al. (2023). REUNS
-)
-from utils import (
-    BSTSTracker,          # AWS. (2020). DeepRacer log analysis
-    ReplayBuffer,         # Fujimoto, S. et al. (2018). ICML
 )
 from corner_analysis import (
     compute_braking_reward,
@@ -75,8 +71,10 @@ from td3_sac_ensemble import TD3SACEnsemble
 from utils import (
     device,
     set_seed,
-        BSTSLogger,
+    BSTSLogger,
     EpisodeMetricsAccumulator,
+    BSTSTracker,          # AWS. (2020). DeepRacer log analysis
+    ReplayBuffer,         # Fujimoto, S. et al. (2018). ICML
     make_environment,
 )
 
@@ -435,6 +433,122 @@ def _preflight_gym_bridge():
         print(f'[preflight v202] gym bridge {host}:{port} UNREACHABLE: {e}', flush=True); return False
 # --- end v202 preflight ---
 
+
+# ============================================================
+# v212: Embedded 9-Phase Orchestrator — yaml-aware
+# 3 tracks x 3 variants = 9 training phases
+# Each phase maps directly to an environment_params yaml file.
+# _apply_phase_env passes the CORRECT yaml path to make_environment,
+# so WORLD_NAME / RACE_TYPE / NUMBER_OF_OBSTACLES are always right.
+# ============================================================
+import itertools as _itertools, hashlib as _hashlib, socket as _socket
+
+# Canonical 3x3 phase identifiers
+TRACKS   = ["reinvent2019_wide", "reinvent2019_track", "vegas_track"]
+VARIANTS = ["time_trial", "obstacle", "h2h"]
+_ALL_PHASES = list(_itertools.product(TRACKS, VARIANTS))
+
+# Maps (track_key, variant_key) -> configs/ yaml filename
+# yaml filenames match what deepracer-gym starter code ships (plus the 6 new ones below)
+_PHASE_YAML_REGISTRY = {
+    ("reinvent2019_wide",  "time_trial"): "environment_params_tt_reinvent.yaml",
+    ("reinvent2019_wide",  "obstacle"):   "environment_params_oa.yaml",
+    ("reinvent2019_wide",  "h2h"):        "environment_params_h2h_reinvent.yaml",
+    ("reinvent2019_track", "time_trial"): "environment_params_tt_reinvent_track.yaml",
+    ("reinvent2019_track", "obstacle"):   "environment_params_oa_reinvent_track.yaml",
+    ("reinvent2019_track", "h2h"):        "environment_params_h2h_reinvent_track.yaml",
+    ("vegas_track",        "time_trial"): "environment_params_tt_vegas.yaml",
+    ("vegas_track",        "obstacle"):   "environment_params_oa_vegas.yaml",
+    ("vegas_track",        "h2h"):        "environment_params_h2h_vegas.yaml",
+}
+
+# Full env-param spec per phase (used as fallback if yaml doesn't exist)
+_PHASE_ENV_PARAMS = {
+    ("reinvent2019_wide",  "time_trial"): {"WORLD_NAME": "reInvent2019_wide",  "RACE_TYPE": "TIME_TRIAL",       "NUMBER_OF_OBSTACLES": 0, "NUMBER_OF_BOT_CARS": 0},
+    ("reinvent2019_wide",  "obstacle"):   {"WORLD_NAME": "reInvent2019_wide",  "RACE_TYPE": "OBJECT_AVOIDANCE", "NUMBER_OF_OBSTACLES": 6, "NUMBER_OF_BOT_CARS": 0},
+    ("reinvent2019_wide",  "h2h"):        {"WORLD_NAME": "reInvent2019_wide",  "RACE_TYPE": "HEAD_TO_BOT",      "NUMBER_OF_OBSTACLES": 0, "NUMBER_OF_BOT_CARS": 3},
+    ("reinvent2019_track", "time_trial"): {"WORLD_NAME": "reInvent2019_track", "RACE_TYPE": "TIME_TRIAL",       "NUMBER_OF_OBSTACLES": 0, "NUMBER_OF_BOT_CARS": 0},
+    ("reinvent2019_track", "obstacle"):   {"WORLD_NAME": "reInvent2019_track", "RACE_TYPE": "OBJECT_AVOIDANCE", "NUMBER_OF_OBSTACLES": 6, "NUMBER_OF_BOT_CARS": 0},
+    ("reinvent2019_track", "h2h"):        {"WORLD_NAME": "reInvent2019_track", "RACE_TYPE": "HEAD_TO_BOT",      "NUMBER_OF_OBSTACLES": 0, "NUMBER_OF_BOT_CARS": 3},
+    ("vegas_track",        "time_trial"): {"WORLD_NAME": "Vegas_track",        "RACE_TYPE": "TIME_TRIAL",       "NUMBER_OF_OBSTACLES": 0, "NUMBER_OF_BOT_CARS": 0},
+    ("vegas_track",        "obstacle"):   {"WORLD_NAME": "Vegas_track",        "RACE_TYPE": "OBJECT_AVOIDANCE", "NUMBER_OF_OBSTACLES": 6, "NUMBER_OF_BOT_CARS": 0},
+    ("vegas_track",        "h2h"):        {"WORLD_NAME": "Vegas_track",        "RACE_TYPE": "HEAD_TO_BOT",      "NUMBER_OF_OBSTACLES": 0, "NUMBER_OF_BOT_CARS": 3},
+}
+
+
+def _resolve_phase_yaml(track, variant, configs_dir="configs"):
+    """Return absolute path to the yaml for this phase.
+    If the file doesn't exist, write it from _PHASE_ENV_PARAMS so training never stalls.
+    """
+    fname = _PHASE_YAML_REGISTRY.get((track, variant))
+    if fname is None:
+        raise KeyError(f"[ORCH] No yaml registered for ({track}, {variant})")
+    path = os.path.join(configs_dir, fname)
+    if not os.path.exists(path):
+        # Auto-generate missing yaml from the spec table
+        params = _PHASE_ENV_PARAMS[(track, variant)]
+        os.makedirs(configs_dir, exist_ok=True)
+        with open(path, "w") as _f:
+            _f.write("---\n")
+            for k, v in params.items():
+                _f.write(f"{k}: {v}\n")
+        logger.warning(f"[ORCH] Auto-generated missing yaml: {path}")
+    return path
+
+
+def _build_phase_schedule(total_timesteps, cluster_ids=None):
+    """Return ordered list of phase dicts for this node.
+    Single-cluster (laptop): all 9 phases, equal timestep budget, round-robin.
+    Multi-cluster (PACE-ICE): each node gets a permuted ordering via hostname hash.
+    Delegates to cluster_orchestrator.get_phase_assignment() if importable.
+    """
+    my_host  = _socket.gethostname()
+    my_hash  = int(_hashlib.md5(my_host.encode()).hexdigest(), 16)
+    n_phases = len(_ALL_PHASES)
+    phase_ts = total_timesteps // n_phases
+
+    if cluster_ids and len(cluster_ids) > 1:
+        try:
+            from cluster_orchestrator import get_phase_assignment
+            phases = get_phase_assignment(my_host, _ALL_PHASES, cluster_ids)
+            logger.info(f"[ORCH] Multi-cluster: {len(cluster_ids)} nodes, "
+                        f"{len(phases)} phases delegated to {my_host}")
+        except ImportError:
+            offset = my_hash % n_phases
+            order  = list(range(n_phases))
+            order  = order[offset:] + order[:offset]
+            phases = [_ALL_PHASES[i] for i in order]
+            logger.info(f"[ORCH] Multi-cluster fallback permute offset={offset}")
+    else:
+        phases = list(_ALL_PHASES)
+        logger.info(f"[ORCH] Single-cluster: {n_phases} phases x {phase_ts} steps, host={my_host}")
+
+    return [
+        {
+            "track":    t,
+            "variant":  v,
+            "timesteps": phase_ts,
+            "phase_id": f"{t}__{v}",
+            "index":    i,
+            "yaml_path": _resolve_phase_yaml(t, v),
+        }
+        for i, (t, v) in enumerate(phases)
+    ]
+
+
+def _apply_phase_env(args, phase, current_env=None):
+    """Close current env, load the phase's yaml, return fresh env.
+    Passes the yaml PATH (not args.environment) so WORLD_NAME/RACE_TYPE are correct.
+    """
+    yaml_path = phase.get("yaml_path") or _resolve_phase_yaml(phase["track"], phase["variant"])
+    logger.info(f"[ORCH] Phase {phase['index']+1}/9: {phase['phase_id']}  yaml={yaml_path}")
+    if current_env is not None:
+        try:
+            current_env.close()
+        except Exception:
+            pass
+    return make_environment(yaml_path)
+
 def run(hparams):
     # v203: allow bypass when GYM_BRIDGE_OPTIONAL=1 (Ed #586 local-loop mode)
     # v205: auto-bootstrap deepracer container
@@ -492,13 +606,19 @@ def run(hparams):
     )
 
     set_seed(args.seed)
-    # v26: Diversify seed per node to avoid identical runs across sessions
-    import socket, hashlib
     _host_hash = int(hashlib.md5(socket.gethostname().encode()).hexdigest(), 16) % 10000
     args.seed = args.seed + _host_hash
     set_seed(args.seed)
     logger.info(f"Diversified seed: {args.seed} (host_offset={_host_hash})")
-    env = make_environment(args.environment)
+    # --- v211: 9-phase orchestrator bootstrap ---
+    _cluster_ids = [c.strip() for c in os.environ.get("CLUSTER_IDS", "").split(",") if c.strip()]
+    _phase_schedule = _build_phase_schedule(args.total_timesteps, _cluster_ids or None)
+    logger.info(f"[ORCH] Schedule ({len(_phase_schedule)} phases): {[p['phase_id'] for p in _phase_schedule]}")
+    _current_phase_idx = 0
+    _phase = _phase_schedule[0]
+    env = _apply_phase_env(args, _phase)
+    _phase_steps_remaining = _phase["timesteps"]
+    
     logger.info(f"action_space type: {type(env.action_space).__name__}")
     logger.info(f"action_space: {env.action_space}")
     logger.info(f"has .n: {hasattr(env.action_space, 'n')}, .n={getattr(env.action_space, 'n', None)}")
@@ -506,32 +626,35 @@ def run(hparams):
     # --- v6: stuck tracker ---
     stuck_tracker = StuckTracker(save_path=os.path.join("runs", run_name, "stuck_stats.json"))
 
-    # PPO agent
-    _obs_dim = env.observation_space.shape[0] if hasattr(env, "observation_space") else 64 # 38400
-    _act_dim_agent = (
-        getattr(env.action_space, "n", None)
-        or env.action_space.shape[0]
-    )
+    # --- v211: ALL dims resolved BEFORE any agent instantiation ---
+    _obs_dim = env.observation_space.shape[0] if hasattr(env, "observation_space") else 64
+    _is_discrete = isinstance(env.action_space, gym.spaces.Discrete)
+    if _is_discrete:
+        _act_dim       = 1
+        _act_n         = int(env.action_space.n)
+        _act_dim_agent = _act_n   # ContextAwarePPOAgent discrete head = n logits
+    else:
+        _act_dim       = env.action_space.shape[0]
+        _act_n         = None
+        _act_dim_agent = _act_dim
+    logger.info(f"v211 dims: obs={_obs_dim}  discrete={_is_discrete}  act_dim={_act_dim}  act_n={_act_n}")
+
+    # PPO agent — safe: _obs_dim defined above
     agent = ContextAwarePPOAgent(
         obs_dim=_obs_dim,
         act_dim=_act_dim_agent,
         name="ctx_ppo_agent",
     ).to(DEVICE)
-    # --- v19: TD3+SAC critic ensemble ---
-    _is_discrete = isinstance(env.action_space, gym.spaces.Discrete)
-    if _is_discrete:
-        _act_dim = 1
-        _act_n = int(env.action_space.n)
-        actions = torch.zeros((num_steps,), dtype=torch.long).to(DEVICE)
-    else:
-        _act_dim = env.action_space.shape[0]
-        _act_n = None
-        actions = torch.zeros((num_steps, _act_dim), dtype=torch.float32).to(DEVICE)
-    td3sac = TD3SACEnsemble(obs_dim=_obs_dim, act_dim=_act_dim, hidden=256,
-        gamma=hp.get("gamma", 0.99), tau=0.005, lr=hp.get("lr", 3e-4), device=DEVICE)
-    _td3sac_update_freq = 4
-    logger.info(f"v19: TD3+SAC ensemble init (obs={_obs_dim}, act={_act_dim})")
 
+    # --- v19: TD3+SAC critic ensemble ---
+    td3sac = TD3SACEnsemble(
+        obs_dim=_obs_dim, act_dim=_act_dim, hidden=256,
+        gamma=hp.get("gamma", 0.99), tau=0.005,
+        lr=hp.get("lr", 3e-4), device=DEVICE,
+    )
+    _td3sac_update_freq = 4
+    logger.info(f"v211: TD3+SAC init obs={_obs_dim} act={_act_dim}")
+    
     # --- v4: Load checkpoint if available ---
     checkpoint_path = os.environ.get("CHECKPOINT", "ppo_agent_best.torch")
     # RandomAgent: baseline reference - not used for training actions
@@ -764,7 +887,12 @@ def run(hparams):
     obs_shape = _init_obs.shape if hasattr(_init_obs, "shape") else (len(_init_obs),)
     # rollout storage
     obs = zeros((num_steps,) + obs_shape)
-    actions = torch.zeros((num_steps, _act_dim), dtype=torch.float32).to(DEVICE) if _act_dim > 1 else torch.zeros((num_steps,), dtype=torch.float32).to(DEVICE)  # V34
+    # v211: correct dtype+shape — discrete needs long, continuous needs float32
+    if _is_discrete:
+        actions = torch.zeros((num_steps,), dtype=torch.long).to(DEVICE)
+    else:
+        actions = torch.zeros((num_steps, _act_dim), dtype=torch.float32).to(DEVICE)
+
     logprobs = zeros((num_steps,))
     rewards = zeros((num_steps,))
     dones = zeros((num_steps,))
@@ -785,6 +913,18 @@ def run(hparams):
     ep_return = float('-inf')
 
     for update in range(1, num_updates + 1):
+        # --- v211: phase advance ---
+        _phase_steps_remaining -= num_steps
+        if _phase_steps_remaining <= 0 and _current_phase_idx < len(_phase_schedule) - 1:
+            _current_phase_idx += 1
+            _phase = _phase_schedule[_current_phase_idx]
+            env = _apply_phase_env(args, _phase, current_env=env)
+            _phase_steps_remaining = _phase["timesteps"]
+            _track_name    = _phase["track"]
+            _track_variant = _phase["variant"]
+            observation, info = env.reset()
+            next_obs   = tensor(obs_to_array(observation))
+            next_done  = torch.zeros(1, device=DEVICE)
         # --- v4: Get annealed hyperparams ---
         hp = scheduler.get_hyperparams(global_step)
         # v16: BSTS trend-aware annealing adjustments
@@ -1800,7 +1940,7 @@ def run(hparams):
         # ---- PPO update ----
         b_obs = obs.reshape((-1,) + obs_shape)
         b_logprobs = logprobs.reshape(-1)
-        b_actions = actions.reshape(-1).long() if _is_discrete else actions  # V33: keep 2D for continuous
+        b_actions = actions.reshape(-1).long() if _is_discrete else actions  # V33: keep 2D for continuous; V211
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
