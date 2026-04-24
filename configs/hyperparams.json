@@ -1,0 +1,49 @@
+{
+  "algorithm": "PPO",
+  "lr": 0.0003,
+  "gamma": 0.99,
+  "gae_lambda": 0.95,
+  "clip_epsilon": 0.2,
+  "entropy_coef": 0.01,
+  "value_coef": 0.5,
+  "max_grad_norm": 0.5,
+  "ppo_epochs": 10,
+  "minibatch_size": 64,
+  "rollout_length": 2048,
+  "total_timesteps_part1": 500000,
+  "total_timesteps_part2": 300000,
+  "eval_interval": 5000,
+  "eval_episodes": 10,
+  "hidden_dim": 256,
+  "cnn_features": 128,
+  "frame_stack": 4,
+  "image_channels": 2,
+  "image_height": 120,
+  "image_width": 160,
+  "lidar_dim": 64,
+  "seed": 42,
+  "device": "auto",
+  "tracks_part1": [
+    "reInvent2019_wide",
+    "reInvent2019_track",
+    "Vegas_track"
+  ],
+  "track_schedule": {
+    "phase1_track": "reInvent2019_wide",
+    "phase1_steps": 200000,
+    "phase2_track": "reInvent2019_track",
+    "phase2_steps": 150000,
+    "phase3_track": "Vegas_track",
+    "phase3_steps": 150000
+  },
+  "obstacle_avoidance": {
+    "num_obstacles": 6,
+    "num_bot_cars": 0,
+    "init_from": "checkpoints/tt_best.pt"
+  },
+  "head_to_bot": {
+    "num_obstacles": 0,
+    "num_bot_cars": 3,
+    "init_from": "checkpoints/tt_best.pt"
+  }
+}

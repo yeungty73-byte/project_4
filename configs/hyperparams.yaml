@@ -1,0 +1,19 @@
+# PPO Hyperparameters — CS7642 Project 4
+# Derived from Schulman et al. (2017) + ICLR blog implementation details
+learning_rate: 0.0003          # Adam LR; anneal to 0 over training
+gamma: 0.999                   # High discount — laps are long (300+ steps)
+gae_lambda: 0.95               # GAE-λ for advantage estimation
+num_steps: 512                 # Rollout length per update
+num_minibatches: 4             # Minibatch count per update epoch
+update_epochs: 4               # PPO epochs per rollout
+clip_coef: 0.2                 # Surrogate clip ε
+clip_vloss: true               # Clip value loss
+ent_coef: 0.01                 # Entropy bonus
+vf_coef: 0.5                   # Value function loss weight
+max_grad_norm: 0.5             # Gradient clipping
+target_kl: 0.02                # Early stop KL threshold (per epoch)
+total_timesteps: 500000        # Total training steps
+anneal_lr: true                # Linear LR annealing
+norm_adv: true                 # Advantage normalization
+save_interval: 10              # Save checkpoint every N updates
+eval_interval: 50              # Evaluate every N updates

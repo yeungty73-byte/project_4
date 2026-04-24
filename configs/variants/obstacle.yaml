@@ -1,0 +1,4 @@
+NUMBER_OF_BOT_CARS: 0
+NUMBER_OF_OBSTACLES: 6
+RACE_TYPE: obstacle_avoidance
+WORLD_NAME: reInvent2019_wide

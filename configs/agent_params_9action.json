@@ -1,0 +1,46 @@
+{
+  "sensor": [
+    "front_facing_camera"
+  ],
+  "stereo": true,
+  "lidar": true,
+  "action_space_type": "discrete",
+  "action_space": [
+    {
+      "steering_angle": -30,
+      "speed": 0.4
+    },
+    {
+      "steering_angle": -30,
+      "speed": 0.6
+    },
+    {
+      "steering_angle": -15,
+      "speed": 0.6
+    },
+    {
+      "steering_angle": 0,
+      "speed": 0.4
+    },
+    {
+      "steering_angle": 0,
+      "speed": 0.6
+    },
+    {
+      "steering_angle": 0,
+      "speed": 0.8
+    },
+    {
+      "steering_angle": 15,
+      "speed": 0.6
+    },
+    {
+      "steering_angle": 30,
+      "speed": 0.4
+    },
+    {
+      "steering_angle": 30,
+      "speed": 0.6
+    }
+  ]
+}

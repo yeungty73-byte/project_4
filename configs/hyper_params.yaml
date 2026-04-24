@@ -1,0 +1,10 @@
+---
+# default hyper-parameters for your experiments.
+# these are just dummy variables as an example.
+seed:               42
+cpu_only:           false
+environment:        deepracer-v0
+experiment_name:    time_trial
+learning_rate:    3e-4
+total_timesteps:    100000
+gamma:              0.99
