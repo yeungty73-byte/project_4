@@ -12,6 +12,7 @@ import os
 import json
 import datetime
 import numpy as np
+import gymnasium as gym
 import harmonized_metrics as _hm
 from loguru import logger
 import subprocess
@@ -79,6 +80,103 @@ from utils import (
     make_environment,
 )
 
+# v210: ContextAwarePPOAgent helpers
+
+def process_action(raw_action, action_space):
+    """Squeeze batch dim, remap throttle [-1,1]->>[0,1], clip to bounds.
+
+    FIX: previously this lived outside the `for step in range(num_steps):`
+    loop due to mis-indentation, so it only executed on the LAST action of
+    each rollout. It must be called inside the loop, once per step.
+
+    Args:
+        raw_action: numpy array from agent.get_action_and_value(), may have
+                    leading batch dim of size 1.
+        action_space: env.action_space (Box or Discrete)
+
+    Returns:
+        Clipped float32 array for continuous spaces, or int for Discrete.
+    """
+    a = np.asarray(raw_action)
+    # Squeeze leading batch dims
+    while a.ndim > 1 and a.shape[0] == 1:
+        a = a[0]
+
+    if hasattr(action_space, "low") and hasattr(action_space, "high"):
+        act_dim = action_space.shape[0]
+        if a.ndim == 0:
+            a = np.array([float(a)])
+        a = a.copy().astype(np.float32)
+        # Remap throttle channel from tanh [-1,1] -> env [0,1]
+        if act_dim == 2 and a.size == 2:
+            a[1] = (a[1] + 1.0) / 2.0
+        return np.clip(a, action_space.low, action_space.high).astype(np.float32)
+    else:
+        # Discrete
+        return int(a.item()) if a.size == 1 else int(a.ravel()[0])
+
+
+def compute_track_curvature(waypoints, closest, lookahead=5):
+    """Return (curvature, safe_speed). Safe for empty/short waypoint lists."""
+    if not waypoints or len(waypoints) < 3:
+        return 0.0, 4.0
+    n = len(waypoints)
+    idx = closest[1] if len(closest) > 1 else 0
+    p0 = waypoints[(idx - lookahead) % n]
+    p1 = waypoints[idx]
+    p2 = waypoints[(idx + lookahead) % n]
+    ax, ay = p0[0] - p1[0], p0[1] - p1[1]
+    bx, by = p2[0] - p1[0], p2[1] - p1[1]
+    cx, cy = p2[0] - p0[0], p2[1] - p0[1]
+    cross = abs(ax * by - ay * bx)
+    d01 = (ax**2 + ay**2)**0.5 + 1e-8
+    d12 = (bx**2 + by**2)**0.5 + 1e-8
+    d02 = (cx**2 + cy**2)**0.5 + 1e-8
+    curv = 2.0 * cross / (d01 * d12 * d02 + 1e-8)
+    safe_speed = min(4.0, max(1.0, 0.8 * (1.0 / (curv + 1e-6))**0.5))
+    return curv, safe_speed
+
+
+def compute_racing_line_offset(waypoints, closest, tw, lookahead=8):
+    """Return lateral offset from centerline for racing line (-0.7 to 0.7)."""
+    if not waypoints or len(waypoints) < 3:
+        return 0.0
+    n = len(waypoints)
+    idx = closest[1] if len(closest) > 1 else 0
+    p0 = waypoints[idx]
+    pa = waypoints[(idx + lookahead) % n]
+    pb = waypoints[(idx - 3) % n]
+    dx1, dy1 = p0[0] - pb[0], p0[1] - pb[1]
+    dx2, dy2 = pa[0] - p0[0], pa[1] - p0[1]
+    cross = dx1 * dy2 - dy1 * dx2
+    mag = (dx1**2 + dy1**2)**0.5 * (dx2**2 + dy2**2)**0.5 + 1e-8
+    return max(-0.7, min(0.7, -cross / mag * 3.0))
+
+
+def _compute_crash_v_perp(speed, heading, closest_wp, waypoints):
+    """Velocity component perpendicular to track tangent at closest waypoint."""
+    if not waypoints or not closest_wp or len(closest_wp) < 2:
+        return 0.0
+    try:
+        dx = waypoints[closest_wp[1]][0] - waypoints[closest_wp[0]][0]
+        dy = waypoints[closest_wp[1]][1] - waypoints[closest_wp[0]][1]
+        delta = math.radians(heading - math.degrees(math.atan2(dy, dx)))
+        return abs(speed * math.sin(delta))
+    except Exception:
+        return 0.0
+
+
+def _compute_crash_v_tang(speed, heading, closest_wp, waypoints):
+    """Velocity component tangent to track at closest waypoint."""
+    if not waypoints or not closest_wp or len(closest_wp) < 2:
+        return 0.0
+    try:
+        dx = waypoints[closest_wp[1]][0] - waypoints[closest_wp[0]][0]
+        dy = waypoints[closest_wp[1]][1] - waypoints[closest_wp[0]][1]
+        delta = math.radians(heading - math.degrees(math.atan2(dy, dx)))
+        return abs(speed * math.cos(delta))
+    except Exception:
+        return 0.0
 
 # v5: Track geometry helpers
 def compute_track_curvature(waypoints, closest, lookahead=5):
@@ -366,8 +464,6 @@ def run(hparams):
     args = munchify(final_hparams)
 
     # --- Track identification ---
-    _track_name = 'unknown'
-    _track_variant = 'regular'
     try:
         import os as _os; _base_dir = _os.path.dirname(_os.path.abspath(__file__)); _env_params_path = getattr(args, 'environment_params_path', _os.path.join(_base_dir, 'configs', 'environment_params.yaml'))
         with open(_env_params_path) as _ef:
@@ -379,7 +475,6 @@ def run(hparams):
                     _track_variant = _line.split(':',1)[1].strip().strip('"').strip("'").lower()
     except Exception as _e:
         print(f'Track ID error: {_e}')
-    hp = args  # alias for hyperparameter access
     hp = args  # alias for hyperparameter access
 
     run_name = (
@@ -404,24 +499,34 @@ def run(hparams):
     set_seed(args.seed)
     logger.info(f"Diversified seed: {args.seed} (host_offset={_host_hash})")
     env = make_environment(args.environment)
+    logger.info(f"action_space type: {type(env.action_space).__name__}")
+    logger.info(f"action_space: {env.action_space}")
+    logger.info(f"has .n: {hasattr(env.action_space, 'n')}, .n={getattr(env.action_space, 'n', None)}")
+    logger.info(f"has .low: {hasattr(env.action_space, 'low')}, shape={getattr(env.action_space, 'shape', None)}")
     # --- v6: stuck tracker ---
     stuck_tracker = StuckTracker(save_path=os.path.join("runs", run_name, "stuck_stats.json"))
 
     # PPO agent
+    _obs_dim = env.observation_space.shape[0] if hasattr(env, "observation_space") else 64 # 38400
+    _act_dim_agent = (
+        getattr(env.action_space, "n", None)
+        or env.action_space.shape[0]
+    )
     agent = ContextAwarePPOAgent(
-        act_dim=getattr(env.action_space, "n", None) or env.action_space.shape[0],
-        name='ctx_ppo_agent',
+        obs_dim=_obs_dim,
+        act_dim=_act_dim_agent,
+        name="ctx_ppo_agent",
     ).to(DEVICE)
     # --- v19: TD3+SAC critic ensemble ---
-    _obs_dim = env.observation_space.shape[0] if hasattr(env, "observation_space") else 64
-    import gymnasium as _gym_chk
-    _is_discrete = hasattr(env.action_space, "n") and getattr(env.action_space, "n", None) is not None
+    _is_discrete = isinstance(env.action_space, gym.spaces.Discrete)
     if _is_discrete:
         _act_dim = 1
         _act_n = int(env.action_space.n)
+        actions = torch.zeros((num_steps,), dtype=torch.long).to(DEVICE)
     else:
         _act_dim = env.action_space.shape[0]
         _act_n = None
+        actions = torch.zeros((num_steps, _act_dim), dtype=torch.float32).to(DEVICE)
     td3sac = TD3SACEnsemble(obs_dim=_obs_dim, act_dim=_act_dim, hidden=256,
         gamma=hp.get("gamma", 0.99), tau=0.005, lr=hp.get("lr", 3e-4), device=DEVICE)
     _td3sac_update_freq = 4
@@ -748,918 +853,931 @@ def run(hparams):
 
             # v40: FIX action rescaling -- env expects throttle in [0,1] but tanh outputs [-1,1]
             _raw_action = action.cpu().numpy()
-        # v40.4: proper action post-processing
-        #   (1) squeeze batch dim so shape is (action_dim,)
-        #   (2) detect continuous vs discrete via action_space (runtime, not cached _act_dim)
-        #   (3) remap throttle [-1,1] -> [0,1] when act_dim==2 (steering, throttle)
-        #   (4) clip to action_space.low/high
-        import numpy as _np
-        _raw_action = _np.asarray(_raw_action)
-        while _raw_action.ndim > 1 and _raw_action.shape[0] == 1:
-            _raw_action = _raw_action[0]
-        _as = env.action_space
-        if hasattr(_as, "low") and hasattr(_as, "high"):
-            _act_dim_rt = _as.shape[0]
-            if _raw_action.ndim == 0:
-                _raw_action = _np.array([float(_raw_action)])
-            if _act_dim_rt == 2 and _raw_action.size == 2:
-                _raw_action = _raw_action.copy().astype(_np.float32)
-                _raw_action[1] = (_raw_action[1] + 1.0) / 2.0
-            _step_action = _np.clip(_raw_action, _as.low, _as.high).astype(_np.float32)
-        else:
-            _step_action = int(_raw_action.item()) if _raw_action.size == 1 else int(_raw_action.ravel()[0])
-        # v40.2: removed duplicate env.step that used un-remapped action (caused 100% stuck episodes)
-        # v40.3: comprehensive action dispatch telemetry for first 20 steps of each episode
-        try:
-            _ep_step = int(ep_step_count) if 'ep_step_count' in dir() else global_step
-        except Exception:
-            _ep_step = global_step
-        if _ep_step < 20 or (global_step % 500 == 0):
+            # v40.4: proper action post-processing
+            #   (1) squeeze batch dim so shape is (action_dim,)
+            #   (2) detect continuous vs discrete via action_space (runtime, not cached _act_dim)
+            #   (3) remap throttle [-1,1] -> [0,1] when act_dim==2 (steering, throttle)
+            #   (4) clip to action_space.low/high
+            _raw_action = np.asarray(_raw_action)
+            while _raw_action.ndim > 1 and _raw_action.shape[0] == 1:
+                _raw_action = _raw_action[0]
+            _as = env.action_space
+            if hasattr(_as, "low") and hasattr(_as, "high"):
+                _act_dim_rt = _as.shape[0]
+                if _raw_action.ndim == 0:
+                    _raw_action = np.array([float(_raw_action)])
+                if _act_dim_rt == 2 and _raw_action.size == 2:
+                    _raw_action = _raw_action.copy().astype(np.float32)
+                    _raw_action[1] = (_raw_action[1] + 1.0) / 2.0
+                _step_action = np.clip(_raw_action, _as.low, _as.high).astype(np.float32)
+            else:
+                _step_action = int(_raw_action.item()) if _raw_action.size == 1 else int(_raw_action.ravel()[0])
+            # v40.2: removed duplicate env.step that used un-remapped action (caused 100% stuck episodes)
+            # v40.3: comprehensive action dispatch telemetry for first 20 steps of each episode
             try:
-                _as = env.action_space
-                _as_info = (f"Box[{_as.low.tolist()}..{_as.high.tolist()},shape={_as.shape}]" 
-                            if hasattr(_as,"low") else f"Discrete(n={getattr(_as,'n','?')})")
-                _sa_info = (f"type={type(_step_action).__name__} val={_step_action!r}")
-                _ra_info = (f"type={type(_raw_action).__name__} val={_raw_action!r}")
-                logger.info(f"[TELEMETRY gs={global_step} eps={_ep_step}] act_space={_as_info} raw={_ra_info} step={_sa_info}")
-            except Exception as _e:
-                logger.warning(f"[TELEMETRY fail] {_e}")
-        observation, reward, terminated, truncated, info = env.step(_step_action)
-        # logger.info(f"[TRUNCATE] ep_step={ep_step_count} >= 500, forcing truncation")
-        # Debug: log reward_params for first 3 steps
-        if global_step <= 3:
-            logger.info(f"[DEBUG] step={global_step} rp={info.get('reward_params', {})} ep_status={info.get('episode_status', None)}")
-        if global_step < 10 or global_step % 100 == 0: logger.info(f"step={global_step} reward={reward:.4f} terminated={terminated} truncated={truncated} info_keys={list(info.keys()) if info else None}")
-        # --- research: Line-of-Sight reward (Garlick & Middleditch, 2022) ---
-        if rp and info and isinstance(info, dict):
-            _v_perp_barrier = 0.0  # v39c: safe default before v_perp computed
-            _v_perp_safe = 999.0  # v39c: safe default (always passes guard)
-            _wps = rp.get("waypoints", [])
-            _cwps = rp.get("closest_waypoints", [0, 1])
-            _x = rp.get("x", 0.0)
-            _y = rp.get("y", 0.0)
-            _hdg = rp.get("heading", 0.0)
-            _spd = rp.get("speed", 0.0)
-            if _wps and len(_wps) > 1:
-                _los_r = _los.compute(_x, _y, _hdg, _wps, _cwps[0])
-                # v39: Un-muted LOS with brake-line guard
+                _ep_step = int(ep_step_count) if 'ep_step_count' in dir() else global_step
+            except Exception:
+                _ep_step = global_step
+            if _ep_step < 20 or (global_step % 500 == 0):
+                try:
+                    _as = env.action_space
+                    _as_info = (f"Box[{_as.low.tolist()}..{_as.high.tolist()},shape={_as.shape}]" 
+                                if hasattr(_as,"low") else f"Discrete(n={getattr(_as,'n','?')})")
+                    _sa_info = (f"type={type(_step_action).__name__} val={_step_action!r}")
+                    _ra_info = (f"type={type(_raw_action).__name__} val={_raw_action!r}")
+                    logger.debug(f"[TELEMETRY gs={global_step} eps={_ep_step}] act_space={_as_info} raw={_ra_info} step={_sa_info}")
+                except Exception as _e:
+                    logger.warning(f"[TELEMETRY fail] {_e}")
+            observation, reward, terminated, truncated, info = env.step(_step_action)
+            # logger.info(f"[TRUNCATE] ep_step={ep_step_count} >= 500, forcing truncation")
+            # Debug: log reward_params for first 3 steps
+            if global_step <= 3:
+                logger.info(f"[DEBUG] step={global_step} rp={info.get('reward_params', {})} ep_status={info.get('episode_status', None)}")
+            if global_step < 10 or global_step % 100 == 0: logger.info(f"step={global_step} reward={reward:.4f} terminated={terminated} truncated={truncated} info_keys={list(info.keys()) if info else None}")
+            # --- research: Line-of-Sight reward (Garlick & Middleditch, 2022) ---
+            if rp and info and isinstance(info, dict):
+                _v_perp_barrier = 0.0  # v39c: safe default before v_perp computed
+                _v_perp_safe = 999.0  # v39c: safe default (always passes guard)
+                _wps = rp.get("waypoints", [])
+                _cwps = rp.get("closest_waypoints", [0, 1])
+                _x = rp.get("x", 0.0)
+                _y = rp.get("y", 0.0)
+                _hdg = rp.get("heading", 0.0)
+                _spd = rp.get("speed", 0.0)
+                if _wps and len(_wps) > 1:
+                    _los_r = _los.compute(_x, _y, _hdg, _wps, _cwps[0])
+                    # v39: Un-muted LOS with brake-line guard
+                    if _v_perp_barrier <= _v_perp_safe:
+                        reward += float(_los_r) * 0.15
+                # REF: BSTS overtake tracking (AWS, 2020)
+                # REF: Yang et al. (2023b) overtake reward for safe passing
+                if _overtake is not None:
+                    _bot_prog = rp.get("progress", 0.0)
+                    _ot_r = _overtake.compute(_bot_prog, 0.0, min(_lidar) if _lidar else 1.0)
+                    # v39: Un-muted overtake with brake-line guard
+                    if _v_perp_barrier <= _v_perp_safe:
+                        reward += 0.10 * float(_ot_r)
+                    # REF: Corner analyzer curvature-based speed reward (Coulom, 2002; Yang et al., 2023)
+                    _curv = curvature_radius(_wps, _cwps[0])
+                    _opt_spd = optimal_speed(_curv)
+                    _spd_err = abs(_spd - _opt_spd)
+                    # v39: Un-muted curv speed with brake-line guard
+                    if _v_perp_barrier <= _v_perp_safe:
+                        reward += max(0.0, 0.15 * (1.0 - _spd_err / max(_opt_spd, 0.1)))
+                # REF: Yang et al. (2023a) corner classification reward
+                _corner_cls_r = _corners.corner_reward(_spd, _curv)
+                # v39: Un-muted corner_cls_r with brake-line guard (was MUTED v25)
+                # REF: Tian et al. (2024) balanced reward for safer cornering
+                # REF: Ng, Harada & Russell (1999) potential-based shaping
                 if _v_perp_barrier <= _v_perp_safe:
-                    reward += float(_los_r) * 0.15
-            # REF: BSTS overtake tracking (AWS, 2020)
-            # REF: Yang et al. (2023b) overtake reward for safe passing
-            if _overtake is not None:
-                _bot_prog = rp.get("progress", 0.0)
-                _ot_r = _overtake.compute(_bot_prog, 0.0, min(_lidar) if _lidar else 1.0)
-                # v39: Un-muted overtake with brake-line guard
-                if _v_perp_barrier <= _v_perp_safe:
-                    reward += 0.10 * float(_ot_r)
-                # REF: Corner analyzer curvature-based speed reward (Coulom, 2002; Yang et al., 2023)
-                _curv = curvature_radius(_wps, _cwps[0])
-                _opt_spd = optimal_speed(_curv)
-                _spd_err = abs(_spd - _opt_spd)
-                # v39: Un-muted curv speed with brake-line guard
-                if _v_perp_barrier <= _v_perp_safe:
-                    reward += max(0.0, 0.15 * (1.0 - _spd_err / max(_opt_spd, 0.1)))
-            # REF: Yang et al. (2023a) corner classification reward
-            _corner_cls_r = _corners.corner_reward(_spd, _curv)
-            # v39: Un-muted corner_cls_r with brake-line guard (was MUTED v25)
-            # REF: Tian et al. (2024) balanced reward for safer cornering
-            # REF: Ng, Harada & Russell (1999) potential-based shaping
-            if _v_perp_barrier <= _v_perp_safe:
-                reward += 0.1 * _corner_cls_r
+                    reward += 0.1 * _corner_cls_r
 
-        # --- v4: Apply annealed reward weights ---
-        _decel_r = 0.0; _speed_steer_r = 0.0; _min_speed_r = 0.0; _racing_line_r = 0.0
-        _center_r = 0.0; _speed_r = 0.0; _steer_r = 0.0
-        _prog_r = 0.0; _eff_r = 0.0; _head_r = 0.0; _comp_r = 0.0
-        rp = info.get("reward_params", {})
-        # v23: diagnostic
-        if ep_step_count == 1 and global_step < 600:
-            logger.info(f"[REWARD_DIAG] rp keys={list(rp.keys())}, rp={rp}")
-        # v23: base progress reward
-        _prog = rp.get("progress", 0)
-        _offtrack = rp.get("is_offtrack", False)
-        _is_stuck = rp.get("is_stuck", False) if "is_stuck" in rp else False
-        _speed = rp.get("speed", 0.0)
-        _steer = abs(rp.get("steering_angle", 0))
-        _delta_prog = _prog - _prev_prog_tracker
-        if _delta_prog > 0:
-            reward += _delta_prog * 0.5
-        _prev_prog_tracker = _prog
-        # v23: alive bonus
-        # if not _offtrack and not _is_stuck:  # MUTED v25
-        # reward += 0.01  # MUTED v25
-        # v25: MUTED rigid speed incentive, replaced by racing-line-only
-        # v39: Re-enabled speed reward (was MUTED v25), now v_perp-aware
-        if _speed > 0.1: reward += min(_speed, 4.0) * 0.05  # v39: halved from 0.1
-        ep_step_count += 1  # v28: FIX missing increment
-        if rp:
-            _speed = rp.get("speed", 0)
-            # v4-bsts: barrier proximity from LIDAR and objects
-            _lidar = rp.get('lidar', [])
-            _lidar_min = min(_lidar) if _lidar else 1.0
-            _objects_dist = rp.get('objects_distance', [])
-            _nearest_obj = min(_objects_dist) if _objects_dist else 999.0
-            _track_width = rp.get('track_width', 0.6)
-            _dist_from_center = rp.get('distance_from_center', 0.0)
-            _barrier_proximity = max(0, 1.0 - (_lidar_min / max(_track_width, 0.1)))
-            _dist = rp.get("distance_from_center", 0)
-            _tw = rp.get("track_width", 1)
-            _steer = abs(rp.get("steering_angle", 0))
+            # --- v4: Apply annealed reward weights ---
+            _decel_r = 0.0; _speed_steer_r = 0.0; _min_speed_r = 0.0; _racing_line_r = 0.0
+            _center_r = 0.0; _speed_r = 0.0; _steer_r = 0.0
+            _prog_r = 0.0; _eff_r = 0.0; _head_r = 0.0; _comp_r = 0.0
+            rp = info.get("reward_params", {})
+            # v23: diagnostic
+            if ep_step_count == 1 and global_step < 600:
+                logger.info(f"[REWARD_DIAG] rp keys={list(rp.keys())}, rp={rp}")
+            # v23: base progress reward
             _prog = rp.get("progress", 0)
-            _steps = rp.get("steps", 1)
             _offtrack = rp.get("is_offtrack", False)
-            _aot = rp.get("all_wheels_on_track", True)
-            _heading = rp.get("heading", 0)
-            _waypoints = rp.get("waypoints", [])
-            # v16: lazy-init race engine with track waypoints
-            if _waypoints and race_engine is None:
-                race_engine = MultiRaceLineEngine(_waypoints)
-                logger.info(f"[V16] MultiRaceLineEngine initialized with {len(_waypoints)} waypoints")
+            _is_stuck = rp.get("is_stuck", False) if "is_stuck" in rp else False
+            _speed = rp.get("speed", 0.0)
+            _steer = abs(rp.get("steering_angle", 0))
+            _delta_prog = _prog - _prev_prog_tracker
+            if _delta_prog > 0:
+                reward += _delta_prog * 0.5
+            _prev_prog_tracker = _prog
+            # v23: alive bonus
+            # if not _offtrack and not _is_stuck:  # MUTED v25
+            # reward += 0.01  # MUTED v25
+            # v25: MUTED rigid speed incentive, replaced by racing-line-only
+            # v39: Re-enabled speed reward (was MUTED v25), now v_perp-aware
+            if _speed > 0.1: reward += min(_speed, 4.0) * 0.05  # v39: halved from 0.1
+            ep_step_count += 1  # v28: FIX missing increment
+            if rp:
+                _speed = rp.get("speed", 0)
+                # v4-bsts: barrier proximity from LIDAR and objects
+                _lidar = rp.get('lidar', [])
+                _lidar_min = min(_lidar) if _lidar else 1.0
+                _objects_dist = rp.get('objects_distance', [])
+                _nearest_obj = min(_objects_dist) if _objects_dist else 999.0
+                _track_width = rp.get('track_width', 0.6)
+                _dist_from_center = rp.get('distance_from_center', 0.0)
+                _barrier_proximity = max(0, 1.0 - (_lidar_min / max(_track_width, 0.1)))
+                _dist = rp.get("distance_from_center", 0)
+                _tw = rp.get("track_width", 1)
+                _steer = abs(rp.get("steering_angle", 0))
+                _prog = rp.get("progress", 0)
+                _steps = rp.get("steps", 1)
+                _offtrack = rp.get("is_offtrack", False)
+                _aot = rp.get("all_wheels_on_track", True)
+                _heading = rp.get("heading", 0)
+                _waypoints = rp.get("waypoints", [])
+                # v16: lazy-init race engine with track waypoints
+                if _waypoints and race_engine is None:
+                    race_engine = MultiRaceLineEngine(_waypoints)
+                    logger.info(f"[V16] MultiRaceLineEngine initialized with {len(_waypoints)} waypoints")
 
-            # === Build racing line map lazily on first step ===
-            # v39: Force track discovery before meaningful training
-            if _race_map is None and ep_step_count < 3 and _waypoints:
-                reward = 0.01  # minimal reward until track layout known
-            if _race_map is None and _waypoints and len(_waypoints) > 5:
-                _race_map = build_racing_line_map(_waypoints, _tw, v_max=4.0)
-                logger.info(f'[RACE_MAP] Built racing line map: {len(_race_map)} waypoints')
-            _closest = rp.get("closest_waypoints", [0, 1])
+                # === Build racing line map lazily on first step ===
+                # v39: Force track discovery before meaningful training
+                if _race_map is None and ep_step_count < 3 and _waypoints:
+                    reward = 0.01  # minimal reward until track layout known
+                if _race_map is None and _waypoints and len(_waypoints) > 5:
+                    _race_map = build_racing_line_map(_waypoints, _tw, v_max=4.0)
+                    logger.info(f'[RACE_MAP] Built racing line map: {len(_race_map)} waypoints')
+                _closest = rp.get("closest_waypoints", [0, 1])
 
-            # --- v5: Track geometry ---
-            _curvature, _safe_speed = compute_track_curvature(_waypoints, _closest)
-            # --- v6: lookahead curvature scan ---
-            _max_curv_ahead, _max_curv_wp, _safe_speed_ahead, _dist_to_corner = \
-                lookahead_curvature_scan(_waypoints, _closest, max_lookahead=15)
-            _brake_r = compute_braking_reward(_speed, _safe_speed_ahead, _dist_to_corner)
-            _turn_align_r = compute_turn_alignment_reward(_heading, _waypoints, _closest)
-            _approaching_stuck, _stuck_bonus, _stuck_wp = \
-                get_stuck_antecedent_bonus(stuck_tracker, _waypoints, _closest)
-            _speed_ratio = _speed / max(_safe_speed, 0.5)
-            _racing_line_offset = compute_racing_line_offset(_waypoints, _closest, _tw)
-            _optimal_dist = _racing_line_offset * (_tw / 2.0)
-            _actual_lateral = _dist_from_center * (1 if rp.get("is_left_of_center", False) else -1)
-            _racing_line_err = abs(_actual_lateral - _optimal_dist) / max(_tw / 2.0, 0.1)
-            _decel = ep_prev_speed - _speed if ep_prev_speed > 0 else 0.0
-            ep_prev_speed = _speed
-            # compute sub-rewards
-            _center_pct = _dist / (0.5 * _tw) if _tw > 0 else 0
-            _center_r = max(0, 1.0 - _center_pct)
-            # V12: REF: Curvature-aware Gaussian speed reward (Gonzalez2020)
-            _curv_abs = max(abs(_curvature), 1e-6)
-            _turn_radius = 1.0 / _curv_abs if _curvature != 0 else 100.0
-            _v_optimal = min(4.0, max(0.5, 1.2 * (_turn_radius ** 0.25)))  # v20 REF:Gonzalez2020
-            _speed_delta = _speed - _v_optimal
-            _speed_r = 5.0 * math.exp(-0.5 * (_speed_delta / 0.8) ** 2)
-            if _speed >= 0.8 * _v_optimal: _speed_r += 1.0  # anti-creep bonus
-            _steer_r = max(0, 1.0 - _steer / 30.0)
-            _prog_r = (_prog / 100.0) * 10.0
-            _eff = _prog / _steps if _steps > 0 else 0
-            _eff_r = min(_eff * 10.0, 1.0)
-
-            # heading reward
-            if _waypoints and len(_closest) >= 2:
-                _nwp = _waypoints[_closest[1]]
-                _pwp = _waypoints[_closest[0]]
-                _tdir = math.degrees(math.atan2(_nwp[1]-_pwp[1], _nwp[0]-_pwp[0]))
-                _ddiff = abs(_tdir - _heading)
-                if _ddiff > 180:
-                    _ddiff = 360 - _ddiff
-                _head_r = max(0, 1.0 - _ddiff / 30.0)
-            else:
-                _head_r = 0.0
-
-            # v5: deceleration smoothness (always computed)
-            _decel_r = max(0, 1.0 - max(0, _decel - 0.3) * 3.0)
-            # V13: Speed-steering harmony (REF: Gonzalez2020)
-            _steer_angle = abs(rp.get("steering_angle", 0))
-            # Reward low steering at high speed (smooth driving)
-            if _speed > 2.0 and _steer_angle < 10:
-                _speed_steer_r = 2.0  # smooth high-speed driving
-            elif _speed > 1.5 and _steer_angle < 15:
-                _speed_steer_r = 1.5
-            elif _steer_angle < 20:
-                _speed_steer_r = 1.0
-            else:
-                _speed_steer_r = 0.3  # still positive, just less
-            # V13: Speed maintenance reward (positive only)
-            if _speed >= 2.5:
-                _min_speed_r = 3.0 * (_speed / 4.0)  # scale up with speed
-            elif _speed >= 1.5:
-                _min_speed_r = 1.0 + (_speed - 1.5)
-            elif _speed >= 0.5:
-                _min_speed_r = 0.3
-            else:
-                _min_speed_r = 0.1  # still positive, just minimal
-            _racing_line_r = max(0, 1.0 - _racing_line_err)
-            # completion bonus
-            _comp_r = (100.0 + 50.0 * min(1.0, max(0, (sum(ep_speeds)/max(len(ep_speeds),1)) - 1.0) / 3.0)) if _prog >= 100.0 else (_prog / 100.0) * 5.0 * (1.0 + 0.5 * min(1.0, _speed / 3.0))
-
-            # === v13: Racing Line Proximity Reward (replaces penalty-based system) ===
-            if _race_map is not None and _waypoints:
-                _wp_idx = _closest[0] if len(_closest) > 0 else 0
-                _rl_reward = racing_line_reward(
-                    _race_map, _wp_idx, _speed, _dist_from_center,
-                    _heading, _tw, rp.get('is_left_of_center', False),
-                    _waypoints, _closest)
-                # Progress reward: pure positive, scales with completion
+                # --- v5: Track geometry ---
+                _curvature, _safe_speed = compute_track_curvature(_waypoints, _closest)
+                # --- v6: lookahead curvature scan ---
+                _max_curv_ahead, _max_curv_wp, _safe_speed_ahead, _dist_to_corner = \
+                    lookahead_curvature_scan(_waypoints, _closest, max_lookahead=15)
+                _brake_r = compute_braking_reward(_speed, _safe_speed_ahead, _dist_to_corner)
+                _turn_align_r = compute_turn_alignment_reward(_heading, _waypoints, _closest)
+                _approaching_stuck, _stuck_bonus, _stuck_wp = \
+                    get_stuck_antecedent_bonus(stuck_tracker, _waypoints, _closest)
+                _speed_ratio = _speed / max(_safe_speed, 0.5)
+                _racing_line_offset = compute_racing_line_offset(_waypoints, _closest, _tw)
+                _optimal_dist = _racing_line_offset * (_tw / 2.0)
+                _actual_lateral = _dist_from_center * (1 if rp.get("is_left_of_center", False) else -1)
+                _racing_line_err = abs(_actual_lateral - _optimal_dist) / max(_tw / 2.0, 0.1)
+                _decel = ep_prev_speed - _speed if ep_prev_speed > 0 else 0.0
+                ep_prev_speed = _speed
+                # compute sub-rewards
+                _center_pct = _dist / (0.5 * _tw) if _tw > 0 else 0
+                _center_r = max(0, 1.0 - _center_pct)
+                # V12: REF: Curvature-aware Gaussian speed reward (Gonzalez2020)
+                _curv_abs = max(abs(_curvature), 1e-6)
+                _turn_radius = 1.0 / _curv_abs if _curvature != 0 else 100.0
+                _v_optimal = min(4.0, max(0.5, 1.2 * (_turn_radius ** 0.25)))  # v20 REF:Gonzalez2020
+                _speed_delta = _speed - _v_optimal
+                _speed_r = 5.0 * math.exp(-0.5 * (_speed_delta / 0.8) ** 2)
+                if _speed >= 0.8 * _v_optimal: _speed_r += 1.0  # anti-creep bonus
+                _steer_r = max(0, 1.0 - _steer / 30.0)
                 _prog_r = (_prog / 100.0) * 10.0
-                # Completion bonus: massive reward for finishing
+                _eff = _prog / _steps if _steps > 0 else 0
+                _eff_r = min(_eff * 10.0, 1.0)
+
+                # heading reward
+                if _waypoints and len(_closest) >= 2:
+                    _nwp = _waypoints[_closest[1]]
+                    _pwp = _waypoints[_closest[0]]
+                    _tdir = math.degrees(math.atan2(_nwp[1]-_pwp[1], _nwp[0]-_pwp[0]))
+                    _ddiff = abs(_tdir - _heading)
+                    if _ddiff > 180:
+                        _ddiff = 360 - _ddiff
+                    _head_r = max(0, 1.0 - _ddiff / 30.0)
+                else:
+                    _head_r = 0.0
+
+                # v5: deceleration smoothness (always computed)
+                _decel_r = max(0, 1.0 - max(0, _decel - 0.3) * 3.0)
+                # V13: Speed-steering harmony (REF: Gonzalez2020)
+                _steer_angle = abs(rp.get("steering_angle", 0))
+                # Reward low steering at high speed (smooth driving)
+                if _speed > 2.0 and _steer_angle < 10:
+                    _speed_steer_r = 2.0  # smooth high-speed driving
+                elif _speed > 1.5 and _steer_angle < 15:
+                    _speed_steer_r = 1.5
+                elif _steer_angle < 20:
+                    _speed_steer_r = 1.0
+                else:
+                    _speed_steer_r = 0.3  # still positive, just less
+                # V13: Speed maintenance reward (positive only)
+                if _speed >= 2.5:
+                    _min_speed_r = 3.0 * (_speed / 4.0)  # scale up with speed
+                elif _speed >= 1.5:
+                    _min_speed_r = 1.0 + (_speed - 1.5)
+                elif _speed >= 0.5:
+                    _min_speed_r = 0.3
+                else:
+                    _min_speed_r = 0.1  # still positive, just minimal
+                _racing_line_r = max(0, 1.0 - _racing_line_err)
+                # completion bonus
                 _comp_r = (100.0 + 50.0 * min(1.0, max(0, (sum(ep_speeds)/max(len(ep_speeds),1)) - 1.0) / 3.0)) if _prog >= 100.0 else (_prog / 100.0) * 5.0 * (1.0 + 0.5 * min(1.0, _speed / 3.0))
-                # v20: Full sub-reward integration with _rl_blend annealing
-                # REF: Scott & Varian (2014) BSTS informs blend schedule
-                # REF: Gonzalez2020 curvature-aware speed reward integrated
-                _env_signal = (
-                    rw.get('curv_speed',0.12) * _speed_r      +
-                    rw.get('heading',   0.10) * _head_r       +
-                    rw.get('braking',   0.08) * _decel_r      +
-                    rw.get('min_speed', 0.10) * _min_speed_r  +
-                    rw.get('corner',    0.06) * _speed_steer_r+
-                    rw.get('racing_line',0.10)* _racing_line_r+
-                    rw.get('progress',  0.15) * _prog_r       +
-                    0.05 * _comp_r
-                )
-                shaped_reward = (1.0-_rl_blend)*_env_signal + _rl_blend*_rl_reward
-            else:
-                # Fallback: use env-signal without race map
-                _env_signal = (
-                    rw.get('curv_speed',0.12) * _speed_r      +
-                    rw.get('heading',   0.10) * _head_r       +
-                    rw.get('braking',   0.08) * _decel_r      +
-                    rw.get('min_speed', 0.10) * _min_speed_r  +
-                    rw.get('corner',    0.06) * _speed_steer_r+
-                    rw.get('racing_line',0.10)* _racing_line_r+
-                    rw.get('progress',  0.15) * _prog_r       +
-                    0.05 * _comp_r
-                )
-                shaped_reward = _env_signal  # v39: FIX use env_signal when no race_map (was _rl_reward which may be undefined)
+
+                # === v13: Racing Line Proximity Reward (replaces penalty-based system) ===
+                if _race_map is not None and _waypoints:
+                    _wp_idx = _closest[0] if len(_closest) > 0 else 0
+                    _rl_reward = racing_line_reward(
+                        _race_map, _wp_idx, _speed, _dist_from_center,
+                        _heading, _tw, rp.get('is_left_of_center', False),
+                        _waypoints, _closest)
+                    # Progress reward: pure positive, scales with completion
+                    _prog_r = (_prog / 100.0) * 10.0
+                    # Completion bonus: massive reward for finishing
+                    _comp_r = (100.0 + 50.0 * min(1.0, max(0, (sum(ep_speeds)/max(len(ep_speeds),1)) - 1.0) / 3.0)) if _prog >= 100.0 else (_prog / 100.0) * 5.0 * (1.0 + 0.5 * min(1.0, _speed / 3.0))
+                    # v20: Full sub-reward integration with _rl_blend annealing
+                    # REF: Scott & Varian (2014) BSTS informs blend schedule
+                    # REF: Gonzalez2020 curvature-aware speed reward integrated
+                    _env_signal = (
+                        rw.get('curv_speed',0.12) * _speed_r      +
+                        rw.get('heading',   0.10) * _head_r       +
+                        rw.get('braking',   0.08) * _decel_r      +
+                        rw.get('min_speed', 0.10) * _min_speed_r  +
+                        rw.get('corner',    0.06) * _speed_steer_r+
+                        rw.get('racing_line',0.10)* _racing_line_r+
+                        rw.get('progress',  0.15) * _prog_r       +
+                        0.05 * _comp_r
+                    )
+                    shaped_reward = (1.0-_rl_blend)*_env_signal + _rl_blend*_rl_reward
+                else:
+                    # Fallback: use env-signal without race map
+                    _env_signal = (
+                        rw.get('curv_speed',0.12) * _speed_r      +
+                        rw.get('heading',   0.10) * _head_r       +
+                        rw.get('braking',   0.08) * _decel_r      +
+                        rw.get('min_speed', 0.10) * _min_speed_r  +
+                        rw.get('corner',    0.06) * _speed_steer_r+
+                        rw.get('racing_line',0.10)* _racing_line_r+
+                        rw.get('progress',  0.15) * _prog_r       +
+                        0.05 * _comp_r
+                    )
+                    shaped_reward = _env_signal  # v39: FIX use env_signal when no race_map (was _rl_reward which may be undefined)
                     
-                                    # v40: Speed gate - harsh penalty for staying still
-                _speed_gate = max(0.1, min(1.0, (_speed - 0.3) / 1.2))
-                shaped_reward = shaped_reward * _speed_gate - 0.02
-            # Blend: mostly racing-line shaped, small env signal
-            # v18: BSTS-driven alpha mixing (race-line compliance vs env signal)
-            reward = (1.0 - _bsts_alpha) * reward + _bsts_alpha * shaped_reward  # v32: unclipped
-            # v18: wire stuck-antecedent bonus into reward
-            # v39: Un-muted _stuck_bonus (was MUTED v25)
-            if _approaching_stuck and _stuck_bonus > 0:
-                reward += _stuck_bonus  # reward agent for navigating historically-stuck waypoints
-                if _speed < 1.0 and _approaching_stuck:
-                    reward += 0.5  # extra bonus for cautious approach near stuck zones
-            # v19: SAC exploration bonus
-            try:
-                _sac_ex = td3sac.exploration_bonus(None, None, log_prob=None)
-                reward += float(_sac_ex) * 0.05
-            except Exception:
-                pass
-            # --- v6: adaptive reward + stuck tracking ---
-            _cur_wp = _closest[0] if len(_closest) > 0 else 0
-            anneal = stuck_tracker.get_annealing_params(_cur_wp)
-            _moved_fwd = _prog > stuck_tracker._prev_progress
-            # --- v38: incompatible-behavior reward (speed IS the reward floor) ---
-            try:
-                _d_prog = float(_prog) - float(stuck_tracker._prev_progress)
-                _spd = float(_speed) if _speed is not None else 0.0
-                # 1) Forward velocity bonus: speed * progress_delta (moving + progressing = best)
-                reward += 3.0 * _d_prog * max(_spd, 0.1)
-                # 2) Pure speed floor: ANY forward motion > standing still, always
-                #    This is the key anti-creep: reward = f(speed), so 0 speed = minimum reward
-                reward += 0.08 * min(_spd, 4.0)  # caps at 3 m/s to avoid pure speed hacking
-                # 3) Standing still is STRICTLY worst: explicit per-step cost for near-zero speed
-                #    Agent pays -0.08/step for creeping. At 200 steps/ep thats -16.0 ep_return.
-                #    But crashing at speed at least earns the speed bonus before dying.
-                if _spd < 0.15:
-                    reward -= 0.15  # creep tax: strictly worse than moving at any speed
-                # 4) Raceline compliance bonus when moving (reward the incompatible behavior)
-                if _spd > 0.3 and ep_dist_from_center:
-                    _ctr = abs(float(ep_dist_from_center[-1]))
-                    reward += 0.25 * max(0.0, 1.0 - _ctr / 0.5)  # on-line + moving = bonus  # v39: boosted from 0.06
-                # 5) Reverse is penalized but less than standing still
-                if _is_rev:
-                    reward -= 0.12
-            except Exception:
-                pass
-            _is_rev = rp.get('is_reversed', False)
-            # v39: offtrack grace period - don't count as stuck for first 10 offtrack steps
-            if _offtrack:
-                ep_offtrack_steps += 1
-            else:
-                ep_offtrack_steps = max(0, ep_offtrack_steps - 1)  # recover
-            _offtrack_stuck = _offtrack and ep_offtrack_steps > 10  # v39: grace period
-            _is_stuck = (_speed < 0.3) or _offtrack_stuck or _is_rev  # v39: uses grace
-            if anneal['reward_boost'] > 1.0:
-#                     # reward += (anneal['reward_boost'] - 1.0) * 0.2 * _prog_r  # MUTED v25
-                pass  # v25 muted
-            stuck_tracker.step_update(
-                wp_idx=_cur_wp, is_stuck=_is_stuck,
-                moved_forward=_moved_fwd, step_reward=reward,
-                speed=_speed, crashed=terminated,
-                reversed_flag=_is_rev, offtrack=_offtrack)
-            stuck_tracker._prev_progress = _prog
-            if _is_stuck and not terminated and not truncated:
-                _thresh = stuck_tracker.get_early_term_threshold(_cur_wp)
-                if ep_step_count > _thresh:
-                    truncated = True
-
-        # Hard max-step truncation fallback
-        if ep_step_count > 500 and not terminated and not truncated:
-            truncated = True
-            logger.info(f"[HARD_TRUNC] ep_step={ep_step_count} > 500")
-            ep_rewards_components["center"].append(_center_r)
-            ep_rewards_components["speed"].append(_speed_r)
-            ep_rewards_components["steering"].append(_steer_r)
-            ep_rewards_components["progress"].append(_prog_r)
-            ep_rewards_components["efficiency"].append(_eff_r)
-            ep_rewards_components["heading"].append(_head_r)
-            ep_rewards_components["braking"].append(_brake_r)
-            ep_rewards_components["turn_align"].append(_turn_align_r)
-            ep_speeds.append(_speed)
-            ep_headings.append(_heading)  # v26
-            ep_closest_wps.append(_cwps)  # v26
-            ep_dist_from_center.append(_dist)
-            try:  # v37 per-step
-                if ep_heading_diffs:
-                    ep_ang_vel_centerline.append(abs(float(ep_heading_diffs[-1])))
-            except Exception: pass
-            try:  # v37 jerk
-                _sp_now = float(info.get("speed", ep_speeds[-1] if ep_speeds else 0.0))
-                if ep_speed_prev is not None:
-                    ep_jerk_abs.append(abs(_sp_now - float(ep_speed_prev)))
-                ep_speed_prev = _sp_now
-            except Exception: pass
-            try:  # v37 brake compliance
-                if ep_barrier_proximities and float(ep_barrier_proximities[-1]) < 1.0 and ep_speed_prev is not None:
-                    _sp_now2 = float(info.get("speed", ep_speeds[-1] if ep_speeds else 0.0))
-                    _dec = float(ep_speed_prev) - _sp_now2
-                    if _dec > 0: ep_brake_before_barrier.append(_dec)
-            except Exception: pass
-            # v3-bsts per-step tracking
-            ep_heading_diffs.append(_ddiff if "_ddiff" in dir() else 0.0)
-            ep_steerings_raw.append(_steer)
-            # Collect step dict for extract_intermediary_metrics
-            try:
-                _step_info = info if isinstance(info, dict) else {}
-                _ep_step_log.append({
-                    'x': _step_info.get('x', _step_info.get('X', 0)),
-                    'y': _step_info.get('y', _step_info.get('Y', 0)),
-                    'heading': _step_info.get('heading', _step_info.get('yaw', 0)),
-                    'speed': _step_info.get('speed', ep_prev_speed),
-                    'steering_angle': float(action[0]) if hasattr(action, '__getitem__') else 0,
-                    'throttle': float(action[1]) if hasattr(action, '__getitem__') and len(action) > 1 else 0,
-                    'reward': float(reward),
-                    'all_wheels_on_track': _step_info.get('all_wheels_on_track', True),
-                'distance_from_center': _step_info.get('distance_from_center', rp.get('distance_from_center', 0.0)),
-                'closest_wp_idx': (rp.get('closest_waypoints', [0, 0])[1] if isinstance(rp.get('closest_waypoints', [0, 0]), (list, tuple)) and len(rp.get('closest_waypoints', [0, 0])) > 1 else -1),
-                })
-            except Exception:
-                pass
-            ep_positions.append((rp.get("x", 0.0), rp.get("y", 0.0)))
-            ep_progress_hist.append(_prog)
-            if (_offtrack or not _aot) and ep_first_offtrack_step is None:
-                ep_first_offtrack_step = ep_step_count
-            if rp.get("is_reversed", False):
-                ep_reversed_count += 1
-            if _speed < 0.01:
-                ep_zero_speed_count += 1
-            if _offtrack or not _aot:
-                ep_offtrack_count += 1
-
-            
-        # v13: On-track bonus (no penalties, only rewards)
-        rp_v7 = info.get("reward_params", {})
-        # v7: Speed bonus for staying on track
-        if rp_v7.get("speed", 0) > 2.0:
-            reward += 2.0 * min(rp_v7.get("speed", 0), 4.0)
-        cumulative_ep_reward += reward
-        # v4: context-aware step tracking
-        if hasattr(agent, 'get_context'):
-            _ctx = int(agent.get_context(tensor(observation).unsqueeze(0))[0])
-            ep_context_preds.append(_ctx)
-            ep_lidar_mins.append(_lidar_min)
-            ep_barrier_proximities.append(_barrier_proximity)
-            # v29: crash-antecedent kinematics
-            _accel = (_speed - ep_prev_speed) / 0.1  # m/s^2 (dt~0.1s)
-            import numpy as _np
-            _af = action.flatten() if hasattr(action, 'flatten') else (_np.array(action).flatten() if hasattr(action, '__iter__') else [action])
-            _act_steer = float(_af[0].item() if hasattr(_af[0], 'item') else float(_af[0]))
-            _act_throttle = float(_af[1].item() if hasattr(_af[1], "item") else float(_af[1])) if len(_af) > 1 else 0.0  # v32: throttle/brake command, negative=brake
-            _steer_rate = (abs(_act_steer) - ep_prev_steer) / 0.1
-            ep_prev_steer = abs(_act_steer)
-            # v_perp to barrier: component of velocity perpendicular to track tangent
-            _v_perp_barrier = _compute_crash_v_perp(_speed, _heading, _closest, _waypoints) if _waypoints else 0.0
-            _v_tang_barrier = _compute_crash_v_tang(_speed, _heading, _closest, _waypoints) if _waypoints else 0.0
-            _dist_barrier = _lidar_min * max(_track_width, 0.1)  # approx metres to wall
-            # stopping distance: d = v_perp^2 / (2*a_max) where a_max~3.0 m/s^2
-            _A_MAX_BRAKE = 3.0
-            _stop_dist = (_v_perp_barrier**2) / (2*_A_MAX_BRAKE + 1e-8)
-            _braking_intent = 1 if (_act_throttle < -0.1 or _accel < -0.5) else 0  # v32: agent brake OR physical decel  # did agent attempt to brake?
-            # v29: STOPPING-DISTANCE CALCULUS REWARD
-            # Reward agent for braking when stop_dist >= dist_to_barrier
-            # This teaches the agent to anticipate braking distance
-            if _dist_barrier < _stop_dist * 1.5 and _dist_barrier > 0.01:
-                # We need to brake! Reward deceleration, penalize acceleration
-                if _accel < -0.3:  # actively braking
-                    reward += 2.0 * min(abs(_accel)/3.0, 1.0)  # proportional to brake force
-                elif _accel < 0:  # coasting/light brake
-                    reward += 0.5
-                # Bonus for reducing v_perp toward 0
-                if len(ep_ante_buf) >= 2:
-                    _prev_vp = ep_ante_buf[-1].get('v_perp', _v_perp_barrier)
-                    if _v_perp_barrier < _prev_vp:  # v_perp decreasing
-                        reward += 1.5 * (_prev_vp - _v_perp_barrier)
-            elif _dist_barrier > _stop_dist * 2.0 and _v_perp_barrier < 0.3:
-                # Safe zone with low v_perp: reward maintaining speed
-                reward += 0.5 * min(_speed / 4.0, 1.0)
-            _ante_rec = {'step': ep_step_count, 'speed': _speed, 'accel': round(_accel,3),
-                'steer': abs(_act_steer), 'steer_rate': round(_steer_rate,3),
-                'v_perp': round(_v_perp_barrier,3), 'v_tang': round(_v_tang_barrier,3),
-                'stuck_antecedent': _approaching_stuck, 'stuck_bonus': round(_stuck_bonus,3), 'stuck_wp': _stuck_wp,  # v39: was dangling
-                'dist_barrier': round(_dist_barrier,3), 'stop_dist': round(_stop_dist,3),
-                'braking': _braking_intent, 'heading': round(_heading,1)}
-            ep_ante_buf.append(_ante_rec)
-            if len(ep_ante_buf) > _ANTE_WIN:
-                ep_ante_buf.pop(0)
-            if _objects_dist:
-                ep_nearest_objects.append(_nearest_obj)
-                ep_decel_penalties.append(_decel_r)
-                ep_safe_speed_ratios.append(_speed_ratio)
-                ep_racing_line_errors.append(_racing_line_err)
-                if _offtrack or _dist_from_center > 0.4 * _tw: ep_in_recovery = True
-                elif ep_in_recovery and _dist_from_center < 0.2 * _tw: ep_in_recovery = False
-                if ep_in_recovery: ep_recovery_steps += 1
-                if len(ep_heading_diffs)>=2 and abs(ep_heading_diffs[-1])>5.0 and abs(ep_heading_diffs[-2])<=5.0: ep_turn_entry_speeds.append(_speed_ratio)
-        # Track corner speeds (high heading diff = corner)
-            if len(ep_heading_diffs) > 0 and abs(ep_heading_diffs[-1]) > 5.0:
-                ep_corner_speeds.append(_speed)
-            # Track graze events (curb context but still on track)
-            if _ctx == 1 and not _offtrack:
-                ep_graze_count += 1
-            
-                    # --- v4: Record step for failure analysis ---
-        ep_metrics.record_step(rp)  # EpisodeMetricsAccumulator: v_perp braking analysis
-        sampler.record_step({
-                'x': rp.get('x', 0.0), 'y': rp.get('y', 0.0),
-                'heading': rp.get('heading', 0), 'speed': _speed,
-                'steering_angle': _steer, 'progress': _prog,
-                'closest_waypoints': _closest,
-                'is_offtrack': _offtrack, 'is_crashed': rp.get('is_crashed', False),
-                'is_reversed': rp.get('is_reversed', False),
-                'distance_from_center': _dist, 'track_width': _tw,
-                'action': action.cpu().numpy().item() if action.numel() == 1 else action.cpu().numpy(), 'reward': reward,
-                'center_r': _center_r, 'heading_r': _head_r,
-                'speed_r': _speed_r, 'step': global_step,
-                'context_pred': int(agent.get_context(tensor(observation).unsqueeze(0))[0]) if hasattr(agent, 'get_context') else -1,
-                'lidar_min': _lidar_min,
-                'nearest_object': _nearest_obj,
-                'barrier_proximity': _barrier_proximity,
-                'track_width': _track_width,
-                'dist_from_center': _dist_from_center,
-            })
-        # v16: BSTS seasonal per-step tracking
-        bsts_season.record_step(
-            progress=_prog,
-            speed=_speed,
-            steering=_steer,
-            heading_err=0.0,
-            raceline_err=0.0,
-            reward=reward,
-            context=obs[step].cpu().numpy() if hasattr(obs[step], "cpu") else obs[step],
-            action=action.cpu().numpy() if hasattr(action, "cpu") else action,
-            lidar_min=0.0,
-            wp_idx=_cur_wp if "_cur_wp" in dir() else 0,
-        )
-
-        _rl_blend = min(1.0, _rl_blend + _rl_blend_rate)
-        rewards[step] = tensor(np.array(reward))
-        # v19: off-policy replay store
-        try:
-            _nobs_t = next_obs.cpu() if isinstance(next_obs, torch.Tensor) else torch.tensor(obs_to_array(observation), dtype=torch.float32)
-            td3sac.store_transition(obs[step].cpu(), actions[step].cpu(), float(reward), _nobs_t, float(terminated or truncated))
-        except Exception:
-            pass
-        # context label: 0=straight, 1=left_curve, 2=right_curve
-        context_labels[step] = 0 if not rp or abs(_curvature) < 0.01 else (1 if _curvature > 0 else 2)
-
-        next_obs = tensor(obs_to_array(observation))
-        next_done = tensor(np.array(float(terminated or truncated)))
-
-        if terminated or truncated:
-            ep_return = cumulative_ep_reward
-            ep_length = ep_step_count
-            ep_progress = info.get("reward_params", {}).get("progress", 0.0)
-            lap_completed = 1.0 if ep_progress >= 100.0 else 0.0
-            lap_time_sec = time.time() - ep_start_time  # v24: wall-clock episode time
-            episode_count += 1
-            # --- v6: episode stuck update ---
-            _escaped = ep_progress > 20.0
-            if stuck_tracker._cur_stuck_cluster is not None:
-                _escaped = ep_progress > (stuck_tracker._cur_stuck_cluster / 120.0 * 100.0 + 15.0)
-            stuck_tracker.episode_update(
-                entry_wp=_closest[0] if len(_closest) > 0 else 0,
-                ep_return=ep_return, ep_progress=ep_progress,
-                escaped_stuck=_escaped)
-            if episode_count % 50 == 0:
+                                        # v40: Speed gate - harsh penalty for staying still
+                    _speed_gate = max(0.1, min(1.0, (_speed - 0.3) / 1.2))
+                    shaped_reward = shaped_reward * _speed_gate - 0.02
+                # Blend: mostly racing-line shaped, small env signal
+                # v18: BSTS-driven alpha mixing (race-line compliance vs env signal)
+                reward = (1.0 - _bsts_alpha) * reward + _bsts_alpha * shaped_reward  # v32: unclipped
+                # v18: wire stuck-antecedent bonus into reward
+                # v39: Un-muted _stuck_bonus (was MUTED v25)
+                if _approaching_stuck and _stuck_bonus > 0:
+                    reward += _stuck_bonus  # reward agent for navigating historically-stuck waypoints
+                    if _speed < 1.0 and _approaching_stuck:
+                        reward += 0.5  # extra bonus for cautious approach near stuck zones
+                # v19: SAC exploration bonus
                 try:
-                    stuck_tracker.print_report()
-                except Exception as e:
-                    logger.warning(f"print_report failed: {e}")
+                    _sac_ex = td3sac.exploration_bonus(None, None, log_prob=None)
+                    reward += float(_sac_ex) * 0.05
+                except Exception:
+                    pass
+                # --- v6: adaptive reward + stuck tracking ---
+                _cur_wp = _closest[0] if len(_closest) > 0 else 0
+                anneal = stuck_tracker.get_annealing_params(_cur_wp)
+                _moved_fwd = _prog > stuck_tracker._prev_progress
+                # --- v38: incompatible-behavior reward (speed IS the reward floor) ---
+                _is_rev = rp.get('is_reversed', False)
+                try:
+                    _d_prog = float(_prog) - float(stuck_tracker._prev_progress)
+                    _spd = float(_speed) if _speed is not None else 0.0
+                    # 1) Forward velocity bonus: speed * progress_delta (moving + progressing = best)
+                    reward += 3.0 * _d_prog * max(_spd, 0.1)
+                    # 2) Pure speed floor: ANY forward motion > standing still, always
+                    #    This is the key anti-creep: reward = f(speed), so 0 speed = minimum reward
+                    reward += 0.08 * min(_spd, 4.0)  # caps at 3 m/s to avoid pure speed hacking
+                    # 3) Standing still is STRICTLY worst: explicit per-step cost for near-zero speed
+                    #    Agent pays -0.08/step for creeping. At 200 steps/ep thats -16.0 ep_return.
+                    #    But crashing at speed at least earns the speed bonus before dying.
+                    if _spd < 0.15:
+                        reward -= 0.15  # creep tax: strictly worse than moving at any speed
+                    # 4) Raceline compliance bonus when moving (reward the incompatible behavior)
+                    if _spd > 0.3 and ep_dist_from_center:
+                        _ctr = abs(float(ep_dist_from_center[-1]))
+                        reward += 0.25 * max(0.0, 1.0 - _ctr / 0.5)  # on-line + moving = bonus  # v39: boosted from 0.06
+                    # 5) Reverse is penalized but less than standing still
+                    if _is_rev:
+                        reward -= 0.12
+                except Exception:
+                    pass
 
-                # v7: Save BSTS data
-                if hasattr(stuck_tracker, 'save_to_json'):
-                    try:
-                        stuck_tracker.save_to_json("results")
-                    except Exception as e:
-                        logger.warning(f"save_to_json failed: {e}")
-                
-                        # v4: End episode for failure analysis
-            term_reason = "crashed" if info.get("reward_params",{}).get("is_crashed",False) else ("offtrack" if info.get("reward_params",{}).get("is_offtrack",False) else ("completed" if ep_progress>=95 else "stuck")); sampler.end_episode(ep_progress, ep_return, ep_length, terminated_reason=term_reason)
+                # v39: offtrack grace period - don't count as stuck for first 10 offtrack steps
+                if _offtrack:
+                    ep_offtrack_steps += 1
+                else:
+                    ep_offtrack_steps = max(0, ep_offtrack_steps - 1)  # recover
+                _offtrack_stuck = _offtrack and ep_offtrack_steps > 10  # v39: grace period
+                _is_stuck = (_speed < 0.3) or _offtrack_stuck or _is_rev  # v39: uses grace
+                if anneal['reward_boost'] > 1.0:
+    #                     # reward += (anneal['reward_boost'] - 1.0) * 0.2 * _prog_r  # MUTED v25
+                    pass  # v25 muted
+                stuck_tracker.step_update(
+                    wp_idx=_cur_wp, is_stuck=_is_stuck,
+                    moved_forward=_moved_fwd, step_reward=reward,
+                    speed=_speed, crashed=terminated,
+                    reversed_flag=_is_rev, offtrack=_offtrack)
+                stuck_tracker._prev_progress = _prog
+                if _is_stuck and not terminated and not truncated:
+                    _thresh = stuck_tracker.get_early_term_threshold(_cur_wp)
+                    if ep_step_count > _thresh:
+                        truncated = True
 
-            # === BSTS AWS (2020)TheRayG (2020) ===
-            if _bsts is not None:
-                _bsts.record(ep_step_count*0.1, ep_return, term_reason)
-            if _bsts_log is not None:
-                _bsts_log.record(ep_step_count*0.1, ep_return, term_reason)
-            # EpisodeMetricsAccumulator: produce braking/speed summary
-            _ep_summary = ep_metrics.end_episode(
-                ep_progress, ep_return, ep_step_count,
-                terminated_reason=term_reason
+            # Hard max-step truncation fallback
+            if ep_step_count > 500 and not terminated and not truncated:
+                truncated = True
+                logger.info(f"[HARD_TRUNC] ep_step={ep_step_count} > 500")
+                ep_rewards_components["center"].append(_center_r)
+                ep_rewards_components["speed"].append(_speed_r)
+                ep_rewards_components["steering"].append(_steer_r)
+                ep_rewards_components["progress"].append(_prog_r)
+                ep_rewards_components["efficiency"].append(_eff_r)
+                ep_rewards_components["heading"].append(_head_r)
+                ep_rewards_components["braking"].append(_brake_r)
+                ep_rewards_components["turn_align"].append(_turn_align_r)
+                ep_speeds.append(_speed)
+                ep_headings.append(_heading)  # v26
+                ep_closest_wps.append(_cwps)  # v26
+                ep_dist_from_center.append(_dist)
+                try:  # v37 per-step
+                    if ep_heading_diffs:
+                        ep_ang_vel_centerline.append(abs(float(ep_heading_diffs[-1])))
+                except Exception: pass
+                try:  # v37 jerk
+                    _sp_now = float(info.get("speed", ep_speeds[-1] if ep_speeds else 0.0))
+                    if ep_speed_prev is not None:
+                        ep_jerk_abs.append(abs(_sp_now - float(ep_speed_prev)))
+                    ep_speed_prev = _sp_now
+                except Exception: pass
+                try:  # v37 brake compliance
+                    if ep_barrier_proximities and float(ep_barrier_proximities[-1]) < 1.0 and ep_speed_prev is not None:
+                        _sp_now2 = float(info.get("speed", ep_speeds[-1] if ep_speeds else 0.0))
+                        _dec = float(ep_speed_prev) - _sp_now2
+                        if _dec > 0: ep_brake_before_barrier.append(_dec)
+                except Exception: pass
+                # v3-bsts per-step tracking
+                ep_heading_diffs.append(_ddiff if "_ddiff" in dir() else 0.0)
+                ep_steerings_raw.append(_steer)
+                # Collect step dict for extract_intermediary_metrics
+                try:
+                    _step_info = info if isinstance(info, dict) else {}
+                    _ep_step_log.append({
+                        'x': _step_info.get('x', _step_info.get('X', 0)),
+                        'y': _step_info.get('y', _step_info.get('Y', 0)),
+                        'heading': _step_info.get('heading', _step_info.get('yaw', 0)),
+                        'speed': _step_info.get('speed', ep_prev_speed),
+                        'steering_angle': float(action[0]) if hasattr(action, '__getitem__') else 0,
+                        'throttle': float(action[1]) if hasattr(action, '__getitem__') and len(action) > 1 else 0,
+                        'reward': float(reward),
+                        'all_wheels_on_track': _step_info.get('all_wheels_on_track', True),
+                    'distance_from_center': _step_info.get('distance_from_center', rp.get('distance_from_center', 0.0)),
+                    'closest_wp_idx': (rp.get('closest_waypoints', [0, 0])[1] if isinstance(rp.get('closest_waypoints', [0, 0]), (list, tuple)) and len(rp.get('closest_waypoints', [0, 0])) > 1 else -1),
+                    })
+                except Exception:
+                    pass
+                ep_positions.append((rp.get("x", 0.0), rp.get("y", 0.0)))
+                ep_progress_hist.append(_prog)
+                if (_offtrack or not _aot) and ep_first_offtrack_step is None:
+                    ep_first_offtrack_step = ep_step_count
+                if rp.get("is_reversed", False):
+                    ep_reversed_count += 1
+                if _speed < 0.01:
+                    ep_zero_speed_count += 1
+                if _offtrack or not _aot:
+                    ep_offtrack_count += 1
+
+            
+            # v13: On-track bonus (no penalties, only rewards)
+            rp_v7 = info.get("reward_params", {})
+            # v7: Speed bonus for staying on track
+            if rp_v7.get("speed", 0) > 2.0:
+                reward += 2.0 * min(rp_v7.get("speed", 0), 4.0)
+            cumulative_ep_reward += reward
+            # v4: context-aware step tracking
+            if hasattr(agent, 'get_context'):
+                _ctx = int(agent.get_context(tensor(observation).unsqueeze(0))[0])
+                ep_context_preds.append(_ctx)
+                ep_lidar_mins.append(_lidar_min)
+                ep_barrier_proximities.append(_barrier_proximity)
+                # v29: crash-antecedent kinematics
+                _accel = (_speed - ep_prev_speed) / 0.1  # m/s^2 (dt~0.1s)
+                _af = action.flatten() if hasattr(action, 'flatten') else (np.array(action).flatten() if hasattr(action, '__iter__') else [action])
+                _act_steer = float(_af[0].item() if hasattr(_af[0], 'item') else float(_af[0]))
+                _act_throttle = float(_af[1].item() if hasattr(_af[1], "item") else float(_af[1])) if len(_af) > 1 else 0.0  # v32: throttle/brake command, negative=brake
+                _steer_rate = (abs(_act_steer) - ep_prev_steer) / 0.1
+                ep_prev_steer = abs(_act_steer)
+                # v_perp to barrier: component of velocity perpendicular to track tangent
+                _v_perp_barrier = _compute_crash_v_perp(_speed, _heading, _closest, _waypoints) if _waypoints else 0.0
+                _v_tang_barrier = _compute_crash_v_tang(_speed, _heading, _closest, _waypoints) if _waypoints else 0.0
+                _dist_barrier = _lidar_min * max(_track_width, 0.1)  # approx metres to wall
+                # stopping distance: d = v_perp^2 / (2*a_max) where a_max~3.0 m/s^2
+                _A_MAX_BRAKE = 3.0
+                _stop_dist = (_v_perp_barrier**2) / (2*_A_MAX_BRAKE + 1e-8)
+                _braking_intent = 1 if (_act_throttle < -0.1 or _accel < -0.5) else 0  # v32: agent brake OR physical decel  # did agent attempt to brake?
+                # v29: STOPPING-DISTANCE CALCULUS REWARD
+                # Reward agent for braking when stop_dist >= dist_to_barrier
+                # This teaches the agent to anticipate braking distance
+                if _dist_barrier < _stop_dist * 1.5 and _dist_barrier > 0.01:
+                    # We need to brake! Reward deceleration, penalize acceleration
+                    if _accel < -0.3:  # actively braking
+                        reward += 2.0 * min(abs(_accel)/3.0, 1.0)  # proportional to brake force
+                    elif _accel < 0:  # coasting/light brake
+                        reward += 0.5
+                    # Bonus for reducing v_perp toward 0
+                    if len(ep_ante_buf) >= 2:
+                        _prev_vp = ep_ante_buf[-1].get('v_perp', _v_perp_barrier)
+                        if _v_perp_barrier < _prev_vp:  # v_perp decreasing
+                            reward += 1.5 * (_prev_vp - _v_perp_barrier)
+                elif _dist_barrier > _stop_dist * 2.0 and _v_perp_barrier < 0.3:
+                    # Safe zone with low v_perp: reward maintaining speed
+                    reward += 0.5 * min(_speed / 4.0, 1.0)
+                _ante_rec = {'step': ep_step_count, 'speed': _speed, 'accel': round(_accel,3),
+                    'steer': abs(_act_steer), 'steer_rate': round(_steer_rate,3),
+                    'v_perp': round(_v_perp_barrier,3), 'v_tang': round(_v_tang_barrier,3),
+                    'stuck_antecedent': _approaching_stuck, 'stuck_bonus': round(_stuck_bonus,3), 'stuck_wp': _stuck_wp,  # v39: was dangling
+                    'dist_barrier': round(_dist_barrier,3), 'stop_dist': round(_stop_dist,3),
+                    'braking': _braking_intent, 'heading': round(_heading,1)}
+                ep_ante_buf.append(_ante_rec)
+                if len(ep_ante_buf) > _ANTE_WIN:
+                    ep_ante_buf.pop(0)
+                if _objects_dist:
+                    ep_nearest_objects.append(_nearest_obj)
+                    ep_decel_penalties.append(_decel_r)
+                    ep_safe_speed_ratios.append(_speed_ratio)
+                    ep_racing_line_errors.append(_racing_line_err)
+                    if _offtrack or _dist_from_center > 0.4 * _tw: ep_in_recovery = True
+                    elif ep_in_recovery and _dist_from_center < 0.2 * _tw: ep_in_recovery = False
+                    if ep_in_recovery: ep_recovery_steps += 1
+                    if len(ep_heading_diffs)>=2 and abs(ep_heading_diffs[-1])>5.0 and abs(ep_heading_diffs[-2])<=5.0: ep_turn_entry_speeds.append(_speed_ratio)
+            # Track corner speeds (high heading diff = corner)
+                if len(ep_heading_diffs) > 0 and abs(ep_heading_diffs[-1]) > 5.0:
+                    ep_corner_speeds.append(_speed)
+                # Track graze events (curb context but still on track)
+                if _ctx == 1 and not _offtrack:
+                    ep_graze_count += 1
+            
+                        # --- v4: Record step for failure analysis ---
+            ep_metrics.record_step(rp)  # EpisodeMetricsAccumulator: v_perp braking analysis
+            sampler.record_step({
+                    'x': rp.get('x', 0.0), 'y': rp.get('y', 0.0),
+                    'heading': rp.get('heading', 0), 'speed': _speed,
+                    'steering_angle': _steer, 'progress': _prog,
+                    'closest_waypoints': _closest,
+                    'is_offtrack': _offtrack, 'is_crashed': rp.get('is_crashed', False),
+                    'is_reversed': rp.get('is_reversed', False),
+                    'distance_from_center': _dist, 'track_width': _tw,
+                    'action': action.cpu().numpy().item() if action.numel() == 1 else action.cpu().numpy(), 'reward': reward,
+                    'center_r': _center_r, 'heading_r': _head_r,
+                    'speed_r': _speed_r, 'step': global_step,
+                    'context_pred': int(agent.get_context(tensor(observation).unsqueeze(0))[0]) if hasattr(agent, 'get_context') else -1,
+                    'lidar_min': _lidar_min,
+                    'nearest_object': _nearest_obj,
+                    'barrier_proximity': _barrier_proximity,
+                    'track_width': _track_width,
+                    'dist_from_center': _dist_from_center,
+                })
+            # v16: BSTS seasonal per-step tracking
+            bsts_season.record_step(
+                progress=_prog,
+                speed=_speed,
+                steering=_steer,
+                heading_err=0.0,
+                raceline_err=0.0,
+                reward=reward,
+                context=obs[step].cpu().numpy() if hasattr(obs[step], "cpu") else obs[step],
+                action=action.cpu().numpy() if hasattr(action, "cpu") else action,
+                lidar_min=0.0,
+                wp_idx=_cur_wp if "_cur_wp" in dir() else 0,
             )
-            if global_step % 200 == 0: print(f"[BSTS] ep={episode_count} {_bsts.summary()}")
-            # v4-bsts: crash-site diagnostics
-            if term_reason == "crashed" or term_reason == "offtrack":
-                ep_crash_ctx = ep_context_preds[-1] if ep_context_preds else -1
-                ep_crash_speed = ep_speeds[-1] if ep_speeds else 0.0
-                ep_crash_heading = ep_headings[-1] if ep_headings else 0.0  # v26
-                ep_crash_closest_wp = ep_closest_wps[-1] if ep_closest_wps else [0,1]  # v26
-                ep_crash_lidar_min = ep_lidar_mins[-1] if ep_lidar_mins else 1.0
-                # v29: CRASH FORENSICS - dump antecedent kinematics
-                _ante_n = len(ep_ante_buf)
-                _ante_brakes = sum(1 for r in ep_ante_buf if r.get('braking',0))
-                _ante_mean_accel = sum(r.get('accel',0) for r in ep_ante_buf)/max(_ante_n,1)
-                _ante_mean_vperp = sum(r.get('v_perp',0) for r in ep_ante_buf)/max(_ante_n,1)
-                _ante_max_vperp = max((r.get('v_perp',0) for r in ep_ante_buf), default=0)
-                _ante_min_dist = min((r.get('dist_barrier',9) for r in ep_ante_buf), default=9)
-                _ante_final_vperp = ep_ante_buf[-1].get('v_perp',0) if ep_ante_buf else 0
-                _ante_final_stopdist = ep_ante_buf[-1].get('stop_dist',0) if ep_ante_buf else 0
-                logger.warning(
-                    f'[CRASH_FORENSICS] ep={episode_count} step={global_step} wp={ep_crash_closest_wp} spd={ep_crash_speed:.2f} hdg={ep_crash_heading:.1f} '
-                    f'ante_window={_ante_n} brake_steps={_ante_brakes}/{_ante_n} '
-                    f'mean_accel={_ante_mean_accel:.2f} mean_v_perp={_ante_mean_vperp:.3f} '
-                    f'max_v_perp={_ante_max_vperp:.3f} final_v_perp={_ante_final_vperp:.3f} '
-                    f'min_dist_barrier={_ante_min_dist:.3f} final_stop_dist={_ante_final_stopdist:.3f} '
-                    f'crash_speed={ep_crash_speed:.2f}')
-                # Dump full antecedent buffer for detailed analysis
-                for _ai, _ar in enumerate(ep_ante_buf):
-                    logger.info(f'  [ANTE t-{_ante_n-_ai}] {_ar}')
-            # --- v4: Log stuck position ---
-            if ep_progress < 100.0:
-                _rp = info.get('reward_params', {})
-                logger.warning(
-                    f'[STUCK] step={global_step}, '
-                    f'progress={ep_progress:.1f}%%, '
-                    f'pos=({_rp.get("x", 0):.2f}, {_rp.get("y", 0):.2f}), '
-                    f'heading={_rp.get("heading", 0):.1f}, '
-                    f'closest_wp={_rp.get("closest_waypoints", [0,1])}, '
-                    f'speed={_rp.get("speed", 0):.2f}, '
-                    f'offtrack={_rp.get("is_offtrack", False)}, '
-                    f'crashed={_rp.get("is_crashed", False)}, '
-                    f'reversed={_rp.get("is_reversed", False)}'
+
+            _rl_blend = min(1.0, _rl_blend + _rl_blend_rate)
+            rewards[step] = tensor(np.array(reward))
+            # v19: off-policy replay store
+            try:
+                _nobs_t = next_obs.cpu() if isinstance(next_obs, torch.Tensor) else torch.tensor(obs_to_array(observation), dtype=torch.float32)
+                td3sac.store_transition(obs[step].cpu(), actions[step].cpu(), float(reward), _nobs_t, float(terminated or truncated))
+            except Exception:
+                pass
+            # context label: 0=straight, 1=left_curve, 2=right_curve
+            context_labels[step] = 0 if not rp or abs(_curvature) < 0.01 else (1 if _curvature > 0 else 2)
+
+            next_obs = tensor(obs_to_array(observation))
+            next_done = tensor(np.array(float(terminated or truncated)))
+
+            if terminated or truncated:
+                ep_return = cumulative_ep_reward
+                ep_length = ep_step_count
+                ep_progress = info.get("reward_params", {}).get("progress", 0.0)
+                lap_completed = 1.0 if ep_progress >= 100.0 else 0.0
+                lap_time_sec = time.time() - ep_start_time  # v24: wall-clock episode time
+                episode_count += 1
+                # --- v6: episode stuck update ---
+                _escaped = ep_progress > 20.0
+                if stuck_tracker._cur_stuck_cluster is not None:
+                    _escaped = ep_progress > (stuck_tracker._cur_stuck_cluster / 120.0 * 100.0 + 15.0)
+                stuck_tracker.episode_update(
+                    entry_wp=_closest[0] if len(_closest) > 0 else 0,
+                    ep_return=ep_return, ep_progress=ep_progress,
+                    escaped_stuck=_escaped)
+                if episode_count % 50 == 0:
+                    try:
+                        stuck_tracker.print_report()
+                    except Exception as e:
+                        logger.warning(f"print_report failed: {e}")
+
+                    # v7: Save BSTS data
+                    if hasattr(stuck_tracker, 'save_to_json'):
+                        try:
+                            stuck_tracker.save_to_json("results")
+                        except Exception as e:
+                            logger.warning(f"save_to_json failed: {e}")
+                
+                            # v4: End episode for failure analysis
+                term_reason = "crashed" if info.get("reward_params",{}).get("is_crashed",False) else ("offtrack" if info.get("reward_params",{}).get("is_offtrack",False) else ("completed" if ep_progress>=95 else "stuck")); sampler.end_episode(ep_progress, ep_return, ep_length, terminated_reason=term_reason)
+
+                # === BSTS AWS (2020)TheRayG (2020) ===
+                if _bsts is not None:
+                    _bsts.record(ep_step_count*0.1, ep_return, term_reason)
+                if _bsts_log is not None:
+                    _bsts_log.record(ep_step_count*0.1, ep_return, term_reason)
+                # EpisodeMetricsAccumulator: produce braking/speed summary
+                _ep_summary = ep_metrics.end_episode(
+                    ep_progress, ep_return, ep_step_count,
+                    terminated_reason=term_reason
+                )
+                if global_step % 200 == 0: print(f"[BSTS] ep={episode_count} {_bsts.summary()}")
+                # v4-bsts: crash-site diagnostics
+                if term_reason == "crashed" or term_reason == "offtrack":
+                    ep_crash_ctx = ep_context_preds[-1] if ep_context_preds else -1
+                    ep_crash_speed = ep_speeds[-1] if ep_speeds else 0.0
+                    ep_crash_heading = ep_headings[-1] if ep_headings else 0.0  # v26
+                    ep_crash_closest_wp = ep_closest_wps[-1] if ep_closest_wps else [0,1]  # v26
+                    ep_crash_lidar_min = ep_lidar_mins[-1] if ep_lidar_mins else 1.0
+                    # v29: CRASH FORENSICS - dump antecedent kinematics
+                    _ante_n = len(ep_ante_buf)
+                    _ante_brakes = sum(1 for r in ep_ante_buf if r.get('braking',0))
+                    _ante_mean_accel = sum(r.get('accel',0) for r in ep_ante_buf)/max(_ante_n,1)
+                    _ante_mean_vperp = sum(r.get('v_perp',0) for r in ep_ante_buf)/max(_ante_n,1)
+                    _ante_max_vperp = max((r.get('v_perp',0) for r in ep_ante_buf), default=0)
+                    _ante_min_dist = min((r.get('dist_barrier',9) for r in ep_ante_buf), default=9)
+                    _ante_final_vperp = ep_ante_buf[-1].get('v_perp',0) if ep_ante_buf else 0
+                    _ante_final_stopdist = ep_ante_buf[-1].get('stop_dist',0) if ep_ante_buf else 0
+                    logger.warning(
+                        f'[CRASH_FORENSICS] ep={episode_count} step={global_step} wp={ep_crash_closest_wp} spd={ep_crash_speed:.2f} hdg={ep_crash_heading:.1f} '
+                        f'ante_window={_ante_n} brake_steps={_ante_brakes}/{_ante_n} '
+                        f'mean_accel={_ante_mean_accel:.2f} mean_v_perp={_ante_mean_vperp:.3f} '
+                        f'max_v_perp={_ante_max_vperp:.3f} final_v_perp={_ante_final_vperp:.3f} '
+                        f'min_dist_barrier={_ante_min_dist:.3f} final_stop_dist={_ante_final_stopdist:.3f} '
+                        f'crash_speed={ep_crash_speed:.2f}')
+                    # Dump full antecedent buffer for detailed analysis
+                    for _ai, _ar in enumerate(ep_ante_buf):
+                        logger.info(f'  [ANTE t-{_ante_n-_ai}] {_ar}')
+                # --- v4: Log stuck position ---
+                if ep_progress < 100.0:
+                    _rp = info.get('reward_params', {})
+                    logger.warning(
+                        f'[STUCK] step={global_step}, '
+                        f'progress={ep_progress:.1f}%%, '
+                        f'pos=({_rp.get("x", 0):.2f}, {_rp.get("y", 0):.2f}), '
+                        f'heading={_rp.get("heading", 0):.1f}, '
+                        f'closest_wp={_rp.get("closest_waypoints", [0,1])}, '
+                        f'speed={_rp.get("speed", 0):.2f}, '
+                        f'offtrack={_rp.get("is_offtrack", False)}, '
+                        f'crashed={_rp.get("is_crashed", False)}, '
+                        f'reversed={_rp.get("is_reversed", False)}'
+                    )
+
+                et = time.time() - start_time
+                et = str(datetime.timedelta(seconds=round(et)))
+                logger.info(
+                    f'step={global_step}, '
+                    f'episodic_return={ep_return}, '
+                    f'episodic_length={ep_length}, '
+                    f'time_elapsed={et}, '
+                    f'progress={ep_progress:.1f}%, '
+                f'lap_time={lap_time_sec:.1f}s, track={_track_name}({_track_variant}), term={term_reason}, '
                 )
 
-            et = time.time() - start_time
-            et = str(datetime.timedelta(seconds=round(et)))
-            logger.info(
-                f'step={global_step}, '
-                f'episodic_return={ep_return}, '
-                f'episodic_length={ep_length}, '
-                f'time_elapsed={et}, '
-                f'progress={ep_progress:.1f}%, '
-            f'lap_time={lap_time_sec:.1f}s, track={_track_name}({_track_variant}), term={term_reason}, '
-            )
-
-            writer.add_scalar('charts/track_progress', ep_progress, global_step)
-            writer.add_scalar('charts/lap_completed', lap_completed, global_step)
-            writer.add_scalar('charts/episodic_return', ep_return, global_step)
-            writer.add_scalar('charts/episodic_length', ep_length, global_step)
+                writer.add_scalar('charts/track_progress', ep_progress, global_step)
+                writer.add_scalar('charts/lap_completed', lap_completed, global_step)
+                writer.add_scalar('charts/episodic_return', ep_return, global_step)
+                writer.add_scalar('charts/episodic_length', ep_length, global_step)
                 
-                        # v4: Periodic save of failure analysis
-            if episode_count % 25 == 0:
-                sampler.save()
+                            # v4: Periodic save of failure analysis
+                if episode_count % 25 == 0:
+                    sampler.save()
 
-                    # --- v5: BSTS JSONL metrics (per episode) ---
-                _crashed = 1 if rp.get('is_crashed', False) else 0
-                _min_dist = min(ep_dist_from_center) if ep_dist_from_center else 0.0
-                _graze = 1 if (_min_dist < 0.15 * _tw and not _crashed) else 0
-                # curvature*speed: mean(|heading_diff|)*mean(speed)
-                _mean_hdiff = sum(abs(h) for h in ep_heading_diffs)/max(len(ep_heading_diffs),1)
-                _mean_speed = sum(ep_speeds)/max(len(ep_speeds),1)
-                _curv_x_spd = _mean_hdiff * _mean_speed
-                # early-entry-late-exit: track apex timing via progress rate
-                _prog_diffs = [ep_progress_hist[i+1]-ep_progress_hist[i] for i in range(len(ep_progress_hist)-1)] if len(ep_progress_hist)>1 else [0]
-                _eele = max(_prog_diffs) - min(_prog_diffs) if _prog_diffs else 0.0
-                    # --- v27 harmonized metrics (success + intermediary; all up==good) ---
-                try:
-                    _hm_track_width = float(rp.get('track_width', 1.0)) if rp else 1.0
-                    _hm_n_wp = len(rp.get('waypoints', [])) if rp else None
-                    _hm_out = _hm.compute_all(_ep_step_log, float(_prog), n_waypoints=_hm_n_wp, track_width=_hm_track_width)
-                except Exception as _e_hm:
-                    _hm_out = {}
-                bsts_row = {
-                    'episode': episode_count,
-                    'global_step': global_step,
-                    'crash': _crashed,
-                    'graze': _graze,
-                    'curvature_x_speed': round(_curv_x_spd, 4),
-                    'early_entry_late_exit': round(_eele, 4),
-                    'progress': round(ep_progress, 2),
-                    'ep_return': round(ep_return, 4),
-                    'ep_brake_frac': round(_ep_summary.get('brake_fraction',0.0),4) if _ep_summary else 0.0,
-                    'ep_speed_mean': round(_ep_summary.get('mean_speed',0.0),4) if _ep_summary else 0.0,
-                    'ep_speed_std':  round(_ep_summary.get('speed_var',0.0)**0.5,4) if _ep_summary else 0.0,
-                                    'lap_time_sec': round(lap_time_sec,2),
-            'term_reason': term_reason,
-            'track_name': _track_name,
-            'track_variant': _track_variant,
-                # v29 crash antecedent forensics
-                'ante_brake_steps': sum(1 for r in ep_ante_buf if r.get('braking',0)),
-                'ante_mean_accel': round(sum(r.get('accel',0) for r in ep_ante_buf)/max(len(ep_ante_buf),1),3),
-                'ante_mean_vperp': round(sum(r.get('v_perp',0) for r in ep_ante_buf)/max(len(ep_ante_buf),1),3),
-                'ante_final_vperp': round(ep_ante_buf[-1].get('v_perp',0),3) if ep_ante_buf else 0,
-                'ante_final_stopdist': round(ep_ante_buf[-1].get('stop_dist',0),3) if ep_ante_buf else 0,
-                    'rl_blend':      round(_rl_blend,4),
-                    'env_signal':    round(_env_signal if '_env_signal' in dir() else 0.0,4),
-                    'avg_speed': round(_mean_speed, 4),
-                    'min_dist_from_center': round(_min_dist, 4),
-                    'offtrack_rate': round(ep_offtrack_count/max(ep_step_count,1), 4),
-                    'reversed_count': ep_reversed_count,
-                    'zero_speed_count': ep_zero_speed_count,
-                'avg_safe_speed_ratio': round(sum(ep_safe_speed_ratios)/max(len(ep_safe_speed_ratios),1), 4),
-                'avg_racing_line_err': round(sum(ep_racing_line_errors)/max(len(ep_racing_line_errors),1), 4),
-                'avg_decel_penalty': round(sum(ep_decel_penalties)/max(len(ep_decel_penalties),1), 4),
-                    'recovery_steps': ep_recovery_steps,
-                'avg_turn_entry_ratio': round(sum(ep_turn_entry_speeds)/max(len(ep_turn_entry_speeds),1), 4) if ep_turn_entry_speeds else 0.0,
-                }
-                bsts_row.update(_hm_out)
-                jsonl_file.write(json.dumps(bsts_row) + '\n')
-                jsonl_file.flush()
-
-
-                # --- v4: Log sub-reward breadcrumbs ---
-                if ep_step_count > 0:
-                    for comp_name, comp_vals in ep_rewards_components.items():
-                        if comp_vals:
-                            avg_val = sum(comp_vals) / len(comp_vals)
-                            writer.add_scalar(f"rewards/{comp_name}", avg_val, global_step)
-                    if ep_speeds:
-                        writer.add_scalar("behavior/avg_speed", sum(ep_speeds)/len(ep_speeds), global_step)
-                    if ep_dist_from_center:
-                        writer.add_scalar("behavior/avg_dist_from_center", sum(ep_dist_from_center)/len(ep_dist_from_center), global_step)
-                    writer.add_scalar("behavior/offtrack_rate", ep_offtrack_count / ep_step_count, global_step)
-                    writer.add_scalar("behavior/ep_steps", ep_step_count, global_step)
-                # v4: context-aware tensorboard logging
-                    # v4-bsts: compute metrics BEFORE reset
-                bsts_metrics = {
-                    'crash_rate': float(terminated),
-                    'offtrack_rate': float(ep_offtrack_count / max(ep_step_count, 1)),
-                    'avg_speed': sum(ep_speeds)/max(len(ep_speeds),1) if ep_speeds else 2.0,
-                    'corner_crash_rate': float(terminated and ep_step_count < 50),
-                'ctx_obstacle_ratio': sum(1 for h in ep_context_preds if h == 2) / max(len(ep_context_preds), 1),
-                'ctx_curb_ratio': sum(1 for h in ep_context_preds if h == 1) / max(len(ep_context_preds), 1),
-                'ctx_clear_ratio': sum(1 for h in ep_context_preds if h == 0) / max(len(ep_context_preds), 1),
-                'avg_corner_speed': sum(ep_corner_speeds) / max(len(ep_corner_speeds), 1) if ep_corner_speeds else 0.0,
-                'graze_count': ep_graze_count,
-                'crash_ctx': ep_crash_ctx if ep_crash_ctx is not None else -1,
-                'crash_speed': ep_crash_speed if ep_crash_speed is not None else 0.0,
-                'crash_lidar_min': ep_crash_lidar_min if ep_crash_lidar_min is not None else 1.0,
-
-                # v26: barrier-relative velocity at crash
-                'crash_v_perp_barrier': _compute_crash_v_perp(ep_crash_speed, ep_crash_heading, ep_crash_closest_wp, _waypoints) if ep_crash_speed is not None else 0.0,
-                'crash_v_tang_barrier': _compute_crash_v_tang(ep_crash_speed, ep_crash_heading, ep_crash_closest_wp, _waypoints) if ep_crash_speed is not None else 0.0,
-                'avg_lidar_min': sum(ep_lidar_mins)/max(len(ep_lidar_mins),1) if ep_lidar_mins else 1.0,
-                'avg_barrier_proximity': sum(ep_barrier_proximities)/max(len(ep_barrier_proximities),1) if ep_barrier_proximities else 0.0,
-                'avg_nearest_object': sum(ep_nearest_objects)/max(len(ep_nearest_objects),1) if ep_nearest_objects else 999.0,
-                # v29 crash antecedent metrics
-                'crash_ante_brake_steps': sum(1 for r in ep_ante_buf if r.get('braking',0)) if ep_ante_buf else 0,
-                'crash_ante_mean_accel': sum(r.get('accel',0) for r in ep_ante_buf)/max(len(ep_ante_buf),1),
-                'crash_ante_mean_vperp': sum(r.get('v_perp',0) for r in ep_ante_buf)/max(len(ep_ante_buf),1),
-                'crash_ante_final_vperp': ep_ante_buf[-1].get('v_perp',0) if ep_ante_buf else 0,
-                'crash_ante_final_stopdist': ep_ante_buf[-1].get('stop_dist',0) if ep_ante_buf else 0,
-                    'avg_ang_vel_centerline': (sum(ep_ang_vel_centerline)/len(ep_ang_vel_centerline)) if ('ep_ang_vel_centerline' in dir() and ep_ang_vel_centerline) else 0.0,  # v37
-                    'avg_jerk': (sum(ep_jerk_abs)/len(ep_jerk_abs)) if ('ep_jerk_abs' in dir() and ep_jerk_abs) else 0.0,  # v37
-                    'max_jerk': (max(ep_jerk_abs) if ('ep_jerk_abs' in dir() and ep_jerk_abs) else 0.0),  # v37
-                    'brake_line_compliance': (sum(ep_brake_before_barrier)/len(ep_brake_before_barrier)) if ('ep_brake_before_barrier' in dir() and ep_brake_before_barrier) else 0.0,  # v37
-                    'position_in_lap': float(_prog) if '_prog' in dir() else 0.0,  # v37
-                    'lap_completed': 1.0 if (('_prog' in dir()) and float(_prog) >= 0.99) else 0.0,  # v37
-                }
-                bsts_feedback.update(bsts_metrics)
-            # --- Compute BSTS-adjusted reward weights ---
-            _adjusted_rw = bsts_feedback.adjust_weights(rw)
-            # --- Rich BSTS console log every episode ---
-            _bsts_ctx = f"ctx=clear:{bsts_metrics.get('ctx_clear_ratio',0):.2f}/curb:{bsts_metrics.get('ctx_curb_ratio',0):.2f}/obs:{bsts_metrics.get('ctx_obstacle_ratio',0):.2f}"
-            print(
-                f'[BSTS ep={episode_count:5d} step={global_step:7d} Track={_track_name}({_track_variant})] '
-                f'ret={ep_return:8.2f} prog={ep_progress:5.1f}% spd={bsts_metrics.get("avg_speed",0):.2f} '
-                f'crash={bsts_metrics.get("crash_rate",0):.2f} otr={bsts_metrics.get("offtrack_rate",0):.2f} '
-                f'ssr={bsts_metrics.get("avg_safe_speed_ratio",1):.2f} rle={bsts_metrics.get("avg_racing_line_err",0):.2f} '
-                f'term={term_reason} lap_t={lap_time_sec:.1f}s {_bsts_ctx} '
-                f'rw_adj=center:{_adjusted_rw.get("center",0):.3f}/prog:{_adjusted_rw.get("progress",0):.3f}/corner:{_adjusted_rw.get("corner",0):.3f}',
-                flush=True
-            )
-            # Log to BSTS CSV
-            try:
-                _bsts_csv_writer.writerow({
-                    'episode': episode_count, 'global_step': global_step,
-                    'crash_rate': bsts_metrics.get('crash_rate',0),
-                    'offtrack_rate': bsts_metrics.get('offtrack_rate',0),
-                    'avg_speed': bsts_metrics.get('avg_speed',0),
-                    'corner_crash_rate': bsts_metrics.get('corner_crash_rate',0),
-                    'avg_safe_speed_ratio': bsts_metrics.get('avg_safe_speed_ratio',1),
-                    'avg_racing_line_err': bsts_metrics.get('avg_racing_line_err',0),
-                    **{f'rw_{k}': _adjusted_rw.get(k,0) for k in ['center','heading','curv_speed','progress','completion','corner','braking','min_speed','racing_line']}
-                })
-                _bsts_csv_f.flush()
-                # v28: Periodic console summary from live_dashboard
-                if live_summary is not None and episode_count % 500 == 0:
+                        # --- v5: BSTS JSONL metrics (per episode) ---
+                    _crashed = 1 if rp.get('is_crashed', False) else 0
+                    _min_dist = min(ep_dist_from_center) if ep_dist_from_center else 0.0
+                    _graze = 1 if (_min_dist < 0.15 * _tw and not _crashed) else 0
+                    # curvature*speed: mean(|heading_diff|)*mean(speed)
+                    _mean_hdiff = sum(abs(h) for h in ep_heading_diffs)/max(len(ep_heading_diffs),1)
+                    _mean_speed = sum(ep_speeds)/max(len(ep_speeds),1)
+                    _curv_x_spd = _mean_hdiff * _mean_speed
+                    # early-entry-late-exit: track apex timing via progress rate
+                    _prog_diffs = [ep_progress_hist[i+1]-ep_progress_hist[i] for i in range(len(ep_progress_hist)-1)] if len(ep_progress_hist)>1 else [0]
+                    _eele = max(_prog_diffs) - min(_prog_diffs) if _prog_diffs else 0.0
+                        # --- v27 harmonized metrics (success + intermediary; all up==good) ---
                     try:
-                        live_summary(bsts_fb, global_step, episode_count)
+                        _hm_track_width = float(rp.get('track_width', 1.0)) if rp else 1.0
+                        _hm_n_wp = len(rp.get('waypoints', [])) if rp else None
+                        _hm_out = _hm.compute_all(_ep_step_log, float(_prog), n_waypoints=_hm_n_wp, track_width=_hm_track_width)
+                    except Exception as _e_hm:
+                        _hm_out = {}
+                    bsts_row = {
+                        'episode': episode_count,
+                        'global_step': global_step,
+                        'crash': _crashed,
+                        'graze': _graze,
+                        'curvature_x_speed': round(_curv_x_spd, 4),
+                        'early_entry_late_exit': round(_eele, 4),
+                        'progress': round(ep_progress, 2),
+                        'ep_return': round(ep_return, 4),
+                        'ep_brake_frac': round(_ep_summary.get('brake_fraction',0.0),4) if _ep_summary else 0.0,
+                        'ep_speed_mean': round(_ep_summary.get('mean_speed',0.0),4) if _ep_summary else 0.0,
+                        'ep_speed_std':  round(_ep_summary.get('speed_var',0.0)**0.5,4) if _ep_summary else 0.0,
+                                        'lap_time_sec': round(lap_time_sec,2),
+                'term_reason': term_reason,
+                'track_name': _track_name,
+                'track_variant': _track_variant,
+                    # v29 crash antecedent forensics
+                    'ante_brake_steps': sum(1 for r in ep_ante_buf if r.get('braking',0)),
+                    'ante_mean_accel': round(sum(r.get('accel',0) for r in ep_ante_buf)/max(len(ep_ante_buf),1),3),
+                    'ante_mean_vperp': round(sum(r.get('v_perp',0) for r in ep_ante_buf)/max(len(ep_ante_buf),1),3),
+                    'ante_final_vperp': round(ep_ante_buf[-1].get('v_perp',0),3) if ep_ante_buf else 0,
+                    'ante_final_stopdist': round(ep_ante_buf[-1].get('stop_dist',0),3) if ep_ante_buf else 0,
+                        'rl_blend':      round(_rl_blend,4),
+                        'env_signal':    round(_env_signal if '_env_signal' in dir() else 0.0,4),
+                        'avg_speed': round(_mean_speed, 4),
+                        'min_dist_from_center': round(_min_dist, 4),
+                        'offtrack_rate': round(ep_offtrack_count/max(ep_step_count,1), 4),
+                        'reversed_count': ep_reversed_count,
+                        'zero_speed_count': ep_zero_speed_count,
+                    'avg_safe_speed_ratio': round(sum(ep_safe_speed_ratios)/max(len(ep_safe_speed_ratios),1), 4),
+                    'avg_racing_line_err': round(sum(ep_racing_line_errors)/max(len(ep_racing_line_errors),1), 4),
+                    'avg_decel_penalty': round(sum(ep_decel_penalties)/max(len(ep_decel_penalties),1), 4),
+                        'recovery_steps': ep_recovery_steps,
+                    'avg_turn_entry_ratio': round(sum(ep_turn_entry_speeds)/max(len(ep_turn_entry_speeds),1), 4) if ep_turn_entry_speeds else 0.0,
+                    }
+                    bsts_row.update(_hm_out)
+                    jsonl_file.write(json.dumps(bsts_row) + '\n')
+                    jsonl_file.flush()
+
+
+                    # --- v4: Log sub-reward breadcrumbs ---
+                    if ep_step_count > 0:
+                        for comp_name, comp_vals in ep_rewards_components.items():
+                            if comp_vals:
+                                avg_val = sum(comp_vals) / len(comp_vals)
+                                writer.add_scalar(f"rewards/{comp_name}", avg_val, global_step)
+                        if ep_speeds:
+                            writer.add_scalar("behavior/avg_speed", sum(ep_speeds)/len(ep_speeds), global_step)
+                        if ep_dist_from_center:
+                            writer.add_scalar("behavior/avg_dist_from_center", sum(ep_dist_from_center)/len(ep_dist_from_center), global_step)
+                        writer.add_scalar("behavior/offtrack_rate", ep_offtrack_count / ep_step_count, global_step)
+                        writer.add_scalar("behavior/ep_steps", ep_step_count, global_step)
+                    # v4: context-aware tensorboard logging
+                        # v4-bsts: compute metrics BEFORE reset
+                    bsts_metrics = {
+                        'crash_rate': float(terminated),
+                        'offtrack_rate': float(ep_offtrack_count / max(ep_step_count, 1)),
+                        'avg_speed': sum(ep_speeds)/max(len(ep_speeds),1) if ep_speeds else 2.0,
+                        'corner_crash_rate': float(terminated and ep_step_count < 50),
+                    'ctx_obstacle_ratio': sum(1 for h in ep_context_preds if h == 2) / max(len(ep_context_preds), 1),
+                    'ctx_curb_ratio': sum(1 for h in ep_context_preds if h == 1) / max(len(ep_context_preds), 1),
+                    'ctx_clear_ratio': sum(1 for h in ep_context_preds if h == 0) / max(len(ep_context_preds), 1),
+                    'avg_corner_speed': sum(ep_corner_speeds) / max(len(ep_corner_speeds), 1) if ep_corner_speeds else 0.0,
+                    'graze_count': ep_graze_count,
+                    'crash_ctx': ep_crash_ctx if ep_crash_ctx is not None else -1,
+                    'crash_speed': ep_crash_speed if ep_crash_speed is not None else 0.0,
+                    'crash_lidar_min': ep_crash_lidar_min if ep_crash_lidar_min is not None else 1.0,
+
+                    # v26: barrier-relative velocity at crash
+                    'crash_v_perp_barrier': _compute_crash_v_perp(ep_crash_speed, ep_crash_heading, ep_crash_closest_wp, _waypoints) if ep_crash_speed is not None else 0.0,
+                    'crash_v_tang_barrier': _compute_crash_v_tang(ep_crash_speed, ep_crash_heading, ep_crash_closest_wp, _waypoints) if ep_crash_speed is not None else 0.0,
+                    'avg_lidar_min': sum(ep_lidar_mins)/max(len(ep_lidar_mins),1) if ep_lidar_mins else 1.0,
+                    'avg_barrier_proximity': sum(ep_barrier_proximities)/max(len(ep_barrier_proximities),1) if ep_barrier_proximities else 0.0,
+                    'avg_nearest_object': sum(ep_nearest_objects)/max(len(ep_nearest_objects),1) if ep_nearest_objects else 999.0,
+                    # v29 crash antecedent metrics
+                    'crash_ante_brake_steps': sum(1 for r in ep_ante_buf if r.get('braking',0)) if ep_ante_buf else 0,
+                    'crash_ante_mean_accel': sum(r.get('accel',0) for r in ep_ante_buf)/max(len(ep_ante_buf),1),
+                    'crash_ante_mean_vperp': sum(r.get('v_perp',0) for r in ep_ante_buf)/max(len(ep_ante_buf),1),
+                    'crash_ante_final_vperp': ep_ante_buf[-1].get('v_perp',0) if ep_ante_buf else 0,
+                    'crash_ante_final_stopdist': ep_ante_buf[-1].get('stop_dist',0) if ep_ante_buf else 0,
+                        'avg_ang_vel_centerline': (sum(ep_ang_vel_centerline)/len(ep_ang_vel_centerline)) if ('ep_ang_vel_centerline' in dir() and ep_ang_vel_centerline) else 0.0,  # v37
+                        'avg_jerk': (sum(ep_jerk_abs)/len(ep_jerk_abs)) if ('ep_jerk_abs' in dir() and ep_jerk_abs) else 0.0,  # v37
+                        'max_jerk': (max(ep_jerk_abs) if ('ep_jerk_abs' in dir() and ep_jerk_abs) else 0.0),  # v37
+                        'brake_line_compliance': (sum(ep_brake_before_barrier)/len(ep_brake_before_barrier)) if ('ep_brake_before_barrier' in dir() and ep_brake_before_barrier) else 0.0,  # v37
+                        'position_in_lap': float(_prog) if '_prog' in dir() else 0.0,  # v37
+                        'lap_completed': 1.0 if (('_prog' in dir()) and float(_prog) >= 0.99) else 0.0,  # v37
+                    }
+                    bsts_feedback.update(bsts_metrics)
+                # --- Compute BSTS-adjusted reward weights ---
+                _adjusted_rw = bsts_feedback.adjust_weights(rw)
+                # --- Rich BSTS console log every episode ---
+                _bsts_ctx = f"ctx=clear:{bsts_metrics.get('ctx_clear_ratio',0):.2f}/curb:{bsts_metrics.get('ctx_curb_ratio',0):.2f}/obs:{bsts_metrics.get('ctx_obstacle_ratio',0):.2f}"
+                print(
+                    f'[BSTS ep={episode_count:5d} step={global_step:7d} Track={_track_name}({_track_variant})] '
+                    f'ret={ep_return:8.2f} prog={ep_progress:5.1f}% spd={bsts_metrics.get("avg_speed",0):.2f} '
+                    f'crash={bsts_metrics.get("crash_rate",0):.2f} otr={bsts_metrics.get("offtrack_rate",0):.2f} '
+                    f'ssr={bsts_metrics.get("avg_safe_speed_ratio",1):.2f} rle={bsts_metrics.get("avg_racing_line_err",0):.2f} '
+                    f'term={term_reason} lap_t={lap_time_sec:.1f}s {_bsts_ctx} '
+                    f'rw_adj=center:{_adjusted_rw.get("center",0):.3f}/prog:{_adjusted_rw.get("progress",0):.3f}/corner:{_adjusted_rw.get("corner",0):.3f}',
+                    flush=True
+                )
+                # Log to BSTS CSV
+                try:
+                    _bsts_csv_writer.writerow({
+                        'episode': episode_count, 'global_step': global_step,
+                        'crash_rate': bsts_metrics.get('crash_rate',0),
+                        'offtrack_rate': bsts_metrics.get('offtrack_rate',0),
+                        'avg_speed': bsts_metrics.get('avg_speed',0),
+                        'corner_crash_rate': bsts_metrics.get('corner_crash_rate',0),
+                        'avg_safe_speed_ratio': bsts_metrics.get('avg_safe_speed_ratio',1),
+                        'avg_racing_line_err': bsts_metrics.get('avg_racing_line_err',0),
+                        **{f'rw_{k}': _adjusted_rw.get(k,0) for k in ['center','heading','curv_speed','progress','completion','corner','braking','min_speed','racing_line']}
+                    })
+                    _bsts_csv_f.flush()
+                    # v28: Periodic console summary from live_dashboard
+                    if live_summary is not None and episode_count % 500 == 0:
+                        try:
+                            live_summary(bsts_fb, global_step, episode_count)
+                        except Exception:
+                            pass  # non-critical
+                except Exception as _ce:
+                    pass
+                # Use BSTS-adjusted weights for next episode reward shaping
+                rw = _adjusted_rw
+            # === Online Kalman BSTS update ===
+                try:
+                    ep_data = {'steps': _ep_step_log, 'completion_pct': bsts_metrics.get('completion_pct', 0),
+                               'termination_reason': term_reason}
+                    # Wire: extract real intermediary metrics from episode step log
+                    try:
+                        intermediary = extract_intermediary_metrics({'steps': _ep_step_log})
                     except Exception:
-                        pass  # non-critical
-            except Exception as _ce:
-                pass
-            # Use BSTS-adjusted weights for next episode reward shaping
-            rw = _adjusted_rw
-        # === Online Kalman BSTS update ===
-            try:
-                ep_data = {'steps': _ep_step_log, 'completion_pct': bsts_metrics.get('completion_pct', 0),
-                           'termination_reason': term_reason}
-                # Wire: extract real intermediary metrics from episode step log
-                try:
-                    intermediary = extract_intermediary_metrics({'steps': _ep_step_log})
-                except Exception:
-                    intermediary = {m: [0] for m in INTERMEDIARY_METRICS}  # fallback
-                summary = episode_summary_metrics(ep_data, intermediary)
-                # Override with actual bsts_metrics values
-                summary['lap_completion_pct'] = bsts_metrics.get('completion_pct', 0)
-                summary['reward_per_step'] = bsts_metrics.get('avg_reward', 0)
-                summary['off_track_rate'] = bsts_metrics.get('offtrack_rate', 0)
-                summary['crash_rate'] = 1.0 if term_reason == 'crashed' else 0.0
-                _kf_episode_buffer.append(summary)
-                if hasattr(bsts_feedback, "_all_summaries"): bsts_feedback._all_summaries.append(summary)
-                # Run Kalman filter update every 10 episodes
-                if len(_kf_episode_buffer) >= 10:
-                    # import numpy as np  # use global
-                    reg_names = [f'{m}_mean' for m in INTERMEDIARY_METRICS]
-                    n = len(_kf_episode_buffer)
-                    X = np.zeros((n, len(reg_names)))
-                    for t in range(n):
-                        for j, rn in enumerate(reg_names):
-                            X[t, j] = _kf_episode_buffer[t].get(rn, 0.0)
-                    X_std = X.std(axis=0) + 1e-8
-                    X_norm = (X - X.mean(axis=0)) / X_std
-                    for sm in SUCCESS_METRICS:
-                        y = np.array([_kf_episode_buffer[t].get(sm, 0) for t in range(n)])
-                        result = _kf_bsts[sm].filter_series(y, X_norm)
-                        bsts_feedback.kf_trends[sm] = float(result['trends'][-1])
-                        if result.get('betas') is not None:
+                        intermediary = {m: [0] for m in INTERMEDIARY_METRICS}  # fallback
+                    summary = episode_summary_metrics(ep_data, intermediary)
+                    # Override with actual bsts_metrics values
+                    summary['lap_completion_pct'] = bsts_metrics.get('completion_pct', 0)
+                    summary['reward_per_step'] = bsts_metrics.get('avg_reward', 0)
+                    summary['off_track_rate'] = bsts_metrics.get('offtrack_rate', 0)
+                    summary['crash_rate'] = 1.0 if term_reason == 'crashed' else 0.0
+                    _kf_episode_buffer.append(summary)
+                    if hasattr(bsts_feedback, "_all_summaries"): bsts_feedback._all_summaries.append(summary)
+                    # Run Kalman filter update every 10 episodes
+                    if len(_kf_episode_buffer) >= 10:
+                        # import numpy as np  # use global
+                        reg_names = [f'{m}_mean' for m in INTERMEDIARY_METRICS]
+                        n = len(_kf_episode_buffer)
+                        X = np.zeros((n, len(reg_names)))
+                        for t in range(n):
                             for j, rn in enumerate(reg_names):
-                                bsts_feedback.kf_betas[rn] = float(result['betas'][-1][j])
-                    _kf_episode_buffer.clear()
+                                X[t, j] = _kf_episode_buffer[t].get(rn, 0.0)
+                        X_std = X.std(axis=0) + 1e-8
+                        X_norm = (X - X.mean(axis=0)) / X_std
+                        for sm in SUCCESS_METRICS:
+                            y = np.array([_kf_episode_buffer[t].get(sm, 0) for t in range(n)])
+                            result = _kf_bsts[sm].filter_series(y, X_norm)
+                            bsts_feedback.kf_trends[sm] = float(result['trends'][-1])
+                            if result.get('betas') is not None:
+                                for j, rn in enumerate(reg_names):
+                                    bsts_feedback.kf_betas[rn] = float(result['betas'][-1][j])
+                        _kf_episode_buffer.clear()
 
-                    # === BSTS Compliance Report (every 50 episodes) ===
-                    if episode_count > 0 and episode_count % 50 == 0:
+                        # === BSTS Compliance Report (every 50 episodes) ===
+                        if episode_count > 0 and episode_count % 50 == 0:
+                            try:
+                                _bsts_matrix = list(_kf_episode_buffer) if _kf_episode_buffer else []
+                                # Use accumulated summaries from all prior episodes
+                                if hasattr(bsts_feedback, '_all_summaries'):
+                                    _bsts_matrix = bsts_feedback._all_summaries
+                                if len(_bsts_matrix) >= 10:
+                                    _bsts_rpt = bsts_compliance_report(_bsts_matrix)
+                                    _anneal_recs = compute_anneal_recommendations(_bsts_rpt, _bsts_matrix)
+                                    logger.info(f"[BSTS-Report] trend={_bsts_rpt.get('trend','?')} "
+                                                f"seasonal={_bsts_rpt.get('seasonal_period','?')} "
+                                                f"LR_rec={_anneal_recs.get('learning_rate','?')} "
+                                                f"residual_std={_anneal_recs.get('residual_std',0):.4f}")
+                                    for sm, trend in _bsts_rpt.get('per_metric_trends', {}).items():
+                                        logger.info(f"  {sm}: {trend}")
+                                    for rec in _bsts_rpt.get('recommendations', []):
+                                        logger.info(f"  [REC] {rec.get('action','')}")
+                                    # Apply anneal recommendations to reward weights
+                                    for k, v in _anneal_recs.get('reward_weight_adjustments', {}).items():
+                                        logger.info(f"  [ANNEAL] {k}: {v}")
+                            except Exception as _be:
+                                logger.debug(f"BSTS report skip: {_be}")
+
+                        # === Race Line Analysis (every 100 episodes) ===
+                        if episode_count > 0 and episode_count % 100 == 0:
+                            try:
+                                _wps = []
+                                if hasattr(bsts_feedback, '_all_summaries'):
+                                    for _ep in bsts_feedback._all_summaries[-20:]:
+                                        if _ep.get('lap_completion_pct', 0) > 80:
+                                            _wps = [(s.get('x',0), s.get('y',0)) for s in _ep.get('_steps', [])]
+                                            break
+                                if not _wps and hasattr(env, 'waypoints'):
+                                    _wps = [(w[0], w[1]) for w in env.waypoints]
+                                if _wps and len(_wps) >= 4:
+                                    _rl = compute_optimal_race_line(_wps)
+                                    logger.info(f"[RaceLine] brake_integral={_rl.get('brake_zone_integral',0):.3f} ")
+                                _rl_eps = [{"steps": e.get("_steps", []), "completion_pct": e.get("lap_completion_pct", 0)} for e in bsts_feedback._all_summaries[-20:]]
+                                _rl_score = score_race_line_compliance(_rl_eps, _rl)
+                                logger.info(f"[RaceLine] perp_v={_rl_score.get(chr(39)+chr(97)+chr(118)+chr(103)+chr(95)+chr(112)+chr(101)+chr(114)+chr(112)+chr(95)+chr(118)+chr(39), 0):.4f}")
+                            except Exception as _re:
+                                logger.debug(f"Race line analysis skip: {_re}")
+                        print(f"[BSTS-Kalman] trends={bsts_feedback.kf_trends}")
+                except Exception as e:
+                    pass  # BSTS update failure is non-fatal
+
+                if ep_context_preds:
+                    writer.add_scalar('context/obstacle_ratio', bsts_metrics.get('ctx_obstacle_ratio', 0), global_step)
+                    writer.add_scalar('context/curb_ratio', bsts_metrics.get('ctx_curb_ratio', 0), global_step)
+                    writer.add_scalar('context/avg_corner_speed', bsts_metrics.get('avg_corner_speed', 0), global_step)
+                    writer.add_scalar('context/graze_count', bsts_metrics.get('graze_count', 0), global_step)
+                    writer.add_scalar('crash/ctx_at_crash', bsts_metrics.get('crash_ctx', -1), global_step)
+                    writer.add_scalar('crash/speed_at_crash', bsts_metrics.get('crash_speed', 0), global_step)
+                    writer.add_scalar('crash/lidar_min_at_crash', bsts_metrics.get('crash_lidar_min', 1), global_step)
+                    writer.add_scalar('barrier/avg_lidar_min', bsts_metrics.get('avg_lidar_min', 1), global_step)
+                    writer.add_scalar('barrier/avg_proximity', bsts_metrics.get('avg_barrier_proximity', 0), global_step)
+                    writer.add_scalar('barrier/avg_nearest_obj', bsts_metrics.get('avg_nearest_object', 999), global_step)
+
+                    # Reset accumulators
+                    ep_rewards_components = {k: [] for k in ep_rewards_components}
+                    ep_speeds = []
+                    ep_headings = []  # v26
+                    ep_closest_wps = []  # v26
+                    ep_dist_from_center = []
+                    ep_offtrack_count = 0
+                    ep_offtrack_steps = 0
+                    ep_step_count = 0
+                    cumulative_ep_reward = 0.0
+                    _prev_prog_tracker = 0.0  # v23: reset
+                    ep_context_preds = []
+                    ep_lidar_mins = []
+                    ep_barrier_proximities = []
+                    ep_nearest_objects = []
+                    ep_crash_ctx = None
+                    ep_crash_speed = None
+                    ep_crash_heading = None  # v26
+                    ep_crash_closest_wp = None  # v26
+                    ep_crash_lidar_min = None
+                    ep_corner_speeds = []
+                    ep_graze_count = 0
+                # v17-bsts feedback: wire analysis -> annealing
+                if bsts_season is not None:
+                    try:
+                        _trend = getattr(bsts_season, "get_trend", lambda: 0.0)()
+                        _seasonal = getattr(bsts_season, "get_seasonal", lambda: 0.0)()
+                        _m = {"ep_return": ep_return, "trend": _trend, "seasonal": _seasonal, "episode": episode_count}
+                        if hasattr(bsts_fb, "update"): bsts_fb.update(_m)
+                        if hasattr(bsts_fb, "adjust_weights"):
+                            _adj = bsts_fb.adjust_weights(scheduler.get_reward_weights(global_step))
+                            scheduler.rw_end = _adj
+                            # v18: update alpha from BSTS trend
+                            _t = _trend if isinstance(_trend, (int,float)) else 0.0
+                            _bsts_alpha = max(0.5, min(0.98, _bsts_alpha + 0.02 * _t))
+                    except Exception as _e:
+                        logger.debug(f"BSTS feedback skip: {_e}")
+                # v17: periodic live analysis and race-line phase-out
+                if episode_count % 50 == 0 and episode_count > 0:
+                    try:
+                        import os as _os
+                        _lp = _os.path.join("results", "metrics.jsonl")
+                        if _os.path.exists(_lp) and _ANALYSIS_MODULES:
+                            _a = live_analyze(_lp)
+                            logger.info(f"Live analysis ep{episode_count}: {_a}")
+                    except Exception as _e:
+                        logger.debug(f"Live analysis skip: {_e}")
+                _rl_phase = min(1.0, global_step / (scheduler.total_steps * 0.8))
+                ep_heading_diffs = []
+                ep_ang_vel_centerline = []  # v37
+                ep_speed_prev = None  # v37
+                ep_jerk_abs = []  # v37
+                ep_brake_before_barrier = []  # v37
+                ep_steerings_raw = []
+                ep_prev_speed = 0.0
+                ep_decel_penalties = []
+                ep_safe_speed_ratios = []
+                ep_racing_line_errors = []
+                _ep_step_log = []
+                ep_recovery_steps = 0
+                ep_in_recovery = False
+                ep_turn_entry_speeds = []
+                ep_positions = []
+                ep_first_offtrack_step = None
+                ep_progress_hist = []
+                ep_reversed_count = 0
+                ep_zero_speed_count = 0
+                ep_start_time = time.time()  # v24: reset lap timer
+
+                for _rtry in range(3):
+                    try:
+                        observation, info = env.reset()
+                        break
+                    except Exception as _e:
+                        logger.warning(f"mid-training reset attempt {_rtry+1}/3 failed: {_e}; recreating env")
                         try:
-                            _bsts_matrix = list(_kf_episode_buffer) if _kf_episode_buffer else []
-                            # Use accumulated summaries from all prior episodes
-                            if hasattr(bsts_feedback, '_all_summaries'):
-                                _bsts_matrix = bsts_feedback._all_summaries
-                            if len(_bsts_matrix) >= 10:
-                                _bsts_rpt = bsts_compliance_report(_bsts_matrix)
-                                _anneal_recs = compute_anneal_recommendations(_bsts_rpt, _bsts_matrix)
-                                logger.info(f"[BSTS-Report] trend={_bsts_rpt.get('trend','?')} "
-                                            f"seasonal={_bsts_rpt.get('seasonal_period','?')} "
-                                            f"LR_rec={_anneal_recs.get('learning_rate','?')} "
-                                            f"residual_std={_anneal_recs.get('residual_std',0):.4f}")
-                                for sm, trend in _bsts_rpt.get('per_metric_trends', {}).items():
-                                    logger.info(f"  {sm}: {trend}")
-                                for rec in _bsts_rpt.get('recommendations', []):
-                                    logger.info(f"  [REC] {rec.get('action','')}")
-                                # Apply anneal recommendations to reward weights
-                                for k, v in _anneal_recs.get('reward_weight_adjustments', {}).items():
-                                    logger.info(f"  [ANNEAL] {k}: {v}")
-                        except Exception as _be:
-                            logger.debug(f"BSTS report skip: {_be}")
+                            env.close()
+                        except Exception:
+                            pass
+                        env = make_environment(args.environment)
+                else:
+                    raise RuntimeError("mid-training env.reset() unrecoverable after 3 retries")
+                next_obs = tensor(obs_to_array(observation))
+                next_done = torch.zeros(1, device=DEVICE)
+            if ep_progress > 10 and ep_return > best_return:  # v41: must have >10% progress to be best
+                    best_return = ep_return
+                    torch.save(agent, f'{agent.name}_best.torch')
+                    pool.add_checkpoint(agent, ep_return, episode_count)  # v8
+                    logger.info(f'New best model saved: return={best_return}')
 
-                    # === Race Line Analysis (every 100 episodes) ===
-                    if episode_count > 0 and episode_count % 100 == 0:
-                        try:
-                            _wps = []
-                            if hasattr(bsts_feedback, '_all_summaries'):
-                                for _ep in bsts_feedback._all_summaries[-20:]:
-                                    if _ep.get('lap_completion_pct', 0) > 80:
-                                        _wps = [(s.get('x',0), s.get('y',0)) for s in _ep.get('_steps', [])]
-                                        break
-                            if not _wps and hasattr(env, 'waypoints'):
-                                _wps = [(w[0], w[1]) for w in env.waypoints]
-                            if _wps and len(_wps) >= 4:
-                                _rl = compute_optimal_race_line(_wps)
-                                logger.info(f"[RaceLine] brake_integral={_rl.get('brake_zone_integral',0):.3f} ")
-                            _rl_eps = [{"steps": e.get("_steps", []), "completion_pct": e.get("lap_completion_pct", 0)} for e in bsts_feedback._all_summaries[-20:]]
-                            _rl_score = score_race_line_compliance(_rl_eps, _rl)
-                            logger.info(f"[RaceLine] perp_v={_rl_score.get(chr(39)+chr(97)+chr(118)+chr(103)+chr(95)+chr(112)+chr(101)+chr(114)+chr(112)+chr(95)+chr(118)+chr(39), 0):.4f}")
-                        except Exception as _re:
-                            logger.debug(f"Race line analysis skip: {_re}")
-                    print(f"[BSTS-Kalman] trends={bsts_feedback.kf_trends}")
-            except Exception as e:
-                pass  # BSTS update failure is non-fatal
-
-            if ep_context_preds:
-                writer.add_scalar('context/obstacle_ratio', bsts_metrics.get('ctx_obstacle_ratio', 0), global_step)
-                writer.add_scalar('context/curb_ratio', bsts_metrics.get('ctx_curb_ratio', 0), global_step)
-                writer.add_scalar('context/avg_corner_speed', bsts_metrics.get('avg_corner_speed', 0), global_step)
-                writer.add_scalar('context/graze_count', bsts_metrics.get('graze_count', 0), global_step)
-                writer.add_scalar('crash/ctx_at_crash', bsts_metrics.get('crash_ctx', -1), global_step)
-                writer.add_scalar('crash/speed_at_crash', bsts_metrics.get('crash_speed', 0), global_step)
-                writer.add_scalar('crash/lidar_min_at_crash', bsts_metrics.get('crash_lidar_min', 1), global_step)
-                writer.add_scalar('barrier/avg_lidar_min', bsts_metrics.get('avg_lidar_min', 1), global_step)
-                writer.add_scalar('barrier/avg_proximity', bsts_metrics.get('avg_barrier_proximity', 0), global_step)
-                writer.add_scalar('barrier/avg_nearest_obj', bsts_metrics.get('avg_nearest_object', 999), global_step)
-
-                # Reset accumulators
-                ep_rewards_components = {k: [] for k in ep_rewards_components}
-                ep_speeds = []
-                ep_headings = []  # v26
-                ep_closest_wps = []  # v26
-                ep_dist_from_center = []
-                ep_offtrack_count = 0
-                ep_step_count = 0
-                cumulative_ep_reward = 0.0
-                _prev_prog_tracker = 0.0  # v23: reset
-                ep_context_preds = []
-                ep_lidar_mins = []
-                ep_barrier_proximities = []
-                ep_nearest_objects = []
-                ep_crash_ctx = None
-                ep_crash_speed = None
-                ep_crash_heading = None  # v26
-                ep_crash_closest_wp = None  # v26
-                ep_crash_lidar_min = None
-                ep_corner_speeds = []
-                ep_graze_count = 0
-            # v17-bsts feedback: wire analysis -> annealing
-            if bsts_season is not None:
-                try:
-                    _trend = getattr(bsts_season, "get_trend", lambda: 0.0)()
-                    _seasonal = getattr(bsts_season, "get_seasonal", lambda: 0.0)()
-                    _m = {"ep_return": ep_return, "trend": _trend, "seasonal": _seasonal, "episode": episode_count}
-                    if hasattr(bsts_fb, "update"): bsts_fb.update(_m)
-                    if hasattr(bsts_fb, "adjust_weights"):
-                        _adj = bsts_fb.adjust_weights(scheduler.get_reward_weights(global_step))
-                        scheduler.rw_end = _adj
-                        # v18: update alpha from BSTS trend
-                        _t = _trend if isinstance(_trend, (int,float)) else 0.0
-                        _bsts_alpha = max(0.5, min(0.98, _bsts_alpha + 0.02 * _t))
-                except Exception as _e:
-                    logger.debug(f"BSTS feedback skip: {_e}")
-            # v17: periodic live analysis and race-line phase-out
-            if episode_count % 50 == 0 and episode_count > 0:
-                try:
-                    import os as _os
-                    _lp = _os.path.join("results", "metrics.jsonl")
-                    if _os.path.exists(_lp) and _ANALYSIS_MODULES:
-                        _a = live_analyze(_lp)
-                        logger.info(f"Live analysis ep{episode_count}: {_a}")
-                except Exception as _e:
-                    logger.debug(f"Live analysis skip: {_e}")
-            _rl_phase = min(1.0, global_step / (scheduler.total_steps * 0.8))
-            ep_heading_diffs = []
-            ep_ang_vel_centerline = []  # v37
-            ep_speed_prev = None  # v37
-            ep_jerk_abs = []  # v37
-            ep_brake_before_barrier = []  # v37
-            ep_steerings_raw = []
-            ep_prev_speed = 0.0
-            ep_decel_penalties = []
-            ep_safe_speed_ratios = []
-            ep_racing_line_errors = []
-            _ep_step_log = []
-            ep_recovery_steps = 0
-            ep_in_recovery = False
-            ep_turn_entry_speeds = []
-            ep_positions = []
-            ep_first_offtrack_step = None
-            ep_progress_hist = []
-            ep_reversed_count = 0
-            ep_zero_speed_count = 0
-            ep_start_time = time.time()  # v24: reset lap timer
-
-        if ep_progress > 10 and ep_return > best_return:  # v41: must have >10% progress to be best
-                best_return = ep_return
-                torch.save(agent, f'{agent.name}_best.torch')
-                pool.add_checkpoint(agent, ep_return, episode_count)  # v8
-                logger.info(f'New best model saved: return={best_return}')
-
-        observation, info = env.reset()
-        next_obs = tensor(obs_to_array(observation))
 
         # ---- compute GAE ----
 
@@ -1682,7 +1800,7 @@ def run(hparams):
         # ---- PPO update ----
         b_obs = obs.reshape((-1,) + obs_shape)
         b_logprobs = logprobs.reshape(-1)
-        b_actions = actions.reshape(-1).long() if _act_dim <= 1 else actions  # V33: keep 2D for continuous
+        b_actions = actions.reshape(-1).long() if _is_discrete else actions  # V33: keep 2D for continuous
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
