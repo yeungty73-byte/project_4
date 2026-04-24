@@ -1,0 +1,14 @@
+torch>=2.0
+gymnasium>=0.29
+numpy>=1.24
+pandas>=2.0
+seaborn>=0.12
+matplotlib>=3.7
+loguru>=0.7
+munch>=4.0
+msgpack>=1.0
+msgpack-numpy>=0.4.8
+pyzmq>=25.0
+PyYAML>=6.0
+tensorboard
+IPython

@@ -1,0 +1,7 @@
+Traceback (most recent call last):
+  File "/mnt/c/Users/TimothyLeung/7642RLDMSpring2026tleung37/project_4/run.py", line 1, in <module>
+    import sys, os; sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "packages")); import deepracer_gym
+                                                                                                              ^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/c/Users/TimothyLeung/7642RLDMSpring2026tleung37/project_4/packages/deepracer_gym/__init__.py", line 1, in <module>
+    from gymnasium.envs.registration import register
+ModuleNotFoundError: No module named 'gymnasium'

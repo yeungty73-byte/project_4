@@ -1,0 +1,100 @@
+# ================================================================
+#  DeepRacer P4 - Master Configuration (v2.0 Overhaul)
+#  Single source of truth for all hyperparameters.
+# ================================================================
+
+env:
+  env_id: deepracer-v0
+  scenario: time_trial
+  seed: 42
+  max_episode_steps: 500
+  docker_image: deepracer-sim:latest
+
+agent:
+  algorithm: td3_sac_ensemble
+  obs_dim: 64
+  act_dim: 2
+  hidden: 256
+  gamma: 0.99
+  tau: 0.005
+  actor_lr: 3.0e-4
+  critic_lr: 3.0e-4
+  alpha_lr: 3.0e-4
+  replay_capacity: 200000
+  batch_size: 256
+  exploration_noise: 0.1
+  policy_delay: 2
+  warmup_steps: 10000
+
+training:
+  total_timesteps: 1000000
+  eval_interval: 10000
+  save_interval: 50000
+  n_eval_episodes: 5
+  log_interval: 1000
+
+reward:
+  success:
+    avg_speed_centerline:
+      enabled: true
+  shaping:
+    race_line_proximity:
+      enabled: true
+      weight: 0.30
+    brake_field:
+      enabled: true
+      weight: 0.20
+    corner_phase:
+      enabled: true
+      weight: 0.15
+    heading_alignment:
+      enabled: true
+      weight: 0.10
+    smoothness:
+      enabled: true
+      weight: 0.10
+    gg_utilisation:
+      enabled: true
+      weight: 0.10
+    overtake_safety:
+      enabled: true
+      weight: 0.05
+
+race_line:
+  method: min_curvature_qp
+  mu: 0.7
+  v_max: 4.0
+  chassis_width: 0.20
+  chassis_length: 0.25
+  obstacle_padding: 0.15
+  recompute_interval: 50
+
+brake_field:
+  mu: 0.7
+  g: 9.81
+  safety_margin: 1.2
+  lookahead_waypoints: 8
+
+corner_analysis:
+  lookahead: 15
+  curvature_threshold: 0.05
+  speed_C: 1.5
+  v_min: 0.5
+  v_max: 4.0
+
+metrics:
+  success:
+    - avg_speed_centerline
+    - track_progress
+  intermediary:
+    - race_line_adherence
+    - brake_compliance
+    - corner_speed_error
+    - heading_alignment_mean
+    - smoothness_jerk_rms
+    - gg_ellipse_utilisation
+    - waypoint_coverage
+
+dashboard:
+  refresh_seconds: 30
+  theme: denim

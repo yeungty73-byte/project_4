@@ -1,0 +1,2 @@
+FROM uzairakbar/deepracer:v0
+COPY configs/model_metadata.json /opt/ml/code/test_model_metadata.json

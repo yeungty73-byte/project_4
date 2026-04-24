@@ -1,0 +1,1 @@
+episode,global_step,crash_rate,offtrack_rate,avg_speed,corner_crash_rate,avg_safe_speed_ratio,avg_racing_line_err,rw_center,rw_heading,rw_curv_speed,rw_progress,rw_completion,rw_corner,rw_braking,rw_min_speed,rw_racing_line

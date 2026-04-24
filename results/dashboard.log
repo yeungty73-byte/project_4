@@ -1,0 +1,3 @@
+usage: live_bsts_plot.py [-h] [--log-dir LOG_DIR] [--out-dir OUT_DIR]
+                         [--window WINDOW] [--mode {all,bsts,dash,text,json}]
+live_bsts_plot.py: error: unrecognized arguments: --refresh 60

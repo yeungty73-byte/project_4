@@ -1,0 +1,7 @@
+nohup: ignoring input
+Traceback (most recent call last):
+  File "run.py", line 1, in <module>
+    import sys, os; sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "packages")); import deepracer_gym
+                                                                    ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen posixpath>", line 420, in abspath
+FileNotFoundError: [Errno 2] No such file or directory
