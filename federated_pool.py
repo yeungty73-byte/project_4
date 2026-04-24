@@ -29,7 +29,7 @@ class FederatedPool:
         """Save a checkpoint to pool and evict the lowest-scoring entry if over limit."""
         fname = "pool_ep{:06d}_score{:.4f}.torch".format(episode, score)
         path = os.path.join(self.pool_dir, fname)
-        torch.save(agent, path)
+        torch.save(agent.state_dict(), path)
         entry = {"path": path, "score": score, "episode": episode, "metadata": metadata or {}}
         self.pool.append(entry)
         self.pool.sort(key=lambda x: x["score"], reverse=True)
@@ -55,6 +55,14 @@ class FederatedPool:
         logger.info("[FederatedPool] Loaded best checkpoint (score={:.4f}, ep={})".format(entry["score"], entry["episode"]))
         return agent
 
+    def load_best_into(self, agent, map_location=None):
+        entry = self.best_entry()
+        if entry is None:
+            return False
+        sd = torch.load(entry["path"], map_location=map_location or self.device)
+        agent.load_state_dict(sd)
+        return True
+    
     # --- FedAvg ---
 
     def fedavg(self, target_agent, weights: Optional[List[float]] = None, top_k: Optional[int] = None):

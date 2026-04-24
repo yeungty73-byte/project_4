@@ -90,7 +90,10 @@ def compute_brake_zone_loss(brake_pred, curvature_pred):
     excess_brake = torch.relu(brake_pred - alpha * curvature_pred.detach())
     return excess_brake.mean()
 
-
+class _ActorProxy:
+    """Named proxy so pickle can find this class by module path."""
+    def __init__(self, mu_head):
+        self.mu_head = mu_head
 class ContextAwarePPOAgent(PPOAgent):
     # REF: Schulman, J. et al. (2017). Proximal policy optimization algorithms. arXiv:1707.06347.
     # REF: Hettiarachchi, R. et al. (2024). U-Transformer for autonomous racing. arXiv preprint.
@@ -156,7 +159,7 @@ class ContextAwarePPOAgent(PPOAgent):
             nn.Tanh(),
         )
         # FIX: mu_head alias lets run.py read out_features for target entropy
-        self.actor = type("_ActorProxy", (), {"mu_head": self.actor_mean[2]})()
+        self.actor = _ActorProxy(self.actor_mean[2])
 
         # Learnable log std
         self.actor_log_std = nn.Parameter(torch.zeros(act_dim))
