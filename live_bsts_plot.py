@@ -343,6 +343,11 @@ def analyze(log_dir, window=30, json_out=False):
 # CLI
 # =============================================================================
 
+VARIANT_LABELS = {
+    "time_trial": "tt",
+    "obstacle":   "oa",
+    "h2h":        "h2h",
+}
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--log-dir", default="results", help="dir containing *.jsonl")
@@ -352,6 +357,14 @@ def main():
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
     rows = load_jsonl(args.log_dir)
+    for variant, suffix in VARIANT_LABELS.items():
+        vrows = [r for r in rows if r.get("variant") == variant]
+        if len(vrows) < 4:
+            continue   # not enough data yet for this race type
+        vdiag = diagnose(vrows, window=args.window)
+        plot_bsts(vrows, os.path.join(args.out_dir, f"dashboard_bsts_{suffix}.png"), diag=vdiag)
+        plot_dashboard(vrows, os.path.join(args.out_dir, f"dashboard_{suffix}.png"), diag=vdiag)
+        print(f"[live] wrote {suffix} plots ({len(vrows)} episodes)")
     diag = diagnose(rows, window=args.window)
     if args.mode in ("all", "bsts"):
         plot_bsts(rows, os.path.join(args.out_dir, "dashboard_bsts.png"))

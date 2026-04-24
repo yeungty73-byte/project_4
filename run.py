@@ -537,17 +537,42 @@ def _build_phase_schedule(total_timesteps, cluster_ids=None):
 
 
 def _apply_phase_env(args, phase, current_env=None):
-    """Close current env, load the phase's yaml, return fresh env.
-    Passes the yaml PATH (not args.environment) so WORLD_NAME/RACE_TYPE are correct.
+    """Switch to a new phase: update env vars, close old env, spin up fresh one.
+    make_environment() always takes the gym ID ("deepracer-v0"), NOT a yaml path.
+    Track/variant switching is done by writing the phase yaml path into the
+    module-level ENVIRONMENT_PARAMS_PATH used by get_world_name() / get_race_type(),
+    and by setting WORLD_NAME / RACE_TYPE env vars for the sim bridge.
     """
+    import utils as _utils
+
     yaml_path = phase.get("yaml_path") or _resolve_phase_yaml(phase["track"], phase["variant"])
-    logger.info(f"[ORCH] Phase {phase['index']+1}/9: {phase['phase_id']}  yaml={yaml_path}")
+
+    # 1. Tell the deepracer sim which track/variant to use
+    env_params = _PHASE_ENV_PARAMS[(phase["track"], phase["variant"])]
+    os.environ["WORLD_NAME"]          = env_params["WORLD_NAME"]
+    os.environ["RACE_TYPE"]           = env_params["RACE_TYPE"]
+    os.environ["NUMBER_OF_OBSTACLES"] = str(env_params["NUMBER_OF_OBSTACLES"])
+    os.environ["NUMBER_OF_BOT_CARS"]  = str(env_params["NUMBER_OF_BOT_CARS"])
+
+    # 2. Patch utils module-level path so get_world_name()/get_race_type() resolve correctly
+    _utils.ENVIRONMENT_PARAMS_PATH = yaml_path
+
+    logger.info(
+        f"[ORCH] Phase {phase['index']+1}/9: {phase['phase_id']}  "
+        f"yaml={yaml_path}  WORLD={env_params['WORLD_NAME']}  "
+        f"RACE={env_params['RACE_TYPE']}"
+    )
+
     if current_env is not None:
         try:
             current_env.close()
         except Exception:
             pass
-    return make_environment(yaml_path)
+
+    # 3. gym.make always gets the registered env ID, not the yaml path
+    env_name = getattr(args, "environment_name",
+                   getattr(args, "gym_env_id", "deepracer-v0"))
+    return make_environment(env_name)
 
 def run(hparams):
     # v203: allow bypass when GYM_BRIDGE_OPTIONAL=1 (Ed #586 local-loop mode)
@@ -616,7 +641,7 @@ def run(hparams):
     logger.info(f"[ORCH] Schedule ({len(_phase_schedule)} phases): {[p['phase_id'] for p in _phase_schedule]}")
     _current_phase_idx = 0
     _phase = _phase_schedule[0]
-    env = _apply_phase_env(args, _phase)
+    env = _apply_phase_env(args, _phase, current_env=None)
     _phase_steps_remaining = _phase["timesteps"]
     
     logger.info(f"action_space type: {type(env.action_space).__name__}")
@@ -881,7 +906,7 @@ def run(hparams):
             except:
                 pass
             time.sleep(30)
-            env = make_environment(args.environment)  # recreate env with fresh ZMQ socket
+            env = _apply_phase_env(args, _phase)  # recreate env with fresh ZMQ socket
     else:
         raise RuntimeError("env.reset() failed after 10 retries")
     obs_shape = _init_obs.shape if hasattr(_init_obs, "shape") else (len(_init_obs),)
@@ -1611,6 +1636,8 @@ def run(hparams):
                     bsts_row = {
                         'episode': episode_count,
                         'global_step': global_step,
+                        "variant": _track_variant,
+                        "track": _track_name, 
                         'crash': _crashed,
                         'graze': _graze,
                         'curvature_x_speed': round(_curv_x_spd, 4),
