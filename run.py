@@ -653,6 +653,7 @@ def run(hparams):
         _act_dim       = env.action_space.shape[0]
         _act_n         = None
         _act_dim_agent = _act_dim
+    _act_dim_critic = 2  # TD3/SAC critic always sees continuous [steering, throttle]
     logger.info(f"v211 dims: obs={_obs_dim}  discrete={_is_discrete}  act_dim={_act_dim}  act_n={_act_n}")
 
     # PPO agent — safe: _obs_dim defined above
@@ -663,7 +664,7 @@ def run(hparams):
     ).to(DEVICE)
 
     # --- v19: TD3+SAC critic ensemble ---
-    td3sac = TD3SACEnsemble(obs_dim=obs_dim, act_dim=_act_dim_agent, hidden=256,
+    td3sac = TD3SACEnsemble(obs_dim=_obs_dim, act_dim=_act_dim_critic, hidden=256,
                             gamma=hp.get('gamma', 0.99), tau=0.005, 
                             lr=hp.get('lr', 3e-4), device=DEVICE,)
     _td3sac_update_freq = 4
@@ -1517,8 +1518,12 @@ def run(hparams):
             try:
                 _nobs_t = next_obs.cpu() if isinstance(next_obs, torch.Tensor) else torch.tensor(obs_to_array(observation), dtype=torch.float32)
                 # Store the continuous action tensor (what the critic sees), not the discretized env action
-                _td3_action = action.squeeze(0).detach().cpu()
-                td3sac.store_transition(obs[step], _td3_action, reward, next_obs, terminated or truncated)
+                # Always store 2D continuous action for the critic, regardless of discrete env
+                _critic_action = action.squeeze(0).detach().float().cpu()   # shape (2,) from ContextAwarePPOAgent
+                if _critic_action.shape[0] != 2:
+                    # Fallback: if agent returned logits (n=26), take first 2 dims or zero-pad
+                    _critic_action = _critic_action[:2] if _critic_action.shape[0] >= 2 else torch.zeros(2)
+                td3sac.store_transition(obs[step], _critic_action, reward, next_obs, terminated or truncated)
             except Exception:
                 pass
             # context label: 0=straight, 1=left_curve, 2=right_curve

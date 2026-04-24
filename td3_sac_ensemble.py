@@ -34,7 +34,7 @@ class ReplayBuffer:
         obs, act, rew, nobs, done = zip(*batch)
         return (
             torch.stack(obs),
-            torch.stack(act) if isinstance(act[0], torch.Tensor) else torch.tensor(np.array(act), dtype=torch.float32),
+            torch.stack(act).float() if isinstance(act[0], torch.Tensor) else torch.tensor(np.array(act), dtype=torch.float32),
             torch.tensor(rew, dtype=torch.float32).unsqueeze(1),
             torch.stack(nobs),
             torch.tensor(done, dtype=torch.float32).unsqueeze(1),
@@ -140,56 +140,48 @@ class TD3SACEnsemble(nn.Module):
         return self.alpha * (-log_prob)
 
     def update_critics(self, ppo_agent, batch_size=256,
-                       policy_noise=0.2, noise_clip=0.5):
-        """Off-policy critic update using replay buffer.
-
-        Uses PPO agent's policy for next-action sampling (TD3+SAC hybrid).
-        Returns dict of metrics.
-        """
+                    policy_noise=0.2, noise_clip=0.5):
         if len(self.replay) < batch_size:
             return {'critic_loss': 0.0, 'alpha': self.alpha,
                     'q1_mean': 0.0, 'q2_mean': 0.0}
 
         obs, act, rew, nobs, done = self.replay.sample(batch_size)
-        obs = torch.as_tensor(obs, dtype=torch.float32).to(self.device)
-        act = torch.as_tensor(act, dtype=torch.float32).to(self.device)
-        rew = torch.as_tensor(rew, dtype=torch.float32).to(self.device)
+        obs  = torch.as_tensor(obs,  dtype=torch.float32).to(self.device)
         nobs = torch.as_tensor(nobs, dtype=torch.float32).to(self.device)
+        rew  = torch.as_tensor(rew,  dtype=torch.float32).to(self.device)
         done = torch.as_tensor(done, dtype=torch.float32).to(self.device)
 
+        # act from replay: shape (batch, ?) — normalize to (batch, 2)
+        act = torch.as_tensor(act, dtype=torch.float32).to(self.device)
+        act = act.view(act.shape[0], -1)          # (batch, act_dim_stored)
+        if act.shape[-1] != self.q1.net[0].in_features - obs.shape[-1]:
+            # stored action dim mismatch: take first 2 or pad
+            target_adim = self.q1.net[0].in_features - obs.shape[-1]
+            if act.shape[-1] >= target_adim:
+                act = act[:, :target_adim]
+            else:
+                act = torch.cat([act, torch.zeros(act.shape[0], target_adim - act.shape[-1], device=self.device)], dim=-1)
+
         with torch.no_grad():
-            # Use PPO policy for next actions (off-policy actor)
-            next_action, next_log_prob, _, _, _, _ = ppo_agent.get_action_and_value(
-                nobs)
-            if next_action.dim() == 1:
-                next_action = next_action.unsqueeze(-1).float()
-            elif next_action.dtype != torch.float32:
-                next_action = next_action.float()
+            # ppo_agent.forward returns (mean, std, value, ctx_logits, intermed_pred)
+            # mean shape is (batch, agent_act_dim) — may be 26 for discrete heads
+            # We need (batch, critic_act_dim=2): take only first 2 dims
+            _mean = ppo_agent.forward(nobs)[0].float()   # (batch, agent_act_dim)
+            critic_act_dim = self.q1.net[0].in_features - nobs.shape[-1]
+            if _mean.shape[-1] >= critic_act_dim:
+                next_action = _mean[:, :critic_act_dim]  # slice to (batch, 2)
+            else:
+                next_action = torch.cat([_mean, torch.zeros(_mean.shape[0], critic_act_dim - _mean.shape[-1], device=self.device)], dim=-1)
 
-            # TD3: add clipped noise to next actions
-            noise = (torch.randn_like(next_action) * policy_noise
-                     ).clamp(-noise_clip, noise_clip)
-            # For discrete actions, skip noise; for continuous, add it
-            if next_action.shape[-1] > 1:  # continuous
-                next_action = next_action + noise
+            # TD3: target policy smoothing noise
+            noise = (torch.randn_like(next_action) * policy_noise).clamp(-noise_clip, noise_clip)
+            next_action = (next_action + noise).clamp(-1.0, 1.0)
 
-            # Clipped double-Q target
             q1_targ = self.q1_target(nobs, next_action)
             q2_targ = self.q2_target(nobs, next_action)
             min_q_targ = torch.min(q1_targ, q2_targ)
-
-            # SAC entropy regularization in target
-            if next_log_prob is not None and next_log_prob.dim() > 0:
-                entropy_term = self.log_alpha.exp() * next_log_prob.unsqueeze(-1)
-                min_q_targ = min_q_targ - entropy_term
-
             target_q = rew + (1.0 - done) * self.gamma * min_q_targ
 
-        # Ensure act shape matches critic input
-        if act.dim() == 1:
-            act = act.unsqueeze(-1)
-
-        # Critic loss
         q1_pred = self.q1(obs, act)
         q2_pred = self.q2(obs, act)
         critic_loss = F.mse_loss(q1_pred, target_q) + F.mse_loss(q2_pred, target_q)
@@ -200,18 +192,8 @@ class TD3SACEnsemble(nn.Module):
             list(self.q1.parameters()) + list(self.q2.parameters()), 1.0)
         self.critic_optim.step()
 
-        # SAC alpha update
-        if next_log_prob is not None:
-            alpha_loss = -(self.log_alpha.exp() * (
-                next_log_prob.detach().mean() + self.target_entropy))
-            self.alpha_optim.zero_grad()
-            alpha_loss.backward()
-            self.alpha_optim.step()
-
-        # Soft update targets (TD3 polyak)
         self._soft_update(self.q1, self.q1_target)
         self._soft_update(self.q2, self.q2_target)
-
         self._update_count += 1
         cl = critic_loss.item()
         self._critic_loss_ema = 0.95 * self._critic_loss_ema + 0.05 * cl
@@ -225,18 +207,19 @@ class TD3SACEnsemble(nn.Module):
             'replay_size': len(self.replay),
         }
 
-
     def update_actor(self, ppo_agent, batch_size=256):
-        """TD3-style deterministic policy gradient update.
-        Uses Q1 critic to compute: actor_loss = -Q1(s, actor(s)).mean()
-        Makes TD3 the PRIMARY policy optimizer.
-        """
         if len(self.replay) < batch_size:
             return {"td3_actor_loss": 0.0}
         obs_b, act_b, rew_b, next_obs_b, done_b = self.replay.sample(batch_size)
         obs_b = obs_b.to(self.device)
         # Get deterministic action from PPO agent actor (mean, no sampling)
         mean, std, value, ctx_logits, intermed_pred = ppo_agent.forward(obs_b)
+        # mean may be (batch, 26) for discrete heads — slice to critic's expected act_dim
+        critic_act_dim = self.q1.net[0].in_features - obs_b.shape[-1]
+        if mean.shape[-1] > critic_act_dim:
+            mean = mean[:, :critic_act_dim]
+        elif mean.shape[-1] < critic_act_dim:
+            mean = torch.cat([mean, torch.zeros(mean.shape[0], critic_act_dim - mean.shape[-1], device=self.device)], dim=-1)
         # Q1 value for current policy actions
         q1_val = self.q1(obs_b, mean)
         actor_loss = -q1_val.mean()
