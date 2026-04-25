@@ -301,32 +301,43 @@ class AnnealingScheduler:
         self.total_steps = total_steps
         self.explore_end = 0.25
         self.transition_end = 0.60
-        # PHASE -1: adaptive survival bootstrap; also enforced by BootstrapRewardController.
+
+        # PHASE -1: Survival bootstrap (0–5% of training)
+        # ONE objective: advance. No racing line, no speed gate.
+        # Without this the agent learns to oscillate for stuck_bonus near start.
         self.rw_phase_m1 = {
-            "center": 0.05, "heading": 0.10, "racing_line": 0.02, "braking": 0.05,
-            "progress": 0.60, "corner": 0.02, "speed_steering": 0.02,
-            "curv_speed": 0.00, "min_speed": 0.12, "completion": 0.02,
-            "decel": 0.00, "obstacle": 0.00, "steering": 0.00,
+            "center":         0.05,
+            "heading":        0.10,
+            "racing_line":    0.02,
+            "braking":        0.05,
+            "progress":       0.62,   # DOMINANT — just advance
+            "corner":         0.02,
+            "speed_steering": 0.02,
+            "curv_speed":     0.00,
+            "min_speed":      0.10,
+            "completion":     0.02,
+            "decel":          0.00,
+            "obstacle":       0.00,
+            "steering":       0.00,
         }
-        # PHASE 0: Completion-first (0–30% of training)
+        # PHASE 0: Completion-first (5–30% of training)
         # Positioning, heading, brake-field, racing line dominate. Speed suppressed.
         self.rw_phase0 = {
-            "center":       0.22,   # stay on line
-            "heading":      0.20,   # point the right way
-            "racing_line":  0.18,   # follow the race line
-            "braking":      0.15,   # honour brake field
-            "progress":     0.14,   # lap completion
-            "corner":       0.06,   # corner geometry
-            "speed_steering": 0.03, # minimal speed-steering coupling
-            "curv_speed":   0.01,   # nearly OFF — no speed reward yet
-            "min_speed":    0.01,
-            "completion":   0.00,
-            "decel":        0.00,
-            "obstacle":     0.00,
-            "steering":     0.00,
+            "center":         0.22,
+            "heading":        0.20,
+            "racing_line":    0.18,
+            "braking":        0.15,
+            "progress":       0.14,
+            "corner":         0.06,
+            "speed_steering": 0.03,
+            "curv_speed":     0.01,
+            "min_speed":      0.01,
+            "completion":     0.00,
+            "decel":          0.00,
+            "obstacle":       0.00,
+            "steering":       0.00,
         }
-
-        # PHASE 1: Positioning+Speed coupling (30–65%)
+        # PHASE 1: Positioning+Speed coupling (30â€“65%)
         # Racing line compliance gates speed reward via speed_steering
         self.rw_phase1 = {
             "center":       0.14,
@@ -335,7 +346,7 @@ class AnnealingScheduler:
             "braking":      0.10,
             "progress":     0.16,
             "corner":       0.07,
-            "speed_steering": 0.10, # rising — speed only rewarded when steering is clean
+            "speed_steering": 0.10, # rising â€” speed only rewarded when steering is clean
             "curv_speed":   0.08,   # curvature-aware speed, still modest
             "min_speed":    0.06,
             "completion":   0.05,
@@ -343,8 +354,7 @@ class AnnealingScheduler:
             "obstacle":     0.03,
             "steering":     0.02,
         }
-
-        # PHASE 2: Speed-optimized (65–100%)
+        # PHASE 2: Speed-optimized (65â€“100%)
         # Full speed rewards, position/heading fade, completion bonus peaks
         self.rw_phase2 = {
             "center":       0.07,
@@ -364,37 +374,38 @@ class AnnealingScheduler:
 
         self.rw_start = self.rw_phase0   # existing code reads rw_start/rw_end
         self.rw_end   = self.rw_phase1   # will swap to phase2 at 65%
+        
     def _sigmoid_blend(self, step, start_frac, end_frac, k=12.0):
         mid = (start_frac + end_frac) / 2.0
         t = step / self.total_steps
         return 1.0 / (1.0 + math.exp(-k * (t - mid)))
-
+    
     def get_reward_weights(self, step):
-        t = step / self.total_steps
+        t = step / max(self.total_steps, 1)
         if t < 0.05:
+            # Phase -1 → 0: survival bootstrap
             alpha = t / 0.05
             src, dst = self.rw_phase_m1, self.rw_phase0
         elif t < 0.30:
-            # Phase 0→1 linear blend after bootstrap
+            # Phase 0 → 1: positioning+compliance
             alpha = (t - 0.05) / 0.25
             src, dst = self.rw_phase0, self.rw_phase1
         elif t < 0.65:
-            # Phase 1→2 linear blend
+            # Phase 1 → 2: speed coupling
             alpha = (t - 0.30) / 0.35
             src, dst = self.rw_phase1, self.rw_phase2
         else:
-            # Full phase 2
-            alpha = 1.0
+            alpha = min((t - 0.65) / 0.35, 1.0)
             src, dst = self.rw_phase2, self.rw_phase2
 
         weights = {}
         for k in set(list(src.keys()) + list(dst.keys())):
             s = float(src.get(k, 0.0))
             e = float(dst.get(k, 0.0))
-            weights[k] = s * (1 - alpha) + e * alpha
+            weights[k] = s * (1.0 - alpha) + e * alpha
 
         total = sum(weights.values())
-        return {k: v/total for k, v in weights.items()} if total > 0 else weights
+        return {k: v / total for k, v in weights.items()} if total > 0 else weights
 
     def get_hyperparams(self, step):
         t = step / self.total_steps
@@ -699,72 +710,38 @@ def preflightgymbridge():
         return False
 # --- v213: BCPilot — internal deterministic expert for BC seeding ---
 # Replaces htm_reference.HTMPilotDriver when unavailable. No external deps.
-
 class BCPilot:
-    """Small deterministic expert for BC seeding; consumes reward_params, not obs arrays."""
-    def __init__(self, waypoints, track_width=0.6, track_variant="timetrial", action_space=None):
-        self.waypoints = list(waypoints or [])
-        self.track_width = float(track_width or 0.6)
-        self.track_variant = track_variant
-        self.action_space = action_space
-
+    """Deterministic BC pilot. No htmreference dependency, no OOB possible."""
+    def __init__(self, waypoints, track_width=0.6, track_variant="timetrial"):
+        self.waypoints=list(waypoints); self.track_width=float(track_width)
+        self.track_variant=track_variant
     def act(self, rp: dict):
-        rp = rp if isinstance(rp, dict) else {}
-        waypoints = rp.get("waypoints", self.waypoints)
-        closest = rp.get("closest_waypoints", [0, 1])
-        speed = float(rp.get("speed", 0.0) or 0.0)
-        heading = float(rp.get("heading", 0.0) or 0.0)
-        tw = float(rp.get("track_width", self.track_width) or self.track_width)
-        dist_ctr = float(rp.get("distance_from_center", 0.0) or 0.0)
-        is_left = bool(rp.get("is_left_of_center", False))
-        if not waypoints or len(waypoints) < 3:
-            raw = np.array([0.0, 0.35], dtype=np.float32)
-            return process_action(raw, self.action_space) if self.action_space is not None else raw
-        n = len(waypoints)
-        idx = int(closest[1] if len(closest) > 1 else closest[0]) % n
-        look = min(8, max(2, n // 20))
-        tx = float(waypoints[(idx + look) % n][0]) - float(waypoints[idx][0])
-        ty = float(waypoints[(idx + look) % n][1]) - float(waypoints[idx][1])
-        target_heading = math.degrees(math.atan2(ty, tx))
-        heading_err = ((target_heading - heading + 180.0) % 360.0) - 180.0
-        steer_heading = np.clip(heading_err / 45.0, -1.0, 1.0)
-        try:
-            rl_offset = compute_racing_line_offset(waypoints, closest, tw)
-        except Exception:
-            rl_offset = 0.0
-        actual_lat = dist_ctr * (1.0 if is_left else -1.0)
-        target_lat = rl_offset * tw * 0.5
-        steer_lat = np.clip((target_lat - actual_lat) / max(tw * 0.5, 1e-3), -1.0, 1.0)
-        steering = float(np.clip(0.65 * steer_heading + 0.35 * steer_lat, -1.0, 1.0))
-        try:
-            _, _, safe_speed, dist_to_corner = lookahead_curvature_scan(waypoints, closest, max_lookahead=15)
-        except Exception:
-            safe_speed, dist_to_corner = 2.2, 5.0
-        # Box throttle channel in this repo is [-1, 1]. Positive accelerates, negative brakes.
-        if abs(heading_err) > 55.0:
-            throttle = -0.25
-        elif speed > safe_speed * 1.08:
-            throttle = -0.35
-        elif speed < safe_speed * 0.80:
-            throttle = 0.75
-        else:
-            throttle = 0.25
-        raw = np.array([steering, throttle], dtype=np.float32)
-        return process_action(raw, self.action_space) if self.action_space is not None else raw
-
+        import numpy as _np
+        waypoints=rp.get("waypoints",self.waypoints)
+        closest=rp.get("closest_waypoints",[0,1])
+        speed=float(rp.get("speed",0.0))
+        dist_ctr=float(rp.get("distance_from_center",0.0))
+        is_left=bool(rp.get("is_left_of_center",False))
+        tw=float(rp.get("track_width",self.track_width))
+        if len(waypoints)<3: return _np.array([0.0,0.5],dtype=_np.float32)
+        try: _,_,safe_speed,dist_to_corner=lookahead_curvature_scan(waypoints,closest,max_lookahead=15)
+        except: safe_speed,dist_to_corner=2.5,5.0
+        try: rl_offset=compute_racing_line_offset(waypoints,closest,tw)
+        except: rl_offset=0.0
+        lat_err=(rl_offset*tw/2.0) - dist_ctr*(1 if is_left else -1)
+        steering=float(_np.clip(lat_err/max(tw*0.5,0.01)*1.5,-1.0,1.0))
+        try: braker=compute_braking_reward(speed,safe_speed,dist_to_corner)
+        except: braker=1.0 if speed<safe_speed*0.95 else 0.5
+        throttle=-0.5 if braker<0.4 else (0.8 if speed<safe_speed*0.85 else 0.4)
+        return _np.array([steering,throttle],dtype=_np.float32)
 
 # --- v1.0.13: centerline arc-length progress + bootstrap reward controller ---
-def arc_track_length(waypoints) -> float:
-    """Total centerline arc length of the closed track in metres."""
-    if not waypoints or len(waypoints) < 2:
-        return 100.0
-    total = 0.0
-    n = len(waypoints)
-    for i in range(n):
-        x0, y0 = float(waypoints[i][0]), float(waypoints[i][1])
-        x1, y1 = float(waypoints[(i + 1) % n][0]), float(waypoints[(i + 1) % n][1])
-        total += math.hypot(x1 - x0, y1 - y0)
-    return max(total, 1.0)
+def _arc_track_length(waypoints) -> float:
+    if not waypoints or len(waypoints)<2: return 100.0
+    pts=[(float(w[0]),float(w[1])) for w in waypoints if len(w)>=2]
+    n=len(pts)
+    if n<2: return 100.0
+    return max(sum(math.sqrt((pts[(i+1)%n][0]-pts[i][0])**2+(pts[(i+1)%n][1]-pts[i][1])**2) for i in range(n)),1.0)
 
 def _build_centerline_cache(waypoints, cache):
     n = len(waypoints)
@@ -1132,10 +1109,15 @@ def run(hparams):
     _bsts_csv_path = 'results/bsts_metrics.csv'
     _bsts_csv_header_written = os.path.exists(_bsts_csv_path)
     _bsts_csv_f = open(_bsts_csv_path, 'a', newline='')
-    _bsts_csv_keys = ['episode','global_step','crash_rate','offtrack_rate','avg_speed',
-        'corner_crash_rate','avg_safe_speed_ratio','avg_racing_line_err',
-        'rw_center','rw_heading','rw_curv_speed','rw_progress','rw_completion',
-        'rw_corner','rw_braking','rw_min_speed','rw_racing_line']
+    _bsts_csv_keys = [
+        'episode', 'global_step',
+        'race_type', 'track_name', 'track_variant',
+        'track_arc_m', 'track_progress_pct', 'track_progress_arc_m',
+        'crash_rate', 'offtrack_rate', 'avg_speed',
+        'corner_crash_rate', 'avg_safe_speed_ratio', 'avg_racing_line_err',
+        'rw_center', 'rw_heading', 'rw_curv_speed', 'rw_progress',
+        'rw_completion', 'rw_corner', 'rw_braking', 'rw_min_speed', 'rw_racing_line',
+    ]
     _bsts_csv_writer = _csv.DictWriter(_bsts_csv_f, fieldnames=_bsts_csv_keys, extrasaction='ignore')
     if not _bsts_csv_header_written:
         _bsts_csv_writer.writeheader()
@@ -1187,6 +1169,7 @@ def run(hparams):
     ep_first_offtrack_step = None
     ep_progress_hist = []
     ep_progress = 0.0
+    ep_progress_pct = 0.0
     ep_centerline_progress_m = 0.0
     ep_track_length_m = 100.0
     ep_track_progress_pct = 0.0
@@ -1261,6 +1244,8 @@ def run(hparams):
         from htm_reference import HTMPilotDriver
         _init_rp = _init_info.get("reward_params", {}) if isinstance(_init_info, dict) else {}
         _env_waypoints = _init_rp.get("waypoints", [])
+        _total_track_arc = _arc_track_length(_env_waypoints)
+        logger.info(f"[ARC] Track arc: {_total_track_arc:.2f}m ({len(_env_waypoints)} wps)")
         htm_pilot = HTMPilotDriver(
             waypoints=_env_waypoints,
             track_width=float(_init_rp.get("track_width", 0.6)),
@@ -1275,6 +1260,8 @@ def run(hparams):
         logger.warning("[HTM] htm_reference not found – falling back to BCPilot")
         _init_rp = _init_info.get("reward_params", {}) if isinstance(_init_info, dict) else {}
         _env_waypoints = _init_rp.get("waypoints", [])
+        _total_track_arc = _arc_track_length(_env_waypoints)
+        logger.info(f"[ARC] Track arc: {_total_track_arc:.2f}m ({len(_env_waypoints)} wps)")
         if len(_env_waypoints) >= 10:
             _bc_pilot = BCPilot(
                 waypoints=_env_waypoints,
@@ -1289,7 +1276,22 @@ def run(hparams):
         else:
             logger.warning("[BC] waypoints empty at init — skipping BC harvest")
     except Exception as _htm_e:
-        logger.warning(f"[HTM] BC harvest failed: {_htm_e} – continuing without BC seed")
+        # v213: also fall back to BCPilot on runtime crash (OOB etc)
+        logger.warning(f"[HTM] BC harvest runtime error: {_htm_e} – falling back to BCPilot")
+        _init_rp = _init_info.get("reward_params", {}) if isinstance(_init_info, dict) else {}
+        _env_waypoints = _init_rp.get("waypoints", [])
+        if len(_env_waypoints) >= 10:
+            _bc_pilot = BCPilot(
+                waypoints=_env_waypoints,
+                track_width=float(_init_rp.get("track_width", 0.6)),
+                track_variant=_track_variant,
+            )
+            n_harvested = harvest_htm_pilots(env, _bc_pilot, td3sac,
+                                             n_episodes=50, min_progress=80.0)
+            if n_harvested >= 10:
+                pretrain_td3_bc(td3sac, agent, bc_steps=2000)
+        else:
+            logger.warning("[BC] waypoints empty at init — skipping BC harvest")
     # rollout storage
     obs = zeros((num_steps,) + obs_shape)
     # v211: correct dtype+shape — discrete needs long, continuous needs float32
@@ -1466,6 +1468,10 @@ def run(hparams):
                 _y = rp.get("y", 0.0)
                 _hdg = rp.get("heading", 0.0)
                 _spd = rp.get("speed", 0.0)
+                # v213: Phase -1 alive bonus — stay on track is enough
+                _t_frac = global_step / max(total_timesteps, 1)
+                if _t_frac < 0.05 and not offtrack and not is_stuck:
+                    reward += 0.03
                 if _wps and len(_wps) > 1:
                     _los_r = _los.compute(_x, _y, _hdg, _wps, _cwps[0])
                     # v39: Un-muted LOS with brake-line guard
@@ -1968,17 +1974,22 @@ def run(hparams):
                 _final_m, _final_total_m, _final_pct, _final_delta_m, _episode_progress_state = update_episode_centerline_progress(_final_rp, _track_progress_cache, _episode_progress_state)
                 ep_centerline_progress_m = max(ep_centerline_progress_m, _final_m)
                 ep_track_length_m = max(ep_track_length_m, _final_total_m)
-                ep_progress = max(ep_track_progress_pct, _final_pct)
-                _raw_final_progress = float(_final_rp.get("progress", 0.0) or 0.0)
+                # ep_progress = max(ep_track_progress_pct, _final_pct)
+                # _raw_final_progress = float(_final_rp.get("progress", 0.0) or 0.0)
                 _bad_end = bool(_final_rp.get("is_offtrack", False) or _final_rp.get("is_crashed", False) or _final_rp.get("is_reversed", False))
-                lap_completed = 1.0 if (ep_progress >= 99.0 and not _bad_end and ep_step_count >= 60) else 0.0
-                bootstrap_rewards.update_episode(ep_progress, lap_completed >= 1.0)
+                # lap_completed = 1.0 if (ep_progress >= 99.0 and not _bad_end and ep_step_count >= 60) else 0.0
+                
+                _raw_prog        = info.get("reward_params",{}).get("progress",0.0)
+                ep_progress      = (_raw_prog/100.0)*_total_track_arc   # metres
+                ep_progress_pct  = float(_raw_prog)                     # 0-100 for gates
+                lap_completed    = 1.0 if (ep_progress_pct>=100.0 and not _bad_end) else 0.0
+                bootstrap_rewards.update_episode(ep_progress, lap_completed == 1.0)
                 lap_time_sec = time.time() - ep_start_time  # v24: wall-clock episode time
                 episode_count += 1
                 # --- v6: episode stuck update ---
-                _escaped = ep_progress > 20.0  # centerline pct
+                _escaped = ep_progress_pct > 20.0  # centerline pct
                 if stuck_tracker._cur_stuck_cluster is not None:
-                    _escaped = ep_progress > (stuck_tracker._cur_stuck_cluster / 120.0 * 100.0 + 15.0)
+                    _escaped = ep_progress_pct> (stuck_tracker._cur_stuck_cluster / 120.0 * 100.0 + 15.0)
                 stuck_tracker.episode_update(
                     entry_wp=_closest[0] if len(_closest) > 0 else 0,
                     ep_return=ep_return, ep_progress=ep_progress,
@@ -2037,7 +2048,7 @@ def run(hparams):
                     for _ai, _ar in enumerate(ep_ante_buf):
                         logger.info(f'  [ANTE t-{_ante_n-_ai}] {_ar}')
                 # --- v4: Log stuck position ---
-                if ep_progress < 100.0 or term_reason in ('offtrack', 'crashed'):
+                if ep_progress_pct< 100.0 or term_reason in ('offtrack', 'crashed'):
                     _rp = info.get('reward_params', {})
                     logger.warning(
                         f'[STUCK] step={global_step}, '
@@ -2063,6 +2074,7 @@ def run(hparams):
                 )
 
                 writer.add_scalar('charts/track_progress', ep_progress, global_step)
+                writer.add_scalar('charts/track_progress_pct',   ep_progress_pct,   global_step)
                 writer.add_scalar('charts/track_progress_m', ep_centerline_progress_m, global_step)
                 writer.add_scalar('charts/track_length_m', ep_track_length_m, global_step)
                 writer.add_scalar('charts/lap_completed', lap_completed, global_step)
@@ -2091,6 +2103,12 @@ def run(hparams):
                         _hm_out = _hm.compute_all(_ep_step_log, float(_prog), n_waypoints=_hm_n_wp, track_width=_hm_track_width)
                     except Exception as _e_hm:
                         _hm_out = {}
+                    # v213: race-type tag for plot/CSV differentiation
+                    _race_type_tag = {
+                        'time_trial': 'tt',
+                        'obstacle':   'oa',
+                        'h2h':        'h2h',
+                    }.get(_track_variant, _track_variant)
                     bsts_row = {
                         'episode': episode_count,
                         'global_step': global_step,
@@ -2106,6 +2124,11 @@ def run(hparams):
                         'ep_speed_mean': round(_ep_summary.get('mean_speed',0.0),4) if _ep_summary else 0.0,
                         'ep_speed_std':  round(_ep_summary.get('speed_var',0.0)**0.5,4) if _ep_summary else 0.0,
                                         'lap_time_sec': round(lap_time_sec,2),
+                        # v213: race-type / arc-length telemetry
+                        'race_type':             _race_type_tag,
+                        'track_arc_m':           round(ep_track_length_m, 2),
+                        'track_progress_pct':    round(ep_progress_pct, 2),
+                        'track_progress_arc_m':  round(ep_centerline_progress_m, 2),
                 'term_reason': term_reason,
                 'track_name': _track_name,
                 'track_variant': _track_variant,
@@ -2201,6 +2224,12 @@ def run(hparams):
                 try:
                     _bsts_csv_writer.writerow({
                         'episode': episode_count, 'global_step': global_step,
+                        'race_type':            _race_type_tag,
+                        'track_name':           _track_name,
+                        'track_variant':        _track_variant,
+                        'track_arc_m':          round(ep_track_length_m, 2),
+                        'track_progress_pct':   round(ep_progress_pct, 2),
+                        'track_progress_arc_m': round(ep_centerline_progress_m, 2),
                         'crash_rate': bsts_metrics.get('crash_rate',0),
                         'offtrack_rate': bsts_metrics.get('offtrack_rate',0),
                         'avg_speed': bsts_metrics.get('avg_speed',0),
@@ -2330,6 +2359,7 @@ def run(hparams):
                 cumulative_ep_reward   = 0.0
                 _prev_prog_tracker     = 0.0
                 ep_progress            = 0.0
+                ep_progress_pct        = 0.0
                 ep_centerline_progress_m = 0.0
                 ep_track_length_m      = 100.0
                 ep_track_progress_pct  = 0.0
@@ -2419,7 +2449,7 @@ def run(hparams):
                     raise RuntimeError("mid-training env.reset unrecoverable after 3 retries")
                 next_obs = tensor(obs_to_array(observation))
                 next_done = torch.zeros(1, device=DEVICE)
-            if ep_progress > 10 and ep_return > best_return:  # v41: must have >10% progress to be best
+            if ep_progress_pct> 10 and ep_return > best_return:  # v41: must have >10% progress to be best
                     best_return = ep_return
                     torch.save({
                         'state_dict': agent.state_dict(),

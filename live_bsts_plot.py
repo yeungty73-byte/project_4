@@ -53,8 +53,8 @@ SUCCESS_METRICS = [
 ]
 
 INTERMEDIARY_METRICS = [
-    ("brake_field_compliance",      "Brake-Field Compliance",      "ratio", (0, 1), "#8B7FBF", +1),
-    ("jerk_rms",                    "Smoothness (1-Jerk RMS)",     "1-rms", (0, 1), "#7FBFBF", +1),
+    ("brake_field_compliance",      "Brake-Field Compliance",      "ratio", (0, 1), "#1D8A50", +1),
+    ("jerk_rms",                    "Smoothness (1-Jerk RMS)",     "1-rms", (0, 1), "#C53C97", +1),
     ("speed_mean",                  "Speed (mean)",                "m/s", None,  "#BF8B7F", +1),
     ("steer_activity",              "Steer Activity (RMS)",        "rad", None,  "#7FBF8B", -1),
     ("waypoint_coverage",           "Waypoint Coverage",           "frac", (0, 1), "#BFBF7F", +1),
@@ -221,7 +221,7 @@ def _plot_metric(ax, rows, key, label, units, bound, color):
     ax.tick_params(axis="both", labelsize=7)
 
 
-def plot_bsts(rows, out_path, diag=None):
+def plot_bsts(rows, out_path, diag=None, variant=None, track=None):
     """BSTS feature-selection dashboard: 1x3 success panels, each overlaid
     with top-3 intermediary predictors colored by regression rank."""
     if not _HAS_MPL:
@@ -262,12 +262,16 @@ def plot_bsts(rows, out_path, diag=None):
         ax.set_title(f"{slabel} [{sunits}]" if sunits else slabel, fontsize=11)
         ax.set_xlabel("episode", fontsize=8); ax.legend(fontsize=7, loc="best", framealpha=0.85)
         _style_ax(ax); ax.tick_params(axis="both", labelsize=7)
-    fig.suptitle("BSTS Feature-Selection Dashboard (success ~ top-3 intermediary predictors)", fontsize=12, y=1.02)
+    _n_eps, _n_steps, _v, _t = _rows_meta(rows)
+    _title = _make_title(
+        "BSTS Feature-Selection Dashboard — success ← top-3 intermediary",
+        variant or _v, track or _t, _n_eps, _n_steps)
+    fig.suptitle(_title, fontsize=11, y=1.02)
     fig.tight_layout(); fig.savefig(out_path, dpi=120, bbox_inches="tight"); plt.close(fig)
     print(f"[bsts] wrote {out_path}")
 
 
-def plot_dashboard(rows, out_path, diag=None):
+def plot_dashboard(rows, out_path, diag=None, variant=None, track=None):
     """Operational dashboard: success panel + intermediary panel + trend bars."""
     if not _HAS_MPL:
         print("[dash] matplotlib unavailable; skipping")
@@ -301,8 +305,11 @@ def plot_dashboard(rows, out_path, diag=None):
         r, c = 1 + (i // 4), i % 4
         ax = fig.add_subplot(gs[r, c])
         _plot_metric(ax, rows, key, label, units, bound, color)
-    fig.suptitle("DeepRacer Live Dashboard -- success vs intermediary metrics",
-                 fontsize=13, fontweight="bold")
+    _n_eps2, _n_steps2, _v2, _t2 = _rows_meta(rows)
+    _title2 = _make_title(
+        "DeepRacer Live Dashboard — success vs intermediary",
+        variant or _v2, track or _t2, _n_eps2, _n_steps2)
+    fig.suptitle(_title2, fontsize=12, fontweight='bold')
     fig.savefig(out_path, dpi=110, bbox_inches="tight")
     plt.close(fig)
     print(f"[dash] wrote {out_path}")
@@ -344,27 +351,88 @@ def analyze(log_dir, window=30, json_out=False):
 # =============================================================================
 
 VARIANT_LABELS = {
-    "time_trial": "tt",
-    "obstacle":   "oa",
-    "h2h":        "h2h",
+    'time_trial': ('tt',  'Time Trial',       "#74B04C"),
+    'obstacle':   ('oa',  'Object Avoidance', "#A6C619"),
+    'h2h':        ('h2h', 'Head-to-Bot',      "#A14517"),
 }
+TRACK_LABELS = {
+    'reinvent2019_wide':  'reInvent2019 Wide',
+    'reinvent2019_track': 'reInvent2019 Track',
+    'vegas_track':        'Vegas Track',
+}
+
+def _variant_meta(variant: str):
+    """Return (suffix, label, color) for a variant key or its short tag."""
+    for k, (suf, lbl, col) in VARIANT_LABELS.items():
+        if variant == k or variant == suf:
+            return suf, lbl, col
+    return variant, variant.upper(), '#888888'
+
+def _rows_meta(rows):
+    """Extract (n_eps, n_steps, variant, track) from a row list."""
+    n_eps   = len(rows)
+    n_steps = rows[-1].get('global_step', 0) if rows else 0
+    variant = (rows[0].get('variant') or rows[0].get('track_variant')) if rows else None
+    track   = (rows[0].get('track')   or rows[0].get('track_name'))    if rows else None
+    return n_eps, n_steps, variant, track
+
+def _make_title(base: str, variant, track, n_eps: int, n_steps: int) -> str:
+    """Compose a rich multi-line plot title."""
+    suf, lbl, _ = _variant_meta(variant) if variant else ('', 'All Race Types', '#888888')
+    track_lbl   = TRACK_LABELS.get(track, track or 'All Tracks')
+    return (f"{base}\n"
+            f"Race: {lbl}  |  Track: {track_lbl}  |  "
+            f"eps={n_eps:,}  global_steps={n_steps:,}")
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--log-dir", default="results", help="dir containing *.jsonl")
     ap.add_argument("--out-dir", default="results/live", help="figure output dir")
     ap.add_argument("--window", type=int, default=30)
     ap.add_argument("--mode", choices=["all", "bsts", "dash", "text", "json"], default="all")
+    ap.add_argument("--race_type", choices=["time_trial", "obstacle", "h2h", "all"], default="all")
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
     rows = load_jsonl(args.log_dir)
-    for variant, suffix in VARIANT_LABELS.items():
-        vrows = [r for r in rows if r.get("variant") == variant]
-        if len(vrows) < 4:
-            continue   # not enough data yet for this race type
-        vdiag = diagnose(vrows, window=args.window)
-        plot_bsts(vrows, os.path.join(args.out_dir, f"dashboard_bsts_{suffix}.png"), diag=vdiag)
-        plot_dashboard(vrows, os.path.join(args.out_dir, f"dashboard_{suffix}.png"), diag=vdiag)
-        print(f"[live] wrote {suffix} plots ({len(vrows)} episodes)")
+    for variant, (suffix, label, color) in VARIANT_LABELS.items():
+        # Accept 'variant', 'track_variant', or short 'race_type' tag
+        v_rows = [r for r in rows
+                  if r.get('variant') == variant
+                  or r.get('track_variant') == variant
+                  or r.get('race_type') == suffix]
+        if len(v_rows) < 4:
+            print(f'[live] {label} ({suffix}): only {len(v_rows)} eps — skipping')
+            continue
+
+        # Per-track breakdown within this variant
+        tracks_seen = sorted({
+            r.get('track') or r.get('track_name', 'unknown') for r in v_rows
+        })
+        for trk in tracks_seen:
+            trk_rows = [r for r in v_rows
+                        if (r.get('track') or r.get('track_name')) == trk]
+            trk_suf  = f"{suffix}_{trk.replace(' ','_').lower()}"
+            trk_diag = diagnose(trk_rows, window=args.window)
+            if args.mode in ('all', 'bsts'):
+                plot_bsts(trk_rows,
+                    os.path.join(args.out_dir, f'dashboard_bsts_{trk_suf}.png'),
+                    diag=trk_diag, variant=variant, track=trk)
+            if args.mode in ('all', 'dash'):
+                plot_dashboard(trk_rows,
+                    os.path.join(args.out_dir, f'dashboard_{trk_suf}.png'),
+                    diag=trk_diag, variant=variant, track=trk)
+
+        # Combined across all tracks for this variant
+        v_diag = diagnose(v_rows, window=args.window)
+        if args.mode in ('all', 'bsts'):
+            plot_bsts(v_rows,
+                os.path.join(args.out_dir, f'dashboard_bsts_{suffix}.png'),
+                diag=v_diag, variant=variant, track=None)
+        if args.mode in ('all', 'dash'):
+            plot_dashboard(v_rows,
+                os.path.join(args.out_dir, f'dashboard_{suffix}.png'),
+                diag=v_diag, variant=variant, track=None)
+        print(f'[live] {label} ({suffix}): {len(v_rows)} eps, '
+              f'{len(tracks_seen)} track(s): {", ".join(tracks_seen)}')
     diag = diagnose(rows, window=args.window)
     if args.mode in ("all", "bsts"):
         plot_bsts(rows, os.path.join(args.out_dir, "dashboard_bsts.png"))
