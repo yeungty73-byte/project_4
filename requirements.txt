@@ -11,4 +11,5 @@ msgpack-numpy>=0.4.8
 pyzmq>=25.0
 PyYAML>=6.0
 tensorboard
+spicy
 IPython
