@@ -565,6 +565,52 @@ def _apply_phase_env(args, phase, current_env=None):
                    getattr(args, "gym_env_id", "deepracer-v0"))
     return make_environment(env_name)
 
+HTM_PILOT_EPISODES = 50   # collect 50 clean HTM completions
+MIN_PILOT_PROGRESS = 80.0  # only keep episodes that hit 80%+
+
+def harvest_htm_pilots(env, htm_agent, td3sac, n_episodes=50, min_progress=80.0):
+    """
+    Run HTM deterministic controller, collect (s,a,r,s',done) tuples,
+    push only high-progress episodes into td3sac.replay (the BC seed buffer).
+    """
+    pilot_count = 0
+    for ep in range(n_episodes * 3):  # 3x budget to hit n target pilots
+        obs, _ = env.reset()
+        ep_buf, ep_prog = [], 0.0
+        terminated, truncated = False, False
+        while not (terminated or truncated):
+            action = htm_agent.act(obs)  # deterministic waypoint-follower
+            next_obs, reward, terminated, truncated, info = env.step(action)
+            ep_prog = info.get('reward_params', {}).get('progress', 0.0)
+            act_t = torch.tensor(action, dtype=torch.float32)
+            obs_t = torch.tensor(obs_to_array(obs), dtype=torch.float32)
+            nobs_t = torch.tensor(obs_to_array(next_obs), dtype=torch.float32)
+            ep_buf.append((obs_t, act_t, reward, nobs_t, float(terminated)))
+            obs = next_obs
+        if ep_prog >= min_progress:
+            for transition in ep_buf:
+                td3sac.store_transition(*transition)
+            pilot_count += 1
+            logger.info(f"HTM Pilot {pilot_count}/{n_episodes}: prog={ep_prog:.1f}%")
+        if pilot_count >= n_episodes:
+            break
+    logger.info(f"HTM pilot harvest done: {pilot_count} episodes → {len(td3sac.replay)} transitions in BC buffer")
+    return pilot_count
+
+def pretrain_td3_bc(td3sac, ppo_agent, bc_steps=2000):
+    """
+    Supervised pre-training: minimize |Q(s,a_htm) - r + γ·min_Q(s')| on BC buffer.
+    No policy noise — these are expert actions, not noisy TD3 rollouts.
+    """
+    for step in range(bc_steps):
+        if len(td3sac.replay) < 256:
+            break
+        result = td3sac.update_critics(ppo_agent, batch_size=256, policy_noise=0.0)  # no noise on BC
+        if step % 200 == 0:
+            logger.info(f"BC pretrain step {step}: critic_loss={result.get('critic_loss',0):.4f}, "
+                        f"replay_size={result.get('replay_size',0)}")
+    logger.info("BC pre-training complete — TD3 critics bootstrapped on expert trajectories")
+
 def run(hparams):
     # v203: allow bypass when GYM_BRIDGE_OPTIONAL=1 (Ed #586 local-loop mode)
     # v205: auto-bootstrap deepracer container
@@ -634,7 +680,16 @@ def run(hparams):
     _phase = _phase_schedule[0]
     env = _apply_phase_env(args, _phase, current_env=None)
     _phase_steps_remaining = _phase["timesteps"]
-    
+    from htm_reference import HTMPilotDriver    
+    htm_pilot = HTMPilotDriver(
+        waypoints=env_waypoints,          # from rp.get('waypoints')
+        track_width=float(rp.get('track_width', 0.6)),
+        track_variant=track_variant       # from args / config.yaml
+    )
+    n_harvested = harvest_htm_pilots(env, htm_pilot, td3sac,
+                                     n_episodes=50, min_progress=80.0)
+    if n_harvested >= 10:
+        pretrain_td3_bc(td3sac, agent, bc_steps=2000)
     logger.info(f"action_space type: {type(env.action_space).__name__}")
     logger.info(f"action_space: {env.action_space}")
     logger.info(f"has .n: {hasattr(env.action_space, 'n')}, .n={getattr(env.action_space, 'n', None)}")

@@ -677,3 +677,66 @@ class HTMOracle:
             "htm_should_brake":  bool(ref["should_brake"]),
             "htm_curvature":     ref["curvature"],
         }
+
+class HTMPilotDriver:
+    """
+    Wraps HTMOracle to produce executable [steer, throttle] actions.
+    Uses oracle.get(wp_idx) for target_speed + lateral_offset + should_brake.
+    """
+    def __init__(self, waypoints, track_width, track_variant):
+        self.obj_tracker = ObjectTracker()
+        self.oracle = HTMOracle(
+            waypoints,
+            track_width=track_width,
+            track_variant=track_variant,
+            object_tracker=self.obj_tracker
+        )
+        self.oracle.build()
+        self.wpts = np.array([w[:2] for w in waypoints])
+
+    def act(self, rp: dict) -> list:
+        """
+        rp = info['reward_params'] dict from DeepRacer env step.
+        Returns [steering_angle (-1..1), throttle (-1..1)].
+        """
+        wp_idx   = rp.get('closest_waypoints', [0,1])[1]
+        speed    = float(rp.get('speed', 0.0))
+        heading  = float(rp.get('heading', 0.0))
+        dist     = float(rp.get('distance_from_center', 0.0))
+        tw       = float(rp.get('track_width', 0.6))
+        lat_frac = dist / max(tw / 2.0, 1e-9)  # sign: positive = right
+        if not rp.get('is_left_of_center', True):
+            lat_frac = -lat_frac
+
+        # Update object tracker
+        self.obj_tracker.update(
+            step=0,
+            context_class=int(rp.get('objects_distance', [99])[:1][0] < 2.0) if rp.get('objects_distance') else 0,
+            lidar_min=float(rp.get('closest_objects', [99])[0]) if rp.get('closest_objects') else 9.9,
+            nearest_obj_dist=float(rp.get('closest_objects', [99])[0]) if rp.get('closest_objects') else 9.9,
+            ego_x=float(rp.get('x', 0.0)),
+            ego_y=float(rp.get('y', 0.0)),
+        )
+        self.oracle.adjust_for_exclusion_zones(
+            wp_idx, self.obj_tracker.get_exclusion_zones()
+        )
+
+        ref = self.oracle.get(wp_idx)
+        target_speed = ref['target_speed']
+        target_lat   = ref['lateral_offset']
+        should_brake = ref['should_brake']
+
+        # --- Steering: proportional control toward target lateral + heading ---
+        heading_rad  = math.radians(heading)
+        ref_hdg      = ref['heading']
+        hdg_err      = (ref_hdg - heading_rad + math.pi) % (2*math.pi) - math.pi
+        lat_err      = target_lat - lat_frac
+        steer        = float(np.clip(2.0 * hdg_err + 1.5 * lat_err, -1.0, 1.0))
+
+        # --- Throttle: track target speed, brake if should_brake ---
+        if should_brake or (speed > target_speed + 0.3):
+            throttle = float(np.clip(-0.5 * (speed - target_speed), -1.0, -0.1))
+        else:
+            throttle = float(np.clip(0.6 + 0.4 * (target_speed - speed) / max(target_speed, 0.1), 0.0, 1.0))
+
+        return [steer, throttle]
