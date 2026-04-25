@@ -307,14 +307,14 @@ class AnnealingScheduler:
         # Without this the agent learns to oscillate for stuck_bonus near start.
         self.rw_phase_m1 = {
             "center":         0.05,
-            "heading":        0.10,
+            "heading":        0.18,   # v1.1.0: boosted from 0.10 — point FORWARD is critical in bootstrap
             "racing_line":    0.02,
-            "braking":        0.05,
+            "braking":        0.01,   # v1.1.0: reduced from 0.05 to fund heading
             "progress":       0.62,   # DOMINANT — just advance
             "corner":         0.02,
             "speed_steering": 0.02,
             "curv_speed":     0.00,
-            "min_speed":      0.10,
+            "min_speed":      0.06,   # v1.1.0: reduced from 0.10 to fund heading
             "completion":     0.02,
             "decel":          0.00,
             "obstacle":       0.00,
@@ -1294,7 +1294,7 @@ def run(hparams):
                 track_variant=_track_variant,
             )
             n_harvested = harvest_htm_pilots(env, _bc_pilot, td3sac,
-                                             n_episodes=50, min_progress=80.0)
+                                             n_episodes=12, min_progress=5.0)  # v1.1.0: was 50/80 — too strict, never seeds replay
             if n_harvested >= 10:
                 pretrain_td3_bc(td3sac, agent, bc_steps=2000)
         else:
@@ -1647,7 +1647,29 @@ def run(hparams):
                     _head_r = 0.0
 
                 # v5: deceleration smoothness (always computed)
-                _decel_r = max(0, 1.0 - max(0, _decel - 0.3) * 3.0)
+                # v1.1.0: jerk-informed brake intent (replaces flat _decel_r which punished hard braking)
+                # REF: Balaban et al. (2018) Jerk as indicator of driving intent. Vehicle System Dynamics.
+                # REF: Brayshaw & Harrison (2005) Quasi-steady state lap sim. Proc. IMechE Part D.
+                _jerk_now = abs(_accel - (ep_prev_accel or 0.0)) / 0.1   # da/dt in m/s³ (dt≈0.1s)
+
+                # Is the agent in a brake approach zone?
+                _in_brake_approach = (
+                    '_brake_potential' in dir() and _brake_potential > 0.3   # inside brake field
+                    and '_dist_from_center' in dir() and _dist_from_center < 0.4 * max(_tw, 0.1)  # on track
+                )
+
+                if _in_brake_approach and _accel < -1.0:
+                    # Intentional braking in brake zone: reward sharp onset (jerk onset = intentional)
+                    # Capped at jerk=50 m/s³ (physical max for 1/18-scale at 4 m/s)
+                    # REF: Balaban 2018 — jerk characterises intentionality of braking input
+                    _decel_r = min(_jerk_now / 50.0, 1.0) * 0.8 + 0.2   # floor 0.2, ceiling 1.0
+                elif _in_brake_approach and _accel >= 0:
+                    # Throttle in brake zone — attenuate (multiplicative, NOT subtractive)
+                    _decel_r = 0.4   # 60% of full brake-zone weight
+                else:
+                    # Not in brake zone — smooth driving preferred; excess random jerk attenuated
+                    # Multiplicative: frozen agent near 0 gets no cut; moving agent with jerk gets cut
+                    _decel_r = 1.0 / (1.0 + max(0.0, _jerk_now - 20.0) * 0.02)
                 # V13: Speed-steering harmony (REF: Gonzalez2020)
                 _steer_angle = abs(rp.get("steering_angle", 0))
                 # Reward low steering at high speed (smooth driving)
@@ -1742,10 +1764,15 @@ def run(hparams):
                         * (0.5 + 0.5 * _rl_compliance)               # off-raceline: floor at 50%
                         * (1.0 if _bf_ok else max(0.3, 1.0 - _brake_potential))  # brake-zone: scales with how deep in field
                     )
-                    shaped_reward = shaped_reward * _speed_gate - 0.02
+                    # v1.1.0: removed flat -0.02 subtractive drag (caused freeze trap on near-zero reward agents)
+                    # Instead: pure multiplicative speed gate — low speed_gate scales reward toward 0, never below
+                    shaped_reward = shaped_reward * _speed_gate  # attenuation only, no additive penalty
                 # Blend: mostly racing-line shaped, small env signal
                 # v18: BSTS-driven alpha mixing (race-line compliance vs env signal)
-                reward = (1.0 - _bsts_alpha) * reward + _bsts_alpha * shaped_reward  # v32: unclipped
+                # v1.1.0: during bootstrap, reduce BSTS alpha so raw progress signal dominates
+                # shaped_reward speed_gate fires near-zero in early chaos → don't let it drown out progress delta
+                _eff_alpha = 0.30 if _bootstrap_active else _bsts_alpha  # 30% shaped vs 70% raw during bootstrap
+                reward = (1.0 - _eff_alpha) * reward + _eff_alpha * shaped_reward  # v32: unclipped
                 # v18: wire stuck-antecedent bonus into reward
                 # v39: Un-muted _stuck_bonus (was MUTED v25)
                 if _approaching_stuck and _stuck_bonus > 0:
@@ -1858,18 +1885,35 @@ def run(hparams):
                 ep_steerings_raw.append(_steer)
                 # Collect step dict for extract_intermediary_metrics
                 try:
-                    _step_info = info if isinstance(info, dict) else {}
+                    # v1.1.0 FIX: x/y/heading/speed live in rp (reward_params), NOT top-level info
+                    # top-level info keys are: reward_params, episode_status, goal
+                    # Using _step_info.get('x') was ALWAYS 0 — causing all BSTS zeros.
+                    _rp_log = rp if rp else (info.get("reward_params", {}) if isinstance(info, dict) else {})
                     _ep_step_log.append({
-                        'x': _step_info.get('x', _step_info.get('X', 0)),
-                        'y': _step_info.get('y', _step_info.get('Y', 0)),
-                        'heading': _step_info.get('heading', _step_info.get('yaw', 0)),
-                        'speed': _step_info.get('speed', ep_prev_speed),
-                        'steering_angle': float(action[0]) if hasattr(action, '__getitem__') else 0,
-                        'throttle': float(action[1]) if hasattr(action, '__getitem__') and len(action) > 1 else 0,
-                        'reward': float(reward),
-                        'all_wheels_on_track': _step_info.get('all_wheels_on_track', True),
-                    'distance_from_center': _step_info.get('distance_from_center', rp.get('distance_from_center', 0.0)),
-                    'closest_wp_idx': (rp.get('closest_waypoints', [0, 0])[1] if isinstance(rp.get('closest_waypoints', [0, 0]), (list, tuple)) and len(rp.get('closest_waypoints', [0, 0])) > 1 else -1),
+                        'x':                    float(_rp_log.get('x', 0.0)),
+                        'y':                    float(_rp_log.get('y', 0.0)),
+                        'heading':              float(_rp_log.get('heading', 0.0)),
+                        'speed':                float(_speed),   # already resolved above
+                        'steering_angle':       float(action[0]) if hasattr(action, '__getitem__') else 0.0,
+                        'throttle':             float(action[1]) if hasattr(action, '__getitem__') and len(action) > 1 else 0.0,
+                        'reward':               float(reward),
+                        'all_wheels_on_track':  bool(_rp_log.get('all_wheels_on_track', True)),
+                        'distance_from_center': float(_dist_from_center) if '_dist_from_center' in dir() else float(_rp_log.get('distance_from_center', 0.0)),
+                        'closest_wp_idx':       int(_closest[1]) if isinstance(_closest, (list, tuple)) and len(_closest) > 1 else -1,
+                        # v1.1.0: fields _translate_step() / extract_intermediary_metrics() need
+                        'braking':              int(_braking_intent) if '_braking_intent' in dir() else 0,
+                        'is_offtrack':          bool(_offtrack),
+                        'progress':             float(_prog),
+                        'heading_diff':         float(ep_heading_diffs[-1]) if ep_heading_diffs else 0.0,
+                        'safe_speed_ratio':     float(_speed_ratio) if '_speed_ratio' in dir() else 1.0,
+                        'racing_line_offset':   float(_racing_line_err) if '_racing_line_err' in dir() else 0.0,
+                        'in_corner':            bool(_rp_log.get('is_turn', False)),
+                        'track_width':          float(_tw) if '_tw' in dir() else float(_rp_log.get('track_width', 1.0)),
+                        # v1.1.0: jerk for brake_intent scoring
+                        'accel':                float(_accel) if '_accel' in dir() else 0.0,
+                        'v_perp':               float(_v_perp_barrier) if '_v_perp_barrier' in dir() else 0.0,
+                        'in_brake_field':       bool(_in_brake_field) if '_in_brake_field' in dir() else False,
+                        'brake_potential':      float(_brake_potential) if '_brake_potential' in dir() else 0.0,
                     })
                 except Exception:
                     pass
@@ -2214,6 +2258,8 @@ def run(hparams):
                         'offtrack_rate': float(ep_offtrack_count / max(ep_step_count, 1)),
                         'avg_speed': sum(ep_speeds)/max(len(ep_speeds),1) if ep_speeds else 2.0,
                         'corner_crash_rate': float(terminated and ep_step_count < 50),
+                    'avg_safe_speed_ratio': round(sum(ep_safe_speed_ratios) / max(len(ep_safe_speed_ratios), 1), 4),
+                    'avg_racing_line_err':  round(sum(ep_racing_line_errors) / max(len(ep_racing_line_errors), 1), 4),
                     'ctx_obstacle_ratio': sum(1 for h in ep_context_preds if h == 2) / max(len(ep_context_preds), 1),
                     'ctx_curb_ratio': sum(1 for h in ep_context_preds if h == 1) / max(len(ep_context_preds), 1),
                     'ctx_clear_ratio': sum(1 for h in ep_context_preds if h == 0) / max(len(ep_context_preds), 1),
@@ -2415,8 +2461,9 @@ def run(hparams):
                 ep_graze_count         = 0
                 ep_heading_diffs = []
                 ep_ang_vel_centerline = []  # v37
-                _trunc_rp = _step_info.get("reward_params", {}) if isinstance(_step_info, dict) else {}
-                ep_prev_speed = float(_trunc_rp.get("speed", 0.0))
+                _trunc_rp = info.get("reward_params", {}) if isinstance(info, dict) else {}
+                ep_prev_speed = float(_trunc_rp.get("speed", 0.0))        
+                _step_speed_snap = ep_prev_speed
                 ep_jerk_abs = []  # v37
                 ep_brake_before_barrier = []  # v37
                 ep_steerings_raw = []

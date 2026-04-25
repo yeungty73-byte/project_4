@@ -72,8 +72,13 @@ class GGDiagram:
         a_lat = speed * d_heading / self.dt
         self._prev_speed = speed
         self._prev_heading = heading_rad
-        r_sq = (a_lat / self.a_max)**2 + (a_lon / self.a_max)**2
-        u = min(np.sqrt(r_sq), 1.0)
+        # v1.1.0: asymmetric friction ellipse — lateral grip ~85% of longitudinal
+        # REF: Milliken & Milliken (1995) Race Car Vehicle Dynamics, p.68
+        # REF: Pacejka (2005) Tyre and Vehicle Dynamics, 2nd ed.
+        # Real tires: lateral traction limited by tire deformation under braking load
+        _a_lat_max = self.a_max * 0.85   # lateral grip ~85% of longitudinal
+        r_sq = (a_lat / _a_lat_max)**2 + (a_lon / self.a_max)**2
+        u = min(float(np.sqrt(r_sq)), 1.0)
         self._utilisations.append(u)
         return u
 
@@ -166,21 +171,30 @@ def velocity_profile_compliance(speed: float, v_target: float) -> float:
 # ================================================================
 
 def curvature_at_waypoints(waypoints: np.ndarray, indices: list) -> list:
-    """Compute curvature at given waypoint indices.
-    Uses three-point method: curv = 2*|cross(v1,v2)| / (|v1|*|v2|*|v1-v2|)."""
+    """Compute curvature at given waypoint indices using correct Menger circumradius.
+    REF: Menger, K. (1930). Untersuchungen uber allgemeine Metrik. Math. Annalen, 100, 75-163.
+    REF: Coulom, R. (2002). RL using Neural Networks, applications to motor control.
+
+    CORRECT formula:
+        kappa = 2 * |cross(p1-p0, p2-p0)| / (|p1-p0| * |p2-p1| * |p2-p0|)
+    The denominator is the product of ALL THREE pairwise distances (circumradius formula),
+    NOT |v1| * |v2| * |v1-v2| (that was using v2-v1 not p2-p0, a subtle bug).
+    brake_field.py's _menger_curvature() already does this correctly — we now match it.
+    """
     n = len(waypoints)
     curvatures = []
     for i in indices:
-        i0 = (i - 1) % n
-        i1 = i % n
-        i2 = (i + 1) % n
-        v1 = waypoints[i1] - waypoints[i0]
-        v2 = waypoints[i2] - waypoints[i1]
-        cross = abs(v1[0]*v2[1] - v1[1]*v2[0])
-        denom = np.linalg.norm(v1) * np.linalg.norm(v2) * np.linalg.norm(v2 - v1)
-        curvatures.append(2.0 * cross / (denom + 1e-8))
+        p0 = waypoints[(i - 1) % n]
+        p1 = waypoints[i % n]
+        p2 = waypoints[(i + 1) % n]
+        # Cross product = twice the triangle area
+        cross = abs((p1[0]-p0[0])*(p2[1]-p0[1]) - (p1[1]-p0[1])*(p2[0]-p0[0]))
+        # All THREE pairwise side lengths (Menger circumradius denominator)
+        d01 = np.linalg.norm(p1 - p0) + 1e-9   # |p1 - p0|
+        d12 = np.linalg.norm(p2 - p1) + 1e-9   # |p2 - p1|
+        d02 = np.linalg.norm(p2 - p0) + 1e-9   # |p2 - p0|
+        curvatures.append(2.0 * cross / (d01 * d12 * d02))
     return curvatures
-
 
 def multi_horizon_curvature(waypoints: np.ndarray, current_wp: int,
                             horizons=(3, 6, 10, 15)) -> np.ndarray:

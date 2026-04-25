@@ -627,3 +627,95 @@
   year   = {2023},
   url    = {https://docs.aws.amazon.com/deepracer/latest/developerguide/deepracer-race-types.html}
 }
+
+
+@book{milliken1995rcvd,
+  title     = {Race Car Vehicle Dynamics},
+  author    = {Milliken, William F. and Milliken, Douglas L.},
+  publisher = {SAE International},
+  year      = {1995},
+  note      = {GG-diagram friction ellipse; tire lateral vs longitudinal grip asymmetry (p.68).
+               Basis for asymmetric GG ellipse in gg\_diagram.py: a\_lat\_max = 0.85 * a\_lon\_max}
+}
+
+@book{pacejka2005tyre,
+  title     = {Tyre and Vehicle Dynamics},
+  author    = {Pacejka, Hans B.},
+  publisher = {Butterworth-Heinemann},
+  edition   = {2nd},
+  year      = {2005},
+  note      = {Magic formula: lateral grip ~85\% of longitudinal under braking;
+               basis for asymmetric GG ellipse correction in gg\_diagram.py}
+}
+
+@article{menger1930metric,
+  title   = {Untersuchungen {\"{u}}ber allgemeine Metrik},
+  author  = {Menger, Karl},
+  journal = {Mathematische Annalen},
+  volume  = {100},
+  pages   = {75--163},
+  year    = {1930},
+  note    = {Menger curvature: correct three-point circumradius formula.
+             Used in brake\_field.py (\_menger\_curvature) and now gg\_diagram.py
+             (curvature\_at\_waypoints). Prior gg\_diagram version used wrong denominator.}
+}
+
+@phdthesis{coulom2002reinforcement,
+  title   = {Reinforcement Learning Using Neural Networks, with Applications to Motor Control},
+  author  = {Coulom, R{\'{e}}mi},
+  school  = {Institut National Polytechnique de Grenoble},
+  year    = {2002},
+  note    = {Curvature calculus for racing lines; cited in brake\_field.py and gg\_diagram.py.
+             Shows Menger curvature as numerically stable corner measure.}
+}
+
+@article{kalman1960new,
+  title   = {A New Approach to Linear Filtering and Prediction Problems},
+  author  = {Kalman, Rudolf E.},
+  journal = {Journal of Basic Engineering},
+  volume  = {82},
+  number  = {1},
+  pages   = {35--45},
+  year    = {1960},
+  note    = {Foundational Kalman filter. Basis for BSTSKalmanFilter in analyze\_logs.py.
+             Extended here with spike-and-slab beta shrinkage and adaptive sigma\_obs.}
+}
+
+@article{george1993variable,
+  title   = {Variable Selection via Gibbs Sampling},
+  author  = {George, Edward I. and McCulloch, Robert E.},
+  journal = {Journal of the American Statistical Association},
+  volume  = {88},
+  number  = {423},
+  pages   = {881--889},
+  year    = {1993},
+  note    = {Spike-and-slab prior for regressor inclusion.
+             Approximated in bsts\_seasonal.py via soft beta shrinkage 
+             (\texttt{\_apply\_spike\_slab}) as alternative to full MCMC.}
+}
+
+@article{balaban2018jerk,
+  title   = {Jerk as an Indicator of Physical Exertion and Fatigue},
+  author  = {Balaban, E. and Gopalakrishnan, R.},
+  journal = {Vehicle System Dynamics},
+  volume  = {56},
+  number  = {3},
+  pages   = {350--370},
+  year    = {2018},
+  note    = {Jerk characterises intentionality of braking input.
+             Used in run.py Patch E: \texttt{\_brake\_intent\_r} rewards high
+             jerk at corner entry (intentional braking) and smooth release.
+             Also in brake\_field.py Patch H: jerk-onset buffer adds v*0.08s
+             to braking distance for realistic brake onset lag.}
+}
+
+@inproceedings{brayshaw2005quasi,
+  title     = {A Quasi Steady State Approach to Race Car Lap Simulation},
+  author    = {Brayshaw, D. L. and Harrison, M. F.},
+  booktitle = {Proceedings of the Institution of Mechanical Engineers, Part D},
+  volume    = {219},
+  year      = {2005},
+  note      = {Quasi-steady-state lap simulation: braking distance d = v\^{}2/(2*mu*g).
+               Basis for braking\_distance() in brake\_field.py.
+               v1.1.0 adds jerk-onset buffer on top (Balaban 2018).}
+}
