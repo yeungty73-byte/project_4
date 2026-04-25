@@ -125,23 +125,6 @@ def compute_track_curvature(waypoints, closest, lookahead=5):
     safe_speed = min(4.0, max(1.0, 0.8 * (1.0 / (curv + 1e-6))**0.5))
     return curv, safe_speed
 
-
-def compute_racing_line_offset(waypoints, closest, tw, lookahead=8):
-    """Return lateral offset from centerline for racing line (-0.7 to 0.7)."""
-    if not waypoints or len(waypoints) < 3:
-        return 0.0
-    n = len(waypoints)
-    idx = closest[1] if len(closest) > 1 else 0
-    p0 = waypoints[idx]
-    pa = waypoints[(idx + lookahead) % n]
-    pb = waypoints[(idx - 3) % n]
-    dx1, dy1 = p0[0] - pb[0], p0[1] - pb[1]
-    dx2, dy2 = pa[0] - p0[0], pa[1] - p0[1]
-    cross = dx1 * dy2 - dy1 * dx2
-    mag = (dx1**2 + dy1**2)**0.5 * (dx2**2 + dy2**2)**0.5 + 1e-8
-    return max(-0.7, min(0.7, -cross / mag * 3.0))
-
-
 def _compute_crash_v_perp(speed, heading, closest_wp, waypoints):
     """Velocity component perpendicular to track tangent at closest waypoint."""
     if not waypoints or not closest_wp or len(closest_wp) < 2:
@@ -171,7 +154,7 @@ def _compute_crash_v_tang(speed, heading, closest_wp, waypoints):
 
 def compute_racing_line_offset(waypoints, closest, tw, lookahead=8):
     if not waypoints or len(waypoints) < 3: return 0.0
-    n = len(waypoints); idx = closest[1] if len(closest) > 1 else 0
+    n = len(waypoints); idx = closest[1] % n if len(closest) > 1 else 0
     p0 = waypoints[idx]; pa = waypoints[(idx + lookahead) % n]; pb = waypoints[(idx - 3) % n]
     dx1, dy1 = p0[0] - pb[0], p0[1] - pb[1]; dx2, dy2 = pa[0] - p0[0], pa[1] - p0[1]
     cross = dx1 * dy2 - dy1 * dx2; mag = (dx1**2 + dy1**2)**0.5 * (dx2**2 + dy2**2)**0.5 + 1e-8
@@ -915,6 +898,9 @@ def run(hparams):
             "braking": [], "turn_align": []
     }
     ep_speeds = []
+    ep_jerk_abs = []
+    ep_brake_before_barrier = []
+    ep_speed_prev = None
     ep_headings = []  # v26
     ep_closest_wps = []  # v26
     ep_dist_from_center = []
@@ -970,9 +956,6 @@ def run(hparams):
     ep_prev_steer = 0.0
     # v37 per-episode lists — must exist before hard-truncation block
     ep_ang_vel_centerline: list = []
-    ep_speed_prev = None
-    ep_jerk_abs: list = []
-    ep_brake_before_barrier: list = []
 
     # Initialize env to get observation shape
     # Retry env.reset() - recreate env on failure (ZMQ socket state)
@@ -1021,15 +1004,20 @@ def run(hparams):
         from htm_reference import HTMPilotDriver
         _init_rp = _init_info.get("reward_params", {}) if isinstance(_init_info, dict) else {}
         _env_waypoints = _init_rp.get("waypoints", [])
-        htm_pilot = HTMPilotDriver(
-            waypoints=_env_waypoints,
-            track_width=float(_init_rp.get("track_width", 0.6)),
-            track_variant=_track_variant,
-        )
-        n_harvested = harvest_htm_pilots(env, htm_pilot, td3sac,
-                                         n_episodes=50, min_progress=80.0)
-        if n_harvested >= 10:
-            pretrain_td3_bc(td3sac, agent, bc_steps=2000)
+
+        # GUARD: don't build HTM pilot on empty waypoints
+        if len(_env_waypoints) < 10:
+            logger.warning("[HTM] waypoints empty at init — skipping BC harvest")
+        else:
+            htm_pilot = HTMPilotDriver(
+                waypoints=_env_waypoints,
+                track_width=float(_init_rp.get("track_width", 0.6)),
+                track_variant=_track_variant,
+            )
+            n_harvested = harvest_htm_pilots(env, htm_pilot, td3sac,
+                                            n_episodes=50, min_progress=80.0)
+            if n_harvested >= 10:
+                pretrain_td3_bc(td3sac, agent, bc_steps=2000)
     except ImportError:
         logger.warning("[HTM] htm_reference not found – skipping BC seed harvest")
     except Exception as _htm_e:
@@ -1082,7 +1070,7 @@ def run(hparams):
             hp['ent_coef'] = min(hp['ent_coef'] * 1.5, 0.05)  # explore more on plateau
             hp['lr'] = min(hp['lr'] * 1.3, 5e-4)
         elif _bt.get('phase') == 'declining':
-            hp['ent_coef'] = min(hp['ent_coef'] * 2.0, 0.08)  # strong explore on decline
+            hp['ent_coef'] = min(hp['ent_coef'] * 1.5, 0.03)  # strong explore on decline
         elif _bt.get('phase') == 'improving' and _bt.get('return_slope', 0) > 0.5:
             hp['ent_coef'] = max(hp['ent_coef'] * 0.8, 0.005)  # exploit on strong improvement
         # --- v6: architecture annealing ---
@@ -1171,8 +1159,8 @@ def run(hparams):
             #   (4) clip to action_space.low/high
 
             # --- v213 FIX: use process_action for ALL action dispatch (discrete + continuous) ---
-            rawaction = action.cpu().numpy()          # ← must be BEFORE process_action call
-            _step_action = process_action(rawaction, env.action_space)
+            _raw_action = action.cpu().numpy()          # ← must be BEFORE process_action call
+            _step_action = process_action(_raw_action, env.action_space)
             # v40.2: removed duplicate env.step that used un-remapped action (caused 100% stuck episodes)
             # v40.3: comprehensive action dispatch telemetry for first 20 steps of each episode
             try:
@@ -1291,6 +1279,7 @@ def run(hparams):
                     _race_map = build_racing_line_map(_waypoints, _tw, v_max=4.0)
                     logger.info(f'[RACE_MAP] Built racing line map: {len(_race_map)} waypoints')
                 _closest = rp.get("closest_waypoints", [0, 1])
+                _closest = [c % max(len(_waypoints), 1) for c in _closest]  # ← modulo wrap
 
                 # --- v5: Track geometry ---
                 _curvature, _safe_speed = compute_track_curvature(_waypoints, _closest)
@@ -2066,9 +2055,6 @@ def run(hparams):
                 _rl_phase = min(1.0, global_step / (scheduler.total_steps * 0.8))
                 ep_heading_diffs = []
                 ep_ang_vel_centerline = []  # v37
-                ep_speed_prev = None  # v37
-                ep_jerk_abs = []  # v37
-                ep_brake_before_barrier = []  # v37
                 ep_steerings_raw = []
                 ep_prev_speed = 0.0
                 ep_decel_penalties = []
@@ -2154,11 +2140,15 @@ def run(hparams):
                 _, newlogprob, entropy, newvalue, new_ctx_logits, _new_intermed = agent.get_action_and_value(
                     b_obs[mb_inds], b_actions[mb_inds]
                 )
-                logratio = newlogprob - b_logprobs[mb_inds]
+                # Clamp logratio BEFORE exp to prevent inf
+                logratio = (newlogprob - b_logprobs[mb_inds]).clamp(-10.0, 10.0)  # ← add clamp
                 ratio = logratio.exp()
 
                 with torch.no_grad():
                     approx_kl = ((ratio - 1) - logratio).mean()
+                    if torch.isnan(approx_kl) or torch.isinf(approx_kl):
+                        logger.warning(f"[PPO] approx_kl is {approx_kl} — skipping minibatch")
+                        continue  # skip this minibatch, don't poison the optimizer
                     clipfracs.append(
                         ((ratio - 1.0).abs() > hp['clip_coef']).float().mean().item()
                     )
