@@ -948,10 +948,10 @@ def run(hparams):
     _phase = _phase_schedule[0]
     env = _apply_phase_env(args, _phase, current_env=None)
     _phase_steps_remaining = _phase["timesteps"]
-    logger.info(f"action_space type: {type(env.action_space).__name__}")
-    logger.info(f"action_space: {env.action_space}")
-    logger.info(f"has .n: {hasattr(env.action_space, 'n')}, .n={getattr(env.action_space, 'n', None)}")
-    logger.info(f"has .low: {hasattr(env.action_space, 'low')}, shape={getattr(env.action_space, 'shape', None)}")
+    logger.debug(f"action_space type: {type(env.action_space).__name__}")
+    logger.debug(f"action_space: {env.action_space}")
+    logger.debug(f"has .n: {hasattr(env.action_space, 'n')}, .n={getattr(env.action_space, 'n', None)}")
+    logger.debug(f"has .low: {hasattr(env.action_space, 'low')}, shape={getattr(env.action_space, 'shape', None)}")
     # --- v6: stuck tracker ---
     stuck_tracker = StuckTracker(save_path=os.path.join("runs", run_name, "stuck_stats.json"))
 
@@ -1316,7 +1316,9 @@ def run(hparams):
     global_step = 0
     episode_count = 0
     observation, info = env.reset()
-    _episode_progress_state = reset_episode_centerline_progress(info.get('reward_params', {}) if isinstance(info, dict) else {}, _track_progress_cache)
+    _episode_progress_state = reset_episode_centerline_progress(info.get('reward_params', {}) 
+                                                                if isinstance(info, dict) else {}, 
+                                                                _track_progress_cache)
     next_obs = tensor(obs_to_array(observation))
     next_done = torch.zeros(1, device=DEVICE)
     best_return = float('-inf')
@@ -1336,7 +1338,9 @@ def run(hparams):
             _track_name    = _phase["track"]
             _track_variant = _phase["variant"]
             observation, info = env.reset()
-            _episode_progress_state = reset_episode_centerline_progress(info.get('reward_params', {}) if isinstance(info, dict) else {}, _track_progress_cache)
+            _episode_progress_state = reset_episode_centerline_progress(info.get('reward_params', {}) 
+                                                                        if isinstance(info, dict) else {}, 
+                                                                        _track_progress_cache)
             next_obs   = tensor(obs_to_array(observation))
             next_done  = torch.zeros(1, device=DEVICE)
         # --- v4: Get annealed hyperparams ---
@@ -1456,17 +1460,21 @@ def run(hparams):
                 _ep_step = int(ep_step_count) if 'ep_step_count' in dir() else global_step
             except Exception:
                 _ep_step = global_step
-            if _ep_step < 20 or (global_step % 500 == 0):
+            # v1.0.13: telemetry only for first 3 steps of first 3 episodes
+            if episode_count < 3 and ep_step_count < 3:
                 try:
-                    _as = env.action_space
-                    _as_info = (f"Box[{_as.low.tolist()}..{_as.high.tolist()},shape={_as.shape}]" 
-                                if hasattr(_as,"low") else f"Discrete(n={getattr(_as,'n','?')})")
-                    _sa_info = (f"type={type(_step_action).__name__} val={_step_action!r}")
-                    _ra_info = (f"type={type(_raw_action).__name__} val={_raw_action!r}")
-                    logger.debug(f"[TELEMETRY gs={global_step} eps={_ep_step}] act_space={_as_info} raw={_ra_info} step={_sa_info}")
-                except Exception as _e:
-                    logger.warning(f"[TELEMETRY fail] {_e}")
+                    as_ = env.action_space
+                    as_info = f"Box(shape={as_.shape})" if hasattr(as_, 'low') else f"Discrete(n={getattr(as_,'n','?')})"
+                    logger.debug(f"TELEMETRY gs={global_step} ep={episode_count} step={ep_step_count} "
+                                f"act_space={as_info} raw={type(raw_action).__name__}:{raw_action!r}")
+                except Exception as e:
+                    logger.warning(f"TELEMETRY fail {e}")
             observation, reward, terminated, truncated, info = env.step(_step_action)
+            # v1.0.13: continuous arc-progress update — runs every step, not just episode end
+            _rp_now = info.get("reward_params", {}) if isinstance(info, dict) else {}
+            ep_centerline_progress_m, ep_track_length_m, ep_progress_pct, _prog_delta, episode_progress_state = \
+                update_episode_centerline_progress(_rp_now, _track_progress_cache, episode_progress_state)
+            ep_progress = ep_centerline_progress_m
             # logger.info(f"[TRUNCATE] ep_step={ep_step_count} >= 500, forcing truncation")
             # Debug: log reward_params for first 3 steps
             if global_step <= 3:
@@ -1525,7 +1533,8 @@ def run(hparams):
                 logger.info(f"[REWARD_DIAG] rp keys={list(rp.keys())}, rp={rp}")
             # v23: base progress reward
             _prog_raw = float(rp.get("progress", 0.0) or 0.0)
-            _center_m, _total_m, _center_pct, _center_delta_m, _episode_progress_state = update_episode_centerline_progress(rp, _track_progress_cache, _episode_progress_state)
+            _center_m, _total_m, _center_pct, _center_delta_m, _episode_progress_state = \
+                update_episode_centerline_progress(rp, _track_progress_cache, _episode_progress_state)
             _prog = _center_pct
             ep_centerline_progress_m = max(ep_centerline_progress_m, _center_m)
             ep_track_length_m = max(ep_track_length_m, _total_m)
@@ -1986,19 +1995,16 @@ def run(hparams):
             if terminated or truncated:
                 ep_return = cumulative_ep_reward
                 ep_length = ep_step_count
-                _final_rp = info.get("reward_params", {}) if isinstance(info, dict) else {}
-                _final_m, _final_total_m, _final_pct, _final_delta_m, _episode_progress_state = update_episode_centerline_progress(_final_rp, _track_progress_cache, _episode_progress_state)
-                ep_centerline_progress_m = max(ep_centerline_progress_m, _final_m)
-                ep_track_length_m = max(ep_track_length_m, _final_total_m)
                 # ep_progress = max(ep_track_progress_pct, _final_pct)
                 # _raw_final_progress = float(_final_rp.get("progress", 0.0) or 0.0)
-                _bad_end = bool(_final_rp.get("is_offtrack", False) or _final_rp.get("is_crashed", False) or _final_rp.get("is_reversed", False))
+                _bad_end = bool(_rp_now.get("is_offtrack", False) or _rp_now.get("is_crashed", False) or _rp_now.get("is_reversed", False))
                 # lap_completed = 1.0 if (ep_progress >= 99.0 and not _bad_end and ep_step_count >= 60) else 0.0
-                
-                _raw_prog        = info.get("reward_params",{}).get("progress",0.0)
-                ep_progress      = (_raw_prog/100.0)*_total_track_arc   # metres
-                ep_progress_pct  = float(_raw_prog)                     # 0-100 for gates
-                lap_completed    = 1.0 if (ep_progress_pct>=100.0 and not _bad_end) else 0.0
+                # v1.0.13: ep_progress / ep_progress_pct already set per-step above
+                # raw_prog still needed for lap gate only
+                raw_prog = info.get("reward_params", {}).get("progress", 0.0) if isinstance(info, dict) else 0.0
+                ep_progress_pct = max(ep_progress_pct, float(raw_prog))   # take sim pct as floor for lap gate
+                lap_completed = 1.0 if ep_progress_pct >= 100.0 and not _bad_end else 0.0
+                bootstrap_rewards.update_episode(ep_progress_pct, lap_completed > 0.0)
                 bootstrap_rewards.update_episode(ep_progress, lap_completed == 1.0)
                 lap_time_sec = time.time() - ep_start_time  # v24: wall-clock episode time
                 episode_count += 1
@@ -2379,7 +2385,11 @@ def run(hparams):
                 ep_centerline_progress_m = 0.0
                 ep_track_length_m      = 100.0
                 ep_track_progress_pct  = 0.0
-                _episode_progress_state = reset_episode_centerline_progress(info.get('reward_params', {}) if isinstance(info, dict) else {}, _track_progress_cache)
+                # v1.0.13: arc-length progress update (replaces raw rp['progress'])
+                _rp_step = info.get("reward_params", {}) if isinstance(info, dict) else {}
+                ep_centerline_progress_m, ep_track_length_m, ep_progress_pct, _prog_delta, _episode_progress_state = \
+                    update_episode_centerline_progress(_rp_step, _track_progress_cache, _episode_progress_state)
+                ep_progress = ep_centerline_progress_m   # metres traveled this episode
                 ep_context_preds       = []
                 ep_lidar_mins          = []
                 ep_barrier_proximities = []
