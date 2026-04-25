@@ -644,6 +644,8 @@ def harvest_htm_pilots(env, htm_agent, td3sac, n_episodes=12, min_progress=5.0):
     for ep in range(max(n_episodes * 3, n_episodes)):
         obs, info = env.reset()
         rp = info.get('reward_params', {}) if isinstance(info, dict) else {}
+        _bc_progress_cache = {}
+        _bc_progress_state = reset_episode_centerline_progress(rp, _bc_progress_cache)
         ep_buf, ep_prog = [], 0.0
         terminated, truncated = False, False
         while not (terminated or truncated):
@@ -651,7 +653,7 @@ def harvest_htm_pilots(env, htm_agent, td3sac, n_episodes=12, min_progress=5.0):
             action = process_action(raw_action, env.action_space)
             next_obs, reward, terminated, truncated, info = env.step(action)
             next_rp = info.get('reward_params', {}) if isinstance(info, dict) else {}
-            _, _, prog_pct = centerline_progress_from_reward_params(next_rp, {})
+            _, _, prog_pct, _, _bc_progress_state = update_episode_centerline_progress(next_rp, _bc_progress_cache, _bc_progress_state)
             ep_prog = max(ep_prog, float(prog_pct))
             act_t = torch.tensor(np.asarray(action), dtype=torch.float32)
             obs_t = torch.tensor(obs_to_array(obs), dtype=torch.float32)
@@ -764,32 +766,34 @@ def arc_track_length(waypoints) -> float:
         total += math.hypot(x1 - x0, y1 - y0)
     return max(total, 1.0)
 
-def centerline_progress_from_reward_params(rp: dict, cache: dict | None = None):
-    """
-    Return (distance_m, track_len_m, percent) where percent is
-    centerline distance traveled / actual centerline track length * 100.
-    This replaces raw simulator progress as the training/logging metric.
-    """
+def _build_centerline_cache(waypoints, cache):
+    n = len(waypoints)
+    key = id(waypoints)
+    if cache.get("key") == key and cache.get("n") == n:
+        return cache
+    seg = []
+    cum = [0.0]
+    for i in range(n):
+        x0, y0 = float(waypoints[i][0]), float(waypoints[i][1])
+        x1, y1 = float(waypoints[(i + 1) % n][0]), float(waypoints[(i + 1) % n][1])
+        d = math.hypot(x1 - x0, y1 - y0)
+        seg.append(d)
+        cum.append(cum[-1] + d)
+    cache.clear()
+    cache.update({"key": key, "n": n, "seg": seg, "cum": cum, "total": max(cum[-1], 1.0)})
+    return cache
+
+def centerline_arc_position_from_reward_params(rp: dict, cache: dict | None = None):
+    """Absolute projected arc coordinate in [0, track_len). Not episode progress."""
     if cache is None:
         cache = {}
     waypoints = rp.get("waypoints", []) if isinstance(rp, dict) else []
     closest = rp.get("closest_waypoints", [0, 1]) if isinstance(rp, dict) else [0, 1]
     if not waypoints or len(waypoints) < 2:
         raw = float(rp.get("progress", 0.0) or 0.0) if isinstance(rp, dict) else 0.0
-        return raw, 100.0, raw
+        return max(0.0, raw), 100.0
     n = len(waypoints)
-    key = id(waypoints)
-    if cache.get("key") != key or cache.get("n") != n:
-        seg = []
-        cum = [0.0]
-        for i in range(n):
-            x0, y0 = float(waypoints[i][0]), float(waypoints[i][1])
-            x1, y1 = float(waypoints[(i + 1) % n][0]), float(waypoints[(i + 1) % n][1])
-            d = math.hypot(x1 - x0, y1 - y0)
-            seg.append(d)
-            cum.append(cum[-1] + d)
-        cache.clear()
-        cache.update({"key": key, "n": n, "seg": seg, "cum": cum, "total": max(cum[-1], 1.0)})
+    _build_centerline_cache(waypoints, cache)
     try:
         prev_i = int(closest[0]) % n
         next_i = int(closest[1]) % n
@@ -802,15 +806,49 @@ def centerline_progress_from_reward_params(rp: dict, cache: dict | None = None):
     vx, vy = x1 - x0, y1 - y0
     denom = vx * vx + vy * vy
     frac = 0.0 if denom <= 1e-12 else max(0.0, min(1.0, ((x - x0) * vx + (y - y0) * vy) / denom))
-    seg_len = cache["seg"][prev_i]
-    dist_m = cache["cum"][prev_i] + frac * seg_len
+    arc_m = cache["cum"][prev_i] + frac * cache["seg"][prev_i]
     total_m = cache["total"]
-    pct = 100.0 * dist_m / total_m
-    raw = float(rp.get("progress", pct) or pct)
-    # If the simulator reports lap completion, trust completion while keeping metres meaningful.
-    if raw >= 100.0:
-        dist_m, pct = total_m, 100.0
-    return float(dist_m), float(total_m), float(max(0.0, min(100.0, pct)))
+    return float(max(0.0, min(total_m, arc_m))), float(total_m)
+
+def reset_episode_centerline_progress(rp: dict, cache: dict | None = None):
+    """Initialize episode-relative progress at this reset/spawn location."""
+    arc_m, total_m = centerline_arc_position_from_reward_params(rp, cache or {})
+    return {"start_arc": arc_m, "last_arc": arc_m, "unwrapped": 0.0,
+            "best_m": 0.0, "total_m": total_m, "last_delta_m": 0.0}
+
+def update_episode_centerline_progress(rp: dict, cache: dict | None, state: dict | None):
+    """
+    Episode progress = forward centerline displacement since reset/spawn.
+    This deliberately does NOT treat waypoint 70/120 as 58% progress if the car spawned there.
+    """
+    if cache is None:
+        cache = {}
+    if state is None or "start_arc" not in state:
+        state = reset_episode_centerline_progress(rp, cache)
+        return 0.0, state["total_m"], 0.0, 0.0, state
+    arc_m, total_m = centerline_arc_position_from_reward_params(rp, cache)
+    last_arc = float(state.get("last_arc", arc_m))
+    delta = arc_m - last_arc
+    if delta > 0.5 * total_m:
+        delta -= total_m
+    elif delta < -0.5 * total_m:
+        delta += total_m
+    # A single sim step cannot legitimately cover 20% of the track; treat that as reset/teleport noise.
+    if abs(delta) > 0.20 * total_m:
+        delta = 0.0
+    state["last_arc"] = arc_m
+    state["total_m"] = total_m
+    state["last_delta_m"] = delta
+    state["unwrapped"] = float(state.get("unwrapped", 0.0)) + delta
+    progress_m = max(0.0, min(total_m, float(state.get("unwrapped", 0.0))))
+    state["best_m"] = max(float(state.get("best_m", 0.0)), progress_m)
+    pct = 100.0 * state["best_m"] / max(total_m, 1e-6)
+    return float(state["best_m"]), float(total_m), float(max(0.0, min(100.0, pct))), float(delta), state
+
+def centerline_progress_from_reward_params(rp: dict, cache: dict | None = None):
+    """Compatibility wrapper: returns absolute arc percent, not safe for episode progress."""
+    arc_m, total_m = centerline_arc_position_from_reward_params(rp, cache or {})
+    return arc_m, total_m, 100.0 * arc_m / max(total_m, 1e-6)
 
 class BootstrapRewardController:
     """Adaptive initial-stage shaping: force completion-first rewards until laps appear."""
@@ -1070,6 +1108,7 @@ def run(hparams):
     # EpisodeMetricsAccumulator: step-level state accumulator for braking/speed analysis
     ep_metrics = EpisodeMetricsAccumulator()
     _track_progress_cache = {}
+    _episode_progress_state = {}
 
     # --- v200: JSONL metrics file for BSTS analysis ---
     os.makedirs('results', exist_ok=True)
@@ -1270,6 +1309,7 @@ def run(hparams):
     global_step = 0
     episode_count = 0
     observation, info = env.reset()
+    _episode_progress_state = reset_episode_centerline_progress(info.get('reward_params', {}) if isinstance(info, dict) else {}, _track_progress_cache)
     next_obs = tensor(obs_to_array(observation))
     next_done = torch.zeros(1, device=DEVICE)
     best_return = float('-inf')
@@ -1289,6 +1329,7 @@ def run(hparams):
             _track_name    = _phase["track"]
             _track_variant = _phase["variant"]
             observation, info = env.reset()
+            _episode_progress_state = reset_episode_centerline_progress(info.get('reward_params', {}) if isinstance(info, dict) else {}, _track_progress_cache)
             next_obs   = tensor(obs_to_array(observation))
             next_done  = torch.zeros(1, device=DEVICE)
         # --- v4: Get annealed hyperparams ---
@@ -1463,7 +1504,7 @@ def run(hparams):
                 logger.info(f"[REWARD_DIAG] rp keys={list(rp.keys())}, rp={rp}")
             # v23: base progress reward
             _prog_raw = float(rp.get("progress", 0.0) or 0.0)
-            _center_m, _total_m, _center_pct = centerline_progress_from_reward_params(rp, _track_progress_cache)
+            _center_m, _total_m, _center_pct, _center_delta_m, _episode_progress_state = update_episode_centerline_progress(rp, _track_progress_cache, _episode_progress_state)
             _prog = _center_pct
             ep_centerline_progress_m = max(ep_centerline_progress_m, _center_m)
             ep_track_length_m = max(ep_track_length_m, _total_m)
@@ -1924,12 +1965,13 @@ def run(hparams):
                 ep_return = cumulative_ep_reward
                 ep_length = ep_step_count
                 _final_rp = info.get("reward_params", {}) if isinstance(info, dict) else {}
-                _final_m, _final_total_m, _final_pct = centerline_progress_from_reward_params(_final_rp, _track_progress_cache)
+                _final_m, _final_total_m, _final_pct, _final_delta_m, _episode_progress_state = update_episode_centerline_progress(_final_rp, _track_progress_cache, _episode_progress_state)
                 ep_centerline_progress_m = max(ep_centerline_progress_m, _final_m)
                 ep_track_length_m = max(ep_track_length_m, _final_total_m)
                 ep_progress = max(ep_track_progress_pct, _final_pct)
                 _raw_final_progress = float(_final_rp.get("progress", 0.0) or 0.0)
-                lap_completed = 1.0 if (ep_progress >= 99.0 or _raw_final_progress >= 100.0) else 0.0
+                _bad_end = bool(_final_rp.get("is_offtrack", False) or _final_rp.get("is_crashed", False) or _final_rp.get("is_reversed", False))
+                lap_completed = 1.0 if (ep_progress >= 99.0 and not _bad_end and ep_step_count >= 60) else 0.0
                 bootstrap_rewards.update_episode(ep_progress, lap_completed >= 1.0)
                 lap_time_sec = time.time() - ep_start_time  # v24: wall-clock episode time
                 episode_count += 1
@@ -1995,7 +2037,7 @@ def run(hparams):
                     for _ai, _ar in enumerate(ep_ante_buf):
                         logger.info(f'  [ANTE t-{_ante_n-_ai}] {_ar}')
                 # --- v4: Log stuck position ---
-                if ep_progress < 100.0:
+                if ep_progress < 100.0 or term_reason in ('offtrack', 'crashed'):
                     _rp = info.get('reward_params', {})
                     logger.warning(
                         f'[STUCK] step={global_step}, '
@@ -2135,8 +2177,11 @@ def run(hparams):
                         'avg_jerk': (sum(ep_jerk_abs)/len(ep_jerk_abs)) if ('ep_jerk_abs' in dir() and ep_jerk_abs) else 0.0,  # v37
                         'max_jerk': (max(ep_jerk_abs) if ('ep_jerk_abs' in dir() and ep_jerk_abs) else 0.0),  # v37
                         'brake_line_compliance': (sum(ep_brake_before_barrier)/len(ep_brake_before_barrier)) if ('ep_brake_before_barrier' in dir() and ep_brake_before_barrier) else 0.0,  # v37
-                        'position_in_lap': float(_prog) if '_prog' in dir() else 0.0,  # v37
-                        'lap_completed': 1.0 if (('_prog' in dir()) and float(_prog) >= 0.99) else 0.0,  # v37
+                        'position_in_lap': float(ep_progress),  # v1.0.14 centerline pct
+                        'completion_pct': float(ep_progress),
+                        'track_progress_m': float(ep_centerline_progress_m),
+                        'track_length_m': float(ep_track_length_m),
+                        'lap_completed': float(lap_completed),  # v1.0.14 strict completion gate
                     }
                     bsts_feedback.update(bsts_metrics)
                 # --- Compute BSTS-adjusted reward weights ---
@@ -2284,6 +2329,11 @@ def run(hparams):
                 ep_step_count          = 0
                 cumulative_ep_reward   = 0.0
                 _prev_prog_tracker     = 0.0
+                ep_progress            = 0.0
+                ep_centerline_progress_m = 0.0
+                ep_track_length_m      = 100.0
+                ep_track_progress_pct  = 0.0
+                _episode_progress_state = reset_episode_centerline_progress(info.get('reward_params', {}) if isinstance(info, dict) else {}, _track_progress_cache)
                 ep_context_preds       = []
                 ep_lidar_mins          = []
                 ep_barrier_proximities = []
