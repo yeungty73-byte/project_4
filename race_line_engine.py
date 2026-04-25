@@ -1,34 +1,177 @@
 # race_line_engine.py
-# Multi-line optimal path engine: time-trial, obstacle-aware, bot-overtake
+# Multi-line optimal path engine: time-trial, obstacle-aware, bot-overtake.
+# UPGRADED: object recognition + dimensions, bot motion projection,
+#           car-dimension-aware apex offsets, object-permanence angle gating.
+#
 # REF: Hart et al. (1968) A*; TheRayG (2020) deepracer-log-analysis;
-#      Gonzalez (2020); Coulom (2002) curvature calculus
-import math, numpy as np
+#      Gonzalez (2020); Coulom (2002) curvature calculus;
+#      Heilmeier et al. (2020) minimum-curvature QP race line;
+#      Waymo Motion Prediction (2021) constant-velocity projection.
+import math
+import numpy as np
 from typing import List, Tuple, Optional, Dict
+from config_loader import CFG
+
+# ---------------------------------------------------------------------------
+# Vehicle / object dimensions  (metres, 1/18-scale DeepRacer)
+# ---------------------------------------------------------------------------
+_CAR_WIDTH      = CFG.get("vehicle", {}).get("width",          0.20)
+_CAR_HALF_W     = _CAR_WIDTH / 2.0                                     # 0.10 m
+_CAR_SAFETY     = CFG.get("vehicle", {}).get("safety_lat",     0.05)  # lateral buffer
+_SAFE_HALF_W    = _CAR_HALF_W + _CAR_SAFETY                           # 0.15 m
+_CAR_LENGTH     = CFG.get("vehicle", {}).get("length",         0.28)
+_CAR_FRONT_OVH  = _CAR_LENGTH / 2.0                                    # 0.14 m
+
+# Object half-widths by type
+_OBJ_HALF_W = {
+    'bot':    _CAR_HALF_W,          # same as own car
+    'cone':   CFG.get("vehicle", {}).get("cone_radius",     0.05),
+    'static': 0.10,
+    'curb':   0.02,
+}
+
 
 def _curvature_radius(wpts, idx, w=3):
+    """Radius of curvature at waypoint idx using Menger formula.
+    REF: Coulom (2002); Menger (1930).
+    """
     n = len(wpts)
-    if n < 3: return 999.0
-    p0 = np.array(wpts[(idx-w)%n][:2])
-    p1 = np.array(wpts[idx%n][:2])
-    p2 = np.array(wpts[(idx+w)%n][:2])
-    d1 = p1-p0; d2 = p2-p1
-    cross = abs(d1[0]*d2[1]-d1[1]*d2[0])
-    nm = max(np.linalg.norm(d1),1e-6)
-    return 1.0/(cross/(nm**3+1e-9)+1e-6)
+    if n < 5:
+        return 999.0
+    p0 = np.array(wpts[(idx - w) % n][:2], dtype=float)
+    p1 = np.array(wpts[idx % n][:2],       dtype=float)
+    p2 = np.array(wpts[(idx + w) % n][:2], dtype=float)
+    d1 = p1 - p0
+    d2 = p2 - p1
+    cross = abs(d1[0]*d2[1] - d1[1]*d2[0])
+    nm    = max(np.linalg.norm(d1), 1e-6)
+    return 1.0 / (cross / (nm**3 + 1e-9) + 1e-6)
+
 
 def _optimal_speed(r, C=1.5, vmin=0.5, vmax=4.0):
-    return float(np.clip(math.sqrt(max(C*r,0)), vmin, vmax))
+    return float(np.clip(math.sqrt(max(C * r, 0)), vmin, vmax))
+
+
+def _cross_sign(wpts, i):
+    """Returns +1 for left turn, -1 for right turn at waypoint i."""
+    n  = len(wpts)
+    p0 = np.array(wpts[(i-3) % n][:2], dtype=float)
+    p1 = np.array(wpts[i][:2],         dtype=float)
+    p2 = np.array(wpts[(i+3) % n][:2], dtype=float)
+    d1 = p1 - p0
+    d2 = p2 - p1
+    return 1.0 if (d1[0]*d2[1] - d1[1]*d2[0]) > 0 else -1.0
+
+
+def _apex_offset_car_aware(r, cross, track_half_w):
+    """Apex-seeking lateral offset that accounts for car half-width.
+
+    The car EDGE (not centre) must not exceed the track boundary.
+    max_offset = track_half_w - _SAFE_HALF_W   (guarantees clearance).
+    REF: Heilmeier et al. (2020) minimum-curvature QP.
+    """
+    if r > 200:
+        return 0.0
+    max_off = max(0.0, track_half_w - _SAFE_HALF_W)
+    if r < 20:
+        tightness = min(max_off, 8.0 / r)
+    elif r < 50:
+        tightness = min(max_off * 0.7, 4.0 / r)
+    else:
+        tightness = min(max_off * 0.3, 0.5)
+    return float(-cross * tightness)
+
+
+class ObjectRecord:
+    """Describes a detected object for race-line computation.
+
+    Supports:
+      'bot'    — another DeepRacer (has heading + speed)
+      'cone'   — static traffic cone
+      'static' — generic static obstacle
+      'curb'   — track boundary marker (treated as a constraint, not obstacle)
+
+    Object-permanence:
+      visible_angle_from() returns the angular span of the object corners
+      from the car's current viewpoint.  A larger angle signals that the
+      car is close or the object is large — the race-line shift scales with it.
+
+    Bot motion projection (constant-velocity):
+      projected_wp() finds the track waypoint the bot will occupy in
+      `lookahead_t` seconds, so the overtake line is set up AHEAD of time.
+      REF: Waymo Motion Prediction Challenge (2021).
+    """
+
+    def __init__(self, obj_type='static', x=0.0, y=0.0,
+                 heading=0.0, speed=0.0, wp_idx=0):
+        self.obj_type = obj_type
+        self.x        = float(x)
+        self.y        = float(y)
+        self.heading  = float(heading)
+        self.speed    = float(speed)
+        self.wp_idx   = int(wp_idx)
+
+    @property
+    def half_width(self):
+        return _OBJ_HALF_W.get(self.obj_type, 0.10)
+
+    def safe_clearance(self):
+        """Total lateral space needed: obj half-w + own car half-w + safety buffer."""
+        return self.half_width + _SAFE_HALF_W
+
+    def corner_points(self):
+        """4 bounding-box corners in world frame."""
+        hw = self.half_width
+        hl = hw * 1.4 if self.obj_type == 'bot' else hw
+        c, s = math.cos(self.heading), math.sin(self.heading)
+        local = np.array([[ hl, hw], [ hl,-hw], [-hl,-hw], [-hl, hw]], dtype=float)
+        rot   = np.array([[c, -s], [s, c]])
+        return (rot @ local.T).T + np.array([self.x, self.y])
+
+    def visible_angle_from(self, car_x, car_y):
+        """Angular span of object corners from car position.
+        Larger -> car is close or object is big -> scale race-line shift up.
+        """
+        corners  = self.corner_points()
+        car_pos  = np.array([car_x, car_y])
+        angles   = [math.atan2(c[1]-car_pos[1], c[0]-car_pos[0]) for c in corners]
+        max_span = 0.0
+        for i in range(len(angles)):
+            for j in range(i+1, len(angles)):
+                d = abs(angles[i] - angles[j])
+                max_span = max(max_span, min(d, 2*math.pi - d))
+        return max_span
+
+    def projected_position(self, dt=1.5):
+        """Constant-velocity projection for bots."""
+        if self.obj_type == 'bot' and self.speed > 0.1:
+            return (self.x + self.speed * math.cos(self.heading) * dt,
+                    self.y + self.speed * math.sin(self.heading) * dt)
+        return self.x, self.y
+
+    def projected_wp_idx(self, wpts, dt=1.5):
+        """Returns nearest waypoint index to projected position."""
+        px, py = self.projected_position(dt)
+        target = np.array([px, py])
+        dists  = np.linalg.norm(np.array([w[:2] for w in wpts], dtype=float) - target, axis=1)
+        return int(np.argmin(dists))
+
 
 class RaceLine:
-# REF: Garlick, J. & Middleditch, A. (2022). Real-time optimal racing line generation. IEEE Trans. Games.
+    # REF: Garlick & Middleditch (2022). Real-time optimal racing line. IEEE Trans. Games.
     """A single candidate racing line with per-waypoint offset, speed target, heading."""
-    def __init__(self, wpts, lateral_offsets: np.ndarray, name='time_trial'):
-        self.name = name
-        self.n = len(wpts)
-        self.wpts = np.array([w[:2] for w in wpts])
-        self.offsets = np.clip(lateral_offsets, -0.9, 0.9)  # fraction of half-width
-        self.speeds = np.zeros(self.n)
-        self.headings = np.zeros(self.n)
+
+    def __init__(self, wpts, lateral_offsets: np.ndarray,
+                 name='time_trial', track_half_w: float = 0.3):
+        self.name         = name
+        self.n            = len(wpts)
+        self.wpts         = np.array([w[:2] for w in wpts], dtype=float)
+        self.track_half_w = track_half_w
+        # Clamp: car edge must not exceed boundary
+        max_off = max(0.0, track_half_w - _SAFE_HALF_W)
+        self.offsets      = np.clip(lateral_offsets, -max_off, max_off)
+        self.speeds       = np.zeros(self.n)
+        self.headings     = np.zeros(self.n)
         self._compute()
 
     def _compute(self):
@@ -36,161 +179,206 @@ class RaceLine:
         for i in range(n):
             r = _curvature_radius(self.wpts, i)
             self.speeds[i] = _optimal_speed(r)
-            p0 = self.wpts[(i-1)%n]; p2 = self.wpts[(i+1)%n]
+            p0 = self.wpts[(i-1) % n]
+            p2 = self.wpts[(i+1) % n]
             self.headings[i] = math.atan2(p2[1]-p0[1], p2[0]-p0[0])
 
     def reward(self, wp_idx, car_lat_pos, car_speed, car_heading, track_width) -> float:
         """Reward for following this race line at wp_idx.
-        car_lat_pos: signed fraction of half-width (left=positive)
+        car_lat_pos: signed fraction of half-width (left positive).
         """
-        target_offset = self.offsets[wp_idx]
-        target_speed = self.speeds[wp_idx]
-        target_heading = self.headings[wp_idx]
-        # lateral proximity reward: Gaussian around target offset
-        lat_err = car_lat_pos - target_offset
-        lat_r = math.exp(-0.5*(lat_err/(0.5*track_width))**2)
-        # speed proximity reward: Gaussian around optimal speed
-        spd_err = car_speed - target_speed
-        spd_r = math.exp(-0.5*(spd_err/0.6)**2)
-        # heading alignment reward
-        hdg_diff = abs(math.atan2(
-            math.sin(car_heading - target_heading),
-            math.cos(car_heading - target_heading)
-        ))
-        hdg_r = math.exp(-0.5*(hdg_diff/0.3)**2)
-        return (0.45*lat_r + 0.35*spd_r + 0.20*hdg_r)
+        target_offset  = self.offsets[wp_idx % self.n]
+        target_speed   = self.speeds[wp_idx % self.n]
+        target_heading = self.headings[wp_idx % self.n]
+        half_w = track_width / 2.0
+        lat_r  = math.exp(-0.5 * ((car_lat_pos - target_offset) / max(half_w, 0.1))**2)
+        spd_r  = math.exp(-0.5 * ((car_speed   - target_speed)  / 0.6)**2)
+        hdg_diff = abs(math.atan2(math.sin(car_heading - target_heading),
+                                   math.cos(car_heading - target_heading)))
+        hdg_r  = math.exp(-0.5 * (hdg_diff / 0.3)**2)
+        return 0.45*lat_r + 0.35*spd_r + 0.20*hdg_r
 
 
 class MultiRaceLineEngine:
     """
-    Maintains multiple race lines:
-      1. time_trial: pure inner-apex optimal line (minimize curvature)
-      2. obstacle_avoid: dynamically shifted away from detected obstacles/barriers
-      3. bot_overtake: set up overtake angle on the bot's racing line
-    Combines them with a soft-max blend based on context.
-    REF: TheRayG (2020); Gonzalez (2020); Haarnoja (2018) entropy-weighted action selection
+    Three race lines dynamically updated with object recognition + dimensions:
+      1. time_trial     — pure min-curvature apex line (car-width-aware)
+      2. obstacle_avoid — shifted away from static obstacles/curbs using
+                          object half-width + car safe clearance bubble
+      3. bot_overtake   — positions car on opposite side of bot's projected
+                          path, updated T=1.5 s ahead of bot's location
+
+    Object-permanence: visible_angle_from() scales the line shift so a
+    nearby large object shifts the line MORE than a distant small one.
+
+    REF: Heilmeier et al. (2020) min-curvature QP;
+         Waymo Motion Prediction (2021) constant-velocity projection;
+         Gonzalez (2020) DeepRacer reward shaping;
+         Haarnoja et al. (2018) entropy-weighted action selection.
     """
     LINE_TIME_TRIAL = 'time_trial'
     LINE_OBSTACLE   = 'obstacle_avoid'
     LINE_BOT        = 'bot_overtake'
 
     def __init__(self, waypoints: list, track_width: float = 0.6):
-        self.waypoints = waypoints
+        self.waypoints   = waypoints
         self.track_width = track_width
-        self.n = len(waypoints)
+        self.half_w      = track_width / 2.0
+        self.n           = len(waypoints)
         self._lines: Dict[str, RaceLine] = {}
-        self._obstacle_offsets = np.zeros(self.n)  # dynamic, updated per step
-        self._bot_offsets      = np.zeros(self.n)
         self._initialized = False
+        self._objects: List[ObjectRecord] = []
 
     def initialize(self):
         if not self.waypoints or self.n < 5:
             return
-        # 1. Time-trial: apex-seeking inside-out offset
-        tt_offsets = self._compute_apex_offsets()
-        self._lines[self.LINE_TIME_TRIAL] = RaceLine(self.waypoints, tt_offsets, self.LINE_TIME_TRIAL)
-        # 2. Obstacle: start identical to time_trial, will be modified dynamically
-        self._lines[self.LINE_OBSTACLE] = RaceLine(self.waypoints, tt_offsets.copy(), self.LINE_OBSTACLE)
-        # 3. Bot overtake: start on opposite side of track from time-trial
-        bot_offsets = -tt_offsets * 0.6  # opposite side, softer
-        self._lines[self.LINE_BOT] = RaceLine(self.waypoints, bot_offsets, self.LINE_BOT)
+        tt_offsets  = self._compute_apex_offsets()
+        self._lines[self.LINE_TIME_TRIAL] = RaceLine(
+            self.waypoints, tt_offsets, self.LINE_TIME_TRIAL, self.half_w)
+        self._lines[self.LINE_OBSTACLE]   = RaceLine(
+            self.waypoints, tt_offsets.copy(), self.LINE_OBSTACLE, self.half_w)
+        bot_offsets = -tt_offsets * 0.6
+        self._lines[self.LINE_BOT]        = RaceLine(
+            self.waypoints, bot_offsets, self.LINE_BOT, self.half_w)
         self._initialized = True
 
     def _compute_apex_offsets(self) -> np.ndarray:
-        """Compute apex-seeking lateral offsets per waypoint.
-        Tight corners -> go wide before, apex inside, wide after (negative on left-turn).
-        REF: Coulom (2002); Gonzalez (2020)
+        """Car-dimension-aware apex offsets.
+        The car EDGE stays within track_half_w.  REF: Heilmeier et al. (2020).
         """
         offsets = np.zeros(self.n)
         for i in range(self.n):
-            r = _curvature_radius(self.waypoints, i, w=4)
-            # curvature sign: cross product determines left vs right turn
-            p0 = np.array(self.waypoints[(i-3)%self.n][:2])
-            p1 = np.array(self.waypoints[i][:2])
-            p2 = np.array(self.waypoints[(i+3)%self.n][:2])
-            d1 = p1-p0; d2 = p2-p1
-            cross_sign = 1.0 if (d1[0]*d2[1]-d1[1]*d2[0]) > 0 else -1.0
-            # tight corners: offset toward apex (inside)
-            if r < 20:  tightness = min(0.7, 8.0/r)
-            elif r < 50: tightness = min(0.4, 4.0/r)
-            else:        tightness = 0.05  # near-straight: stay near center
-            offsets[i] = -cross_sign * tightness
-        # smooth offsets
-        from scipy.ndimage import uniform_filter1d
+            r    = _curvature_radius(self.waypoints, i, w=4)
+            cs   = _cross_sign(self.waypoints, i)
+            offsets[i] = _apex_offset_car_aware(r, cs, self.half_w)
+        # smooth
         try:
+            from scipy.ndimage import uniform_filter1d
             offsets = uniform_filter1d(offsets, size=5, mode='wrap')
         except Exception:
             pass
         return offsets
 
+    # ------------------------------------------------------------------
+    # Object registration
+    # ------------------------------------------------------------------
+    def update_objects(self, objects):
+        """Register current frame's objects (bots, cones, static, curbs).
+        objects: List[ObjectRecord] or List[dict]
+        Called each step from run.py before get_combined_reward().
+        """
+        parsed = []
+        for o in objects:
+            if isinstance(o, ObjectRecord):
+                parsed.append(o)
+            elif isinstance(o, dict):
+                parsed.append(ObjectRecord(**{k: o[k] for k in
+                    ('obj_type','x','y','heading','speed','wp_idx') if k in o}))
+        self._objects = parsed
+
+    # ------------------------------------------------------------------
+    # Dynamic line updates
+    # ------------------------------------------------------------------
     def update_obstacle_line(self, wp_idx: int, lidar_min: float,
-                              barrier_prox: float, nearest_obj: float, context: int):
-        """Dynamically shift obstacle-avoidance line away from detected hazards.
-        context: 1=curb, 2=obstacle, 3=corner, 0=clear, 4=straight
+                              barrier_prox: float, nearest_obj: float,
+                              context: int,
+                              car_x: float = 0.0, car_y: float = 0.0):
+        """Shift obstacle-avoidance line using:
+          - Object type -> known half-width -> minimum safe clearance
+          - Object-permanence angle -> scale shift magnitude
+          - context: 0=clear,1=curb,2=obstacle,3=corner,4=straight
         """
-        if not self._initialized: return
-        tt_offset = self._lines[self.LINE_TIME_TRIAL].offsets[wp_idx]
-        if context == 2 and nearest_obj < 1.5:  # obstacle close
-            # shift opposite to time_trial
-            min_clear = (0.10+0.15)/max(self.track_width/2,0.1)
-            shift = max(min_clear, min(0.5, 1.2/max(nearest_obj,0.3)))
-            self._lines[self.LINE_OBSTACLE].offsets[wp_idx] = -tt_offset + shift*np.sign(-tt_offset+1e-6)
-        elif context == 1 and lidar_min < 0.4:  # near curb
-            # pull back toward center
-            self._lines[self.LINE_OBSTACLE].offsets[wp_idx] = tt_offset * (1.0 - barrier_prox)
+        if not self._initialized:
+            return
+        tt_off = self._lines[self.LINE_TIME_TRIAL].offsets[wp_idx % self.n]
+        max_off = max(0.0, self.half_w - _SAFE_HALF_W)
+
+        # Find closest non-bot obstacle to this WP
+        closest_obs   = None
+        closest_dist  = float('inf')
+        for obj in self._objects:
+            if obj.obj_type in ('cone', 'static', 'curb'):
+                d = math.hypot(obj.x - self.waypoints[wp_idx % self.n][0],
+                               obj.y - self.waypoints[wp_idx % self.n][1])
+                if d < closest_dist:
+                    closest_dist, closest_obs = d, obj
+
+        if closest_obs is not None and closest_dist < 1.5:
+            clearance = closest_obs.safe_clearance()
+            raw_shift = max(clearance / self.half_w,
+                            min(max_off, 1.2 / max(closest_dist, 0.3)))
+            # Scale by angular span (object-permanence)
+            if car_x != 0.0 or car_y != 0.0:
+                vis = closest_obs.visible_angle_from(car_x, car_y)
+                raw_shift *= min(2.0, 1.0 + vis / math.pi)
+            new_off = -tt_off + raw_shift * np.sign(-tt_off + 1e-6)
+            new_off = float(np.clip(new_off, -max_off, max_off))
+        elif context == 1 and lidar_min < 0.4:
+            # Curb: pull toward center proportionally
+            new_off = float(tt_off * (1.0 - barrier_prox))
         else:
-            # fall back to time_trial
-            alpha = 0.1
-            self._lines[self.LINE_OBSTACLE].offsets[wp_idx] = (
-                alpha * tt_offset + (1-alpha)*self._lines[self.LINE_OBSTACLE].offsets[wp_idx]
-            )
-        self._lines[self.LINE_OBSTACLE].offsets[wp_idx] = float(
-            np.clip(self._lines[self.LINE_OBSTACLE].offsets[wp_idx], -0.9, 0.9)
-        )
+            # Decay back to time-trial
+            alpha   = 0.1
+            cur     = self._lines[self.LINE_OBSTACLE].offsets[wp_idx % self.n]
+            new_off = float(alpha * tt_off + (1 - alpha) * cur)
 
-    def update_bot_line(self, wp_idx: int, bot_progress: float, own_progress: float,
-                         bot_x: float = 0.0, bot_y: float = 0.0):
-        """Update bot-overtake line: position to overtake safely.
-        Places car on opposite side from bot when within 10% progress of bot.
-        REF: Yang (2023) overtake shaping
+        self._lines[self.LINE_OBSTACLE].offsets[wp_idx % self.n] = \
+            float(np.clip(new_off, -max_off, max_off))
+
+    def update_bot_line(self, wp_idx: int, bot_progress: float,
+                         own_progress: float,
+                         bot_x: float = 0.0, bot_y: float = 0.0,
+                         bot_heading: float = 0.0, bot_speed: float = 0.0,
+                         car_x: float = 0.0, car_y: float = 0.0):
+        """Position car to overtake bot using:
+          - Projected bot position (T+1.5 s) to set up gap AHEAD of time
+          - Bot half-width for minimum safe passing distance
+          - Object-permanence angle to scale urgency
+        REF: Waymo Motion Prediction (2021); Yang (2023) overtake shaping.
         """
-        if not self._initialized: return
-        gap = own_progress - bot_progress
-        if abs(gap) < 10.0:  # bot nearby
-            # estimate bot lateral position from its waypoint offset (use opposite)
-            # --- Use bot_x, bot_y if available for precise bot lateral position ---
-            BOT_HALF_WIDTH = 0.10  # ~0.20m car width / 2 (1/18 scale DeepRacer)
-            if bot_x != 0.0 or bot_y != 0.0:
-                # compute bot lateral position on track from (bot_x, bot_y)
-                n = len(self.waypoints)
-                wp_c = np.array(self.waypoints[wp_idx % n][:2])
-                wp_n = np.array(self.waypoints[(wp_idx + 1) % n][:2])
-                tang = wp_n - wp_c
-                tang_len = np.linalg.norm(tang) + 1e-8
-                tang_unit = tang / tang_len
-                norm_unit = np.array([-tang_unit[1], tang_unit[0]])  # left normal
-                bot_vec = np.array([bot_x, bot_y]) - wp_c
-                bot_lat_pos = float(np.dot(bot_vec, norm_unit))  # signed lateral
-                bot_est_offset = bot_lat_pos
-                # store bot boundaries for downstream use
-                self._bot_left_edge = bot_lat_pos + BOT_HALF_WIDTH
-                self._bot_right_edge = bot_lat_pos - BOT_HALF_WIDTH
-            else:
-                bot_est_offset = self._lines[self.LINE_TIME_TRIAL].offsets[wp_idx]
-                self._bot_left_edge = bot_est_offset + BOT_HALF_WIDTH
-                self._bot_right_edge = bot_est_offset - BOT_HALF_WIDTH
-            # position ourselves on opposite side
-            overtake_offset = -np.sign(bot_est_offset) * 0.6
-            alpha = max(0.0, 1.0 - abs(gap)/10.0)  # stronger as gap shrinks
-            cur = self._lines[self.LINE_BOT].offsets[wp_idx]
-            self._lines[self.LINE_BOT].offsets[wp_idx] = float(
-                np.clip(alpha*overtake_offset + (1-alpha)*cur, -0.9, 0.9)
-            )
+        if not self._initialized:
+            return
+        gap     = own_progress - bot_progress
+        max_off = max(0.0, self.half_w - _SAFE_HALF_W)
 
+        if abs(gap) < 10.0:
+            # Build an ObjectRecord for the bot
+            bot_obj = ObjectRecord('bot', bot_x, bot_y, bot_heading, bot_speed, wp_idx)
+            # Projected WP index
+            proj_wp = bot_obj.projected_wp_idx(self.waypoints, dt=1.5)
+            # Bot's projected lateral position at that WP
+            wc  = np.array(self.waypoints[proj_wp % self.n][:2], dtype=float)
+            wn  = np.array(self.waypoints[(proj_wp+1) % self.n][:2], dtype=float)
+            tang = wn - wc
+            tang_len = np.linalg.norm(tang) + 1e-8
+            norm_unit = np.array([-tang[1], tang[0]]) / tang_len
+            px, py    = bot_obj.projected_position(dt=1.5)
+            bot_lat   = float(np.dot(np.array([px, py]) - wc, norm_unit))
+
+            # Minimum safe passing offset
+            clearance    = bot_obj.safe_clearance()
+            overtake_off = bot_lat + clearance * (-1.0 if bot_lat >= 0 else 1.0)
+            overtake_off = float(np.clip(overtake_off, -max_off, max_off))
+
+            # Scale by object-permanence angle
+            if car_x != 0.0 or car_y != 0.0:
+                vis = bot_obj.visible_angle_from(car_x, car_y)
+                alpha_vis = min(1.0, 0.5 + vis / math.pi)
+            else:
+                alpha_vis = max(0.0, 1.0 - abs(gap) / 10.0)
+
+            cur = self._lines[self.LINE_BOT].offsets[wp_idx % self.n]
+            new_off = alpha_vis * overtake_off + (1 - alpha_vis) * cur
+            self._lines[self.LINE_BOT].offsets[wp_idx % self.n] = \
+                float(np.clip(new_off, -max_off, max_off))
+
+    # ------------------------------------------------------------------
+    # Reward
+    # ------------------------------------------------------------------
     def get_combined_reward(
         self,
         wp_idx: int,
-        car_lat_pos: float,  # signed lateral fraction
+        car_lat_pos: float,
         car_speed: float,
         car_heading: float,
         track_width: float,
@@ -199,59 +387,46 @@ class MultiRaceLineEngine:
         nearest_obj: float,
         bot_progress: float = 0.0,
         own_progress: float = 0.0,
+        car_x: float = 0.0,
+        car_y: float = 0.0,
     ) -> Tuple[float, Dict]:
-        """Compute blended multi-line reward with context-aware weights.
-        Returns (combined_reward, {per_line_rewards})
-        """
         if not self._initialized or not self._lines:
             return 0.0, {}
-        # Context-based line weights
-        # clear/straight: follow time_trial
-        # obstacle/curb: emphasize obstacle-avoid line
-        # bot nearby: blend in bot-overtake line
-        w_tt  = 0.7
-        w_obs = 0.2
-        w_bot = 0.1
-        if context == 2:   w_tt, w_obs, w_bot = 0.3, 0.6, 0.1  # obstacle
-        elif context == 1: w_tt, w_obs, w_bot = 0.5, 0.4, 0.1  # curb
-        elif context == 3: w_tt, w_obs, w_bot = 0.6, 0.3, 0.1  # corner
-        # bot proximity modulation
+        w_tt, w_obs, w_bot = 0.7, 0.2, 0.1
+        if context == 2:   w_tt, w_obs, w_bot = 0.3, 0.6, 0.1
+        elif context == 1: w_tt, w_obs, w_bot = 0.5, 0.4, 0.1
+        elif context == 3: w_tt, w_obs, w_bot = 0.6, 0.3, 0.1
         if bot_progress > 0 and abs(own_progress - bot_progress) < 15.0:
-            bot_factor = max(0.0, 1.0 - abs(own_progress-bot_progress)/15.0) * 0.3
-            w_bot += bot_factor
-            total = w_tt + w_obs + w_bot
-            w_tt  /= total; w_obs /= total; w_bot /= total
+            bf    = max(0.0, 1.0 - abs(own_progress-bot_progress)/15.0) * 0.3
+            w_bot += bf
+            tot   = w_tt + w_obs + w_bot
+            w_tt /= tot; w_obs /= tot; w_bot /= tot
         line_rewards = {}
         total_r = 0.0
-        for line_name, weight in [
-            (self.LINE_TIME_TRIAL, w_tt),
-            (self.LINE_OBSTACLE,   w_obs),
-            (self.LINE_BOT,        w_bot),
-        ]:
-            if line_name in self._lines:
-                r = self._lines[line_name].reward(
-                    wp_idx, car_lat_pos, car_speed, car_heading, track_width
-                )
-                line_rewards[line_name] = r
-                total_r += weight * r
-        # --- proximity penalty: penalize high speed near obstacles/curbs ---
-        # lidar_min ~0..1 (0=touching wall), nearest_obj ~0..inf (metres)
-        _lidar_safe = min(1.0, max(0.0, lidar_min))  # clamp 0-1
-        _obj_safe = min(1.0, nearest_obj / 1.5) if nearest_obj > 0 else 0.0
-        _prox_factor = 0.5 + 0.5 * min(_lidar_safe, _obj_safe)  # 0.5..1.0
-        total_r *= _prox_factor
-        line_rewards['proximity'] = _prox_factor
+        for lname, wt in [(self.LINE_TIME_TRIAL, w_tt),
+                           (self.LINE_OBSTACLE,   w_obs),
+                           (self.LINE_BOT,        w_bot)]:
+            if lname in self._lines:
+                r = self._lines[lname].reward(
+                    wp_idx, car_lat_pos, car_speed, car_heading, track_width)
+                line_rewards[lname] = r
+                total_r += wt * r
+        # Proximity penalty
+        _lidar_s  = float(np.clip(lidar_min, 0.0, 1.0))
+        _obj_s    = min(1.0, nearest_obj / 1.5) if nearest_obj > 0 else 0.0
+        _prox     = 0.5 + 0.5 * min(_lidar_s, _obj_s)
+        total_r  *= _prox
+        line_rewards['proximity'] = _prox
         return float(total_r), line_rewards
 
     def get_target_speed(self, wp_idx: int, context: int) -> float:
         if not self._initialized or self.LINE_TIME_TRIAL not in self._lines:
             return 2.0
-        if context in (1, 2, 3):
-            line = self._lines.get(self.LINE_OBSTACLE, self._lines[self.LINE_TIME_TRIAL])
-        else:
-            line = self._lines[self.LINE_TIME_TRIAL]
+        line = (self._lines.get(self.LINE_OBSTACLE, self._lines[self.LINE_TIME_TRIAL])
+                if context in (1, 2, 3) else self._lines[self.LINE_TIME_TRIAL])
         return float(line.speeds[wp_idx % self.n])
 
     def reset(self):
         self._initialized = False
-        self._lines = {}
+        self._lines       = {}
+        self._objects     = []
