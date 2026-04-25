@@ -1163,7 +1163,9 @@ def run(hparams):
     ep_heading_diffs = []
     _ep_step_log = []  # collect per-step dicts for extract_intermediary_metrics
     ep_steerings_raw = []
-    ep_prev_speed = 0.0
+    ep_prev_speed   = float(init_rp.get("speed", 0.0))  # seed from actual first obs speed
+    _step_speed_snap = 0.0   # v1.0.14: single snapshot, updated ONCE at bottom of step
+    ep_prev_accel   = None   # v1.0.14: for jerk computation
     ep_decel_penalties = []
     ep_safe_speed_ratios = []
     ep_racing_line_errors = []
@@ -1198,7 +1200,6 @@ def run(hparams):
     ep_prev_steer = 0.0
     # v37 per-episode lists — must exist before hard-truncation block
     ep_ang_vel_centerline: list = []
-    ep_speed_prev = None
     ep_jerk_abs: list = []
     ep_brake_before_barrier: list = []
 
@@ -1322,7 +1323,7 @@ def run(hparams):
     next_done = torch.zeros(1, device=DEVICE)
     best_return = float('-inf')
     _curvature = 0.0  # default for context label
-    ep_prev_speed = 0.0
+    ep_prev_speed = 0.0; _step_speed_snap = 0.0
     _decel = 0.0; _speed_ratio = 0.0; _racing_line_err = 0.0
     ep_return = float('-inf')
 
@@ -1610,7 +1611,6 @@ def run(hparams):
                 _actual_lateral = _dist_from_center * (1 if rp.get("is_left_of_center", False) else -1)
                 _racing_line_err = abs(_actual_lateral - _optimal_dist) / max(_tw / 2.0, 0.1)
                 _decel = ep_prev_speed - _speed if ep_prev_speed > 0 else 0.0
-                ep_prev_speed = _speed
                 # compute sub-rewards
                 _center_pct = _dist / (0.5 * _tw) if _tw > 0 else 0
                 _center_r = max(0, 1.0 - _center_pct)
@@ -1709,10 +1709,7 @@ def run(hparams):
                     #   (a) not in brake field, OR (b) already braking correctly
                     # v222: Coherent speed gate via actual BrakeField.step() API
                     # So here we derive it from the same source directly:
-                    _is_braking_now = bool(
-                        (len(_af) > 1 and float(_af[1]) < -0.1)  # throttle < -0.1
-                        or (_speed < ep_prev_speed - 0.05)         # physical decel proxy (ep_prev_speed set L1241)
-                    )
+                    _is_braking_now = bool(_speed < _step_speed_snap - 0.05)
 
                     try:
                         _bf_step         = _brake_field.step(
@@ -1826,16 +1823,17 @@ def run(hparams):
                     if ep_heading_diffs:
                         ep_ang_vel_centerline.append(abs(float(ep_heading_diffs[-1])))
                 except Exception: pass
-                try:  # v37 jerk
-                    _sp_now = float(info.get("speed", ep_speeds[-1] if ep_speeds else 0.0))
-                    if ep_speed_prev is not None:
-                        ep_jerk_abs.append(abs(_sp_now - float(ep_speed_prev)))
-                    ep_speed_prev = _sp_now
-                except Exception: pass
+                try:
+                    if ep_prev_accel is not None:
+                        _jerk = abs(_accel - ep_prev_accel) / 0.1   # true da/dt in m/s³
+                        ep_jerk_abs.append(_jerk)
+                    ep_prev_accel = _accel   # update AFTER use
+                except Exception:
+                    pass
                 try:  # v37 brake compliance
-                    if ep_barrier_proximities and float(ep_barrier_proximities[-1]) < 1.0 and ep_speed_prev is not None:
+                    if ep_barrier_proximities and float(ep_barrier_proximities[-1]) < 1.0 and ep_prev_speed is not None:
                         _sp_now2 = float(info.get("speed", ep_speeds[-1] if ep_speeds else 0.0))
-                        _dec = float(ep_speed_prev) - _sp_now2
+                        _dec = float(ep_prev_speed) - _sp_now2
                         if _dec > 0: ep_brake_before_barrier.append(_dec)
                 except Exception: pass
                 # v3-bsts per-step tracking
@@ -1883,7 +1881,7 @@ def run(hparams):
                 ep_lidar_mins.append(_lidar_min)
                 ep_barrier_proximities.append(_barrier_proximity)
                 # v29: crash-antecedent kinematics
-                _accel = (_speed - ep_prev_speed) / 0.1  # m/s^2 (dt~0.1s)
+                _accel = (_speed - _step_speed_snap) / 0.1  # m/s^2 (dt~0.1s)
                 ep_prev_speed = _speed
                 _af = action.flatten() if hasattr(action, 'flatten') else (np.array(action).flatten() if hasattr(action, '__iter__') else [action])
                 _act_steer = float(_af[0].item() if hasattr(_af[0], 'item') else float(_af[0]))
@@ -2397,7 +2395,7 @@ def run(hparams):
                 ep_graze_count         = 0
                 ep_heading_diffs = []
                 ep_ang_vel_centerline = []  # v37
-                ep_speed_prev = None  # v37
+                ep_prev_speed = None  # v37
                 ep_jerk_abs = []  # v37
                 ep_brake_before_barrier = []  # v37
                 ep_steerings_raw = []
