@@ -1163,7 +1163,8 @@ def run(hparams):
     ep_heading_diffs = []
     _ep_step_log = []  # collect per-step dicts for extract_intermediary_metrics
     ep_steerings_raw = []
-    ep_prev_speed   = float(init_rp.get("speed", 0.0))  # seed from actual first obs speed
+    _init_rp = _init_info.get("reward_params", {}) if isinstance(_init_info, dict) else {}
+    ep_prev_speed   = float(_init_rp.get("speed", 0.0))  # seed from actual first obs speed
     _step_speed_snap = 0.0   # v1.0.14: single snapshot, updated ONCE at bottom of step
     ep_prev_accel   = None   # v1.0.14: for jerk computation
     ep_decel_penalties = []
@@ -1323,7 +1324,9 @@ def run(hparams):
     next_done = torch.zeros(1, device=DEVICE)
     best_return = float('-inf')
     _curvature = 0.0  # default for context label
-    ep_prev_speed = 0.0; _step_speed_snap = 0.0
+    _reset_rp = info.get("reward_params", {}) if isinstance(info, dict) else {}
+    ep_prev_speed = float(_reset_rp.get("speed", 0.0))
+    _step_speed_snap = ep_prev_speed
     _decel = 0.0; _speed_ratio = 0.0; _racing_line_err = 0.0
     ep_return = float('-inf')
 
@@ -2395,11 +2398,11 @@ def run(hparams):
                 ep_graze_count         = 0
                 ep_heading_diffs = []
                 ep_ang_vel_centerline = []  # v37
-                ep_prev_speed = None  # v37
+                _trunc_rp = _step_info.get("reward_params", {}) if isinstance(_step_info, dict) else {}
+                ep_prev_speed = float(_trunc_rp.get("speed", 0.0))
                 ep_jerk_abs = []  # v37
                 ep_brake_before_barrier = []  # v37
                 ep_steerings_raw = []
-                ep_prev_speed = 0.0
                 ep_decel_penalties = []
                 ep_safe_speed_ratios = []
                 ep_racing_line_errors = []
