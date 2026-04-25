@@ -49,7 +49,7 @@ from federated_pool import FederatedPool
 # REF: Lillicrap, T. P. et al. (2016). Continuous control with deep reinforcement learning. ICLR.
 from race_line_engine import MultiRaceLineEngine
 # REF: Hart, P. E., Nilsson, N. J., & Raphael, B. (1968). A formal basis for the heuristic determination of minimum cost paths. IEEE Trans. SSC, 4(2), 100-107.
-from bsts_seasonal import BSTSSeasonal
+from bsts_seasonal import BSTSFeedback
 # REF: Scott, S. L. & Varian, H. R. (2014). Predicting the present with Bayesian structural time series. Int. J. Math. Model. Numer. Optim., 5(1-2), 4-23.
 live_analyze = lambda *a,**k: None  # live_metrics.py purged (stubbed)
 try:
@@ -209,6 +209,7 @@ def obs_to_array(obs):
 # ============================================================
 # Meta-Annealing Scheduler (3 dimensions)
 # ============================================================
+'''
 class BSTSFeedback:
     def __init__(self,ema_alpha=0.05,feedback_strength=0.15):
         self.ema={}
@@ -292,6 +293,8 @@ class BSTSFeedback:
         t=sum(w.values())
         return {k:v/t for k,v in w.items()} if t>0 else w
 
+
+'''
 
 # REF: Almakhayita, S. K. et al. (2025). Reward design and hyperparameter tuning for generalizable deep RL agents. PLoS ONE, 20(6).
 class AnnealingScheduler:
@@ -1025,17 +1028,18 @@ def run(hparams):
     race_engine = None  # v18: lazy-init after waypoints available
 
     # v16: BSTS Seasonal tracker (season=lap position, trend=epoch)
-    bsts_season = BSTSSeasonal(
-        n_segments=12,
-        save_dir=os.path.join('results', run_name),
+    bsts_feedback = BSTSFeedback(
+        ema_alpha=0.05,
+        feedback_strength=0.15,
+        race_type=_track_variant,   # race-type tagging live from init
     )
-    bsts_feedback = BSTSFeedback()  # v20: instantiate BSTS feedback controller
+    bsts_season = bsts_feedback.model("ep_return", period=100) 
 
     # v16: Race-line blend factor: starts at 0.0 (all rigid), anneals to 1.0 (all race-line)
     _rl_blend = 0.0
 
     _RESEARCH_MODULES = True  # Activate research module integrations
-# v17 BSTS wiring imports
+    # v17 BSTS wiring imports
     try:
         live_analyze = lambda *a,**k: None  # live_metrics.py purged (stubbed)
         from failure_analysis import FailurePointSampler
@@ -1144,7 +1148,11 @@ def run(hparams):
     _prev_prog_tracker = 0.0  # v23
     _bsts_alpha = 0.7  # v39: 70/30 shaped/env blend (was 0.90)
     bsts_metrics = {}
-    bsts_feedback = BSTSFeedback(ema_alpha=0.05, feedback_strength=0.15)
+    bsts_feedback = BSTSFeedback(
+        ema_alpha=0.05,
+        feedback_strength=0.15,
+        race_type=_track_variant,   # race-type tagging live from init
+    )
     bsts_feedback._all_summaries = []  # accumulate all episode summaries for periodic BSTS report
     # Kalman-filter BSTS for proper trend/seasonal/regression decomposition
     _kf_bsts = {sm: BSTSKalmanFilter(seasonal_period=8, n_regressors=len(INTERMEDIARY_METRICS),
@@ -1337,14 +1345,19 @@ def run(hparams):
         # --- v4: Get annealed hyperparams ---
         hp = scheduler.get_hyperparams(global_step)
         # v16: BSTS trend-aware annealing adjustments
-        _bt = bsts_season.get_trend() if hasattr(bsts_season, 'get_trend') else {}
-        if _bt.get('phase') == 'plateau':
-            hp['ent_coef'] = min(hp['ent_coef'] * 1.5, 0.05)  # explore more on plateau
-            hp['lr'] = min(hp['lr'] * 1.3, 5e-4)
-        elif _bt.get('phase') == 'declining':
-            hp['ent_coef'] = min(hp['ent_coef'] * 2.0, 0.08)  # strong explore on decline
-        elif _bt.get('phase') == 'improving' and _bt.get('return_slope', 0) > 0.5:
-            hp['ent_coef'] = max(hp['ent_coef'] * 0.8, 0.005)  # exploit on strong improvement
+        # v1.0.13: get_trend_vector() returns {metric: slope_float} over last 5 obs
+        _bt = bsts_feedback.get_trend_vector(race_type_filter=_track_variant)
+        _prog_slope  = float(_bt.get('progress', 0.0))
+        _speed_slope = float(_bt.get('speed', 0.0))
+        _rew_slope   = float(_bt.get('reward', 0.0))
+
+        if _rew_slope < -0.005:                           # reward declining → explore
+            hp['ent_coef'] = min(hp['ent_coef'] * 2.0, 0.08)
+        elif _rew_slope < 0.0:                            # plateau
+            hp['ent_coef'] = min(hp['ent_coef'] * 1.5, 0.05)
+            hp['lr']       = min(hp['lr'] * 1.3, 5e-4)
+        elif _rew_slope > 0.005 and _prog_slope > 0.0:   # strong improvement → exploit
+            hp['ent_coef'] = max(hp['ent_coef'] * 0.8, 0.005)
         # --- v6: architecture annealing ---
         _worst_br = min((s.breakout_rate for s in stuck_tracker.stats.values() if s.total_episodes >= 3), default=0.5)
         hp['ent_coef'] = hp['ent_coef'] + 0.03 * (1.0 - _worst_br) ** 2
@@ -1354,6 +1367,7 @@ def run(hparams):
         if bootstrap_rewards.active(global_step, total_timesteps):
             rw = bootstrap_rewards.weights(rw)
         # v16: BSTS season-aware reward weight adjustment
+        '''
         _bs = bsts_season.get_season() if hasattr(bsts_season, 'get_season') else {}
         _worst_segs = _bs.get('worst_segments', [])
         if _worst_segs:
@@ -1362,11 +1376,15 @@ def run(hparams):
                 _seg_info = _bs.get('segments', {}).get(_seg_id, {})
                 if _seg_info.get('crashes', 0) > 2:
                     rw['braking'] = rw.get('braking', 0.08) * 1.3
-                    rw['turn_align'] = rw.get('turn_align', 0.06) * 1.2
+                    rw['turn_align'] = rw.get('turn_align', 0.06) * 1.2    
             # Renormalize weights
             _rw_total = sum(rw.values())
             if _rw_total > 0:
-                rw = {k: v / _rw_total for k, v in rw.items()}
+                rw = {k: v / _rw_total for k, v in rw.items()}                        
+        '''
+        # v1.0.13: worst-segment crash boosting now driven by BSTSFeedback.adjust_weights()
+        # which already runs below. No separate season query needed.
+        # The crash_rate/corner_crash_rate EMA paths in adjust_weights() handle this.
 
         # Apply annealed learning rate
         for pg in optimizer.param_groups:
@@ -1938,17 +1956,18 @@ def run(hparams):
                     'dist_from_center': _dist_from_center,
                 })
             # v16: BSTS seasonal per-step tracking
-            bsts_season.record_step(
-                progress=_prog,
-                speed=_speed,
-                steering=_steer,
-                heading_err=0.0,
-                raceline_err=0.0,
-                reward=reward,
-                context=obs[step].cpu().numpy() if hasattr(obs[step], "cpu") else obs[step],
-                action=action.cpu().numpy() if hasattr(action, "cpu") else action,
-                lidar_min=0.0,
-                wp_idx=_cur_wp if "_cur_wp" in dir() else 0,
+            # v222: per-step BSTS update via BSTSFeedback.update()
+            # This feeds into bsts_feedback.model(metric) Kalman filters
+            # and drives get_trend_vector() and adjust_weights() correctly.
+            bsts_feedback.update(
+                {
+                    'progress':  float(_prog),
+                    'speed':     float(_speed),
+                    'steering':  float(abs(_steer)),
+                    'reward':    float(reward),
+                },
+                step=global_step,
+                race_type_tag=_track_variant,
             )
 
             _rl_blend = min(1.0, _rl_blend + _rl_blend_rate)
@@ -2399,18 +2418,27 @@ def run(hparams):
                 # v17-bsts feedback: wire analysis -> annealing
                 if bsts_season is not None:
                     try:
-                        _trend = getattr(bsts_season, "get_trend", lambda: 0.0)()
-                        _seasonal = getattr(bsts_season, "get_seasonal", lambda: 0.0)()
-                        _m = {"ep_return": ep_return, "trend": _trend, "seasonal": _seasonal, "episode": episode_count}
-                        if hasattr(bsts_feedback, "update"): bsts_feedback.update(_m)
-                        if hasattr(bsts_feedback, "adjust_weights"):
-                            _adj = bsts_feedback.adjust_weights(scheduler.get_reward_weights(global_step))
-                            scheduler.rw_end = _adj
-                            # v18: update alpha from BSTS trend
-                            _t = _trend if isinstance(_trend, (int,float)) else 0.0
-                            _bsts_alpha = max(0.5, min(0.98, _bsts_alpha + 0.02 * _t))
-                    except Exception as _e:
-                        logger.debug(f"BSTS feedback skip: {_e}")
+                        # get_trend_vector returns {metric: 5-step linear slope}
+                        _tv   = bsts_feedback.get_trend_vector(race_type_filter=_track_variant)
+                        trend = float(_tv.get('reward', 0.0))     # use reward trend as proxy for return trend
+                        # seasonal component is internal to the Kalman RLS inside BSTSFeedback.model()
+                        # — not separately extractable; set to 0.0 here
+                        seasonal = 0.0
+                        m = {
+                            'ep_return':    ep_return,
+                            'trend':        trend,
+                            'seasonal':     seasonal,
+                            'episode':      episode_count,
+                            'crash_rate':   ep_offtrack_count / max(ep_step_count, 1),
+                            'avg_speed':    float(np.mean(ep_speeds)) if ep_speeds else 0.0,
+                        }
+                        bsts_feedback.update(m, step=global_step, race_type_tag=_track_variant)
+                        if hasattr(bsts_feedback, 'adjust_weights'):
+                            adj = bsts_feedback.adjust_weights(scheduler.get_reward_weights(global_step),
+                                                            race_type_filter=_track_variant)
+                            scheduler.rw_end = adj
+                    except Exception as e:
+                        logger.debug(f"BSTS feedback skip: {e}")
                 # v17: periodic live analysis and race-line phase-out
                 if episode_count % 50 == 0 and episode_count > 0:
                     try:
