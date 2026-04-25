@@ -657,7 +657,7 @@ def run(hparams):
     if _is_discrete:
         _act_dim       = 1
         _act_n         = int(env.action_space.n)
-        _act_dim_agent = _act_n   # ContextAwarePPOAgent discrete head = n logits
+        _act_dim_agent = 2  # ContextAwarePPOAgent discrete head = n logits
     else:
         _act_dim       = env.action_space.shape[0]
         _act_n         = None
@@ -1503,18 +1503,18 @@ def run(hparams):
                 in_corner_entry = (len(ep_heading_diffs) >= 2 and
                                 abs(ep_heading_diffs[-1]) > 3.0 and
                                 abs(ep_heading_diffs[-1]) > abs(ep_heading_diffs[-2]))
-                brake_pct = max(0.0, -act_throttle)
-                tb_quality = tb.step(brake_pct, abs(act_steer), in_corner_entry=in_corner_entry)
+                brake_pct = max(0.0, _act_throttle)
+                tb_quality = tb.step(brake_pct, abs(_act_steer), in_corner_entry=in_corner_entry)
 
-                curv_for_vpc, _ = compute_track_curvature(waypoints, closest) if waypoints else (curvature, 4.0)
+                curv_for_vpc, _ = compute_track_curvature(_waypoints, _closest) if _waypoints else (_curvature, 4.0)
                 v_target_vpc = optimal_speed_at_curvature(curv_for_vpc)
-                vpc = velocity_profile_compliance(speed, v_target_vpc)
+                vpc = velocity_profile_compliance(_speed, v_target_vpc)
 
-                if waypoints and len(waypoints) >= 16:
-                    wps_arr = np.array(waypoints)
-                    cur_wp_idx = closest[1] if len(closest) > 1 else 0
+                if _waypoints and len(_waypoints) >= 16:
+                    wps_arr = np.array(_waypoints)
+                    cur_wp_idx = _closest[1] if len(_closest) > 1 else 0
                     curvs_ahead = multi_horizon_curvature(wps_arr, cur_wp_idx)
-                    ca_score = curvature_anticipation_score(speed, curvs_ahead, bool(braking_intent))
+                    ca_score = curvature_anticipation_score(_speed, curvs_ahead, bool(_braking_intent))
                 else:
                     ca_score = 0.5
 
