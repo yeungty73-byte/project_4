@@ -20,6 +20,24 @@ Adjustments by race_type:
 
 adjust_weights() now normalises all returned weights so they always sum to 1.0.
 
+API compatibility with run.py (v1.0.13)
+----------------------------------------
+  update(metrics_dict, *, step=None, race_type_tag=None)
+      ``step`` and ``race_type_tag`` are accepted as keyword-only kwargs so that
+      run.py's existing call-sites work without modification.  ``race_type_tag``
+      hot-swaps self.race_type if provided.
+
+  adjust_weights(base_weights, *, race_type_filter=None)
+      ``race_type_filter`` overrides self.race_type for this call only.
+
+  get_trend_vector(race_type_filter=None) -> dict[str, float]
+      Returns {metric: linear_slope_over_last_5_obs} from self.ema history.
+      Used by run.py to drive entropy_coef / lr adjustments.
+
+  model(metric, period=100) -> _NullModel
+      Backward-compat stub — run.py calls bsts_feedback.model("ep_return",period=100)
+      at init time to get bsts_season.  Returns a no-op proxy that won't crash.
+
 BSTSSeasonal v1.0.13 changes (unchanged from prior version)
 ------------------------------------------------------------
   - record_step() buffers per-step data in a rolling deque (no longer a no-op)
@@ -93,8 +111,18 @@ def _norm_race_type(raw: str) -> str:
     return _RACE_TYPE_MAP.get(str(raw).lower().replace(" ", "_"), "TIME_TRIAL")
 
 
+# ---------------------------------------------------------------------------
+# Backward-compat stub returned by BSTSFeedback.model()
+# ---------------------------------------------------------------------------
+class _NullModel:
+    """No-op proxy so bsts_season.get_season() / .get_trend() never raise."""
+    def get_season(self):  return {'worst_segments': [], 'segments': {}}
+    def get_trend(self):   return {}
+    def get_seasonal(self):return {}
+
+
 # ===========================================================================
-# BSTSFeedback  (transplanted from run.py v1.0.13, now race_type-aware)
+# BSTSFeedback  (transplanted from run.py v1.0.13, race_type-aware)
 # ===========================================================================
 class BSTSFeedback:
     """EMA-smoothed, Kalman-informed reward-weight adjuster.
@@ -106,11 +134,24 @@ class BSTSFeedback:
     race_type         : str     One of TIME_TRIAL | OBJECT_AVOIDANCE | HEAD_TO_BOT
                                 Case-insensitive; aliases like 'oa', 'h2h' accepted.
 
-    Public API
-    ----------
-    update(metrics_dict)            -> None   Feed new scalar metrics into EMA.
-    adjust_weights(base_weights)    -> dict   Return re-normalised adjusted weights.
-    set_race_type(race_type: str)   -> None   Hot-swap race_type mid-training.
+    Public API (run.py compatible)
+    ------------------------------
+    update(metrics_dict, *, step=None, race_type_tag=None)
+        Feed new scalar metrics into EMA.  ``race_type_tag`` hot-swaps race_type.
+
+    adjust_weights(base_weights, *, race_type_filter=None) -> dict
+        Return re-normalised adjusted weights.  ``race_type_filter`` overrides
+        self.race_type for this call only.
+
+    get_trend_vector(race_type_filter=None) -> dict[str, float]
+        Returns {metric: linear_slope_over_last_5_obs}.  Used by run.py to
+        drive entropy_coef / lr BSTS adjustments.
+
+    set_race_type(race_type: str) -> None
+        Hot-swap race_type mid-training.
+
+    model(metric, period=100) -> _NullModel
+        Backward-compat stub for run.py's ``bsts_season = bsts_feedback.model(...)``.
 
     Attributes written by caller (run.py / analyze_logs integration)
     ---------------------------------------------------------------
@@ -133,24 +174,100 @@ class BSTSFeedback:
         self.kf_trends: dict = {}
         self.kf_betas:  dict = {}
 
+        # Internal history buffer for get_trend_vector()
+        # {metric: deque of last 20 float values}
+        self._history: dict = {}
+        self._HIST_LEN = 20
+
+    # ------------------------------------------------------------------
     def set_race_type(self, race_type: str) -> None:
         """Hot-swap race_type (e.g. when the 9-phase orchestrator changes phase)."""
         self.race_type = _norm_race_type(race_type)
 
     # ------------------------------------------------------------------
-    def update(self, metrics_dict: dict) -> None:
-        """Feed new scalar metrics into EMA state."""
+    def model(self, metric: str, period: int = 100) -> "_NullModel":
+        """Backward-compat stub.
+
+        run.py does::
+
+            bsts_season = bsts_feedback.model("ep_return", period=100)
+
+        We return a _NullModel so downstream calls like
+        ``bsts_season.get_season()`` silently no-op rather than crash.
+        BSTSSeasonal (the full decomposer) is a separate class and is
+        instantiated independently when needed.
+        """
+        return _NullModel()
+
+    # ------------------------------------------------------------------
+    def update(self, metrics_dict: dict, *, step=None, race_type_tag=None) -> None:
+        """Feed new scalar metrics into EMA state.
+
+        Parameters
+        ----------
+        metrics_dict   : dict          {metric_name: scalar_value, ...}
+        step           : int | None    Global training step (unused internally,
+                                       accepted for run.py call-site compatibility).
+        race_type_tag  : str | None    If provided, hot-swaps self.race_type.
+        """
+        if race_type_tag is not None:
+            self.race_type = _norm_race_type(str(race_type_tag))
+
         for k, v in metrics_dict.items():
             if not isinstance(v, (int, float)):
                 continue                    # skip non-scalar BSTS metrics
             v = float(v)
+            # EMA
             if k not in self.ema:
                 self.ema[k] = v
             else:
                 self.ema[k] = self.alpha * v + (1.0 - self.alpha) * self.ema[k]
+            # History buffer for get_trend_vector()
+            if k not in self._history:
+                self._history[k] = collections.deque(maxlen=self._HIST_LEN)
+            self._history[k].append(v)
 
     # ------------------------------------------------------------------
-    def adjust_weights(self, base_weights) -> dict:
+    def get_trend_vector(self, race_type_filter=None) -> dict:
+        """Return {metric: linear_slope} over the last 5 observations in the
+        EMA history buffer.
+
+        Used by run.py to drive entropy_coef / lr annealing adjustments::
+
+            _bt = bsts_feedback.get_trend_vector(race_type_filter=_track_variant)
+            _rew_slope = float(_bt.get('reward', 0.0))
+
+        Parameters
+        ----------
+        race_type_filter : str | None
+            Accepted for call-site compatibility; not used to filter data
+            (all history is stored in a single buffer regardless of race_type).
+
+        Returns
+        -------
+        dict[str, float]
+            {metric: slope_float}.  Slope is the linear-regression coefficient
+            of ``metric`` over its last ``min(5, len(history))`` observations.
+            Returns 0.0 for metrics with fewer than 2 observations.
+        """
+        out = {}
+        window = 5
+        for k, dq in self._history.items():
+            arr = list(dq)[-window:]
+            n   = len(arr)
+            if n < 2:
+                out[k] = 0.0
+                continue
+            x = np.arange(n, dtype=float)
+            try:
+                slope = float(np.polyfit(x, arr, 1)[0])
+            except Exception:
+                slope = 0.0
+            out[k] = slope
+        return out
+
+    # ------------------------------------------------------------------
+    def adjust_weights(self, base_weights, *, race_type_filter=None) -> dict:
         """Return re-normalised reward weights adjusted by BSTS feedback.
 
         Applies three layers of adjustment in order:
@@ -158,8 +275,20 @@ class BSTSFeedback:
         2. EMA metric thresholds (crash_rate, offtrack_rate, speed, etc.)
         3. Race-type-specific multipliers (OBJECT_AVOIDANCE / HEAD_TO_BOT)
 
+        Parameters
+        ----------
+        base_weights     : dict   Starting weight dict from AnnealingScheduler.
+        race_type_filter : str | None
+            If provided, overrides self.race_type for this call only.
+
         Always returns a dict that sums to 1.0.
         """
+        effective_race_type = (
+            _norm_race_type(str(race_type_filter))
+            if race_type_filter is not None
+            else self.race_type
+        )
+
         # --- coerce base weights to float dict ---
         if isinstance(base_weights, dict):
             w = {k: float(v) if isinstance(v, (int, float)) else 0.1
@@ -167,7 +296,7 @@ class BSTSFeedback:
         else:
             w = {}
 
-        s  = self.strength
+        s   = self.strength
         cr  = self.ema.get("crash_rate",        0.0)
         otr = self.ema.get("offtrack_rate",      0.0)
         spd = self.ema.get("avg_speed",          2.0)
@@ -211,7 +340,7 @@ class BSTSFeedback:
             "TIME_TRIAL":       1.2,
             "OBJECT_AVOIDANCE": 1.05,   # tighter — obstacles demand precise speed
             "HEAD_TO_BOT":      1.1,
-        }.get(self.race_type, 1.2)
+        }.get(effective_race_type, 1.2)
 
         if ssr > _ssr_thresh:
             w["safe_speed"] = w.get("safe_speed", 0.06) + s * min(ssr - 1.0, 0.5) * 0.3
@@ -246,13 +375,13 @@ class BSTSFeedback:
             w["progress"] = w.get("progress", 0.12) + s * 0.10
 
         # ---- Layer 3: race_type multipliers ----
-        if self.race_type == "OBJECT_AVOIDANCE":
+        if effective_race_type == "OBJECT_AVOIDANCE":
             # Obstacle awareness and braking are critical; raise their floor
             w["obstacle"] = max(w.get("obstacle", 0.0), 0.12) * 1.3
             w["braking"]  = w.get("braking",  0.08) * 1.5
             w["center"]   = w.get("center",   0.10) * 1.1
 
-        elif self.race_type == "HEAD_TO_BOT":
+        elif effective_race_type == "HEAD_TO_BOT":
             # Need both obstacle avoidance AND speed — steering precision matters more
             w["obstacle"]       = max(w.get("obstacle", 0.0), 0.15) * 1.5
             w["steering"]       = w.get("steering",       0.02) * 2.0
