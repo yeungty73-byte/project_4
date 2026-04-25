@@ -51,6 +51,15 @@ from race_line_engine import MultiRaceLineEngine
 from bsts_seasonal import BSTSSeasonal
 # REF: Scott, S. L. & Varian, H. R. (2014). Predicting the present with Bayesian structural time series. Int. J. Math. Model. Numer. Optim., 5(1-2), 4-23.
 live_analyze = lambda *a,**k: None  # live_metrics.py purged (stubbed)
+# REF: Brach, R. (2011). Vehicle accident reconstruction. SAE 2011-01-0094.
+from gg_diagram import (
+    GGDiagram,
+    TrailBrakingDetector,
+    optimal_speed_at_curvature,
+    velocity_profile_compliance,
+    multi_horizon_curvature,
+    curvature_anticipation_score,
+)
 try:
     from live_dashboard import console_summary as live_summary
 except Exception:
@@ -735,6 +744,9 @@ def run(hparams):
     _corners = CornerAnalyzer() if _RESEARCH_MODULES else None
     _overtake = OvertakeAnalyzer(safe=1.5, bonus=2.0) if _RESEARCH_MODULES else None
     _bsts = BSTSTracker(win=50) if _RESEARCH_MODULES else None
+    # --- v220 GG-diagram instruments (reset each episode) ---
+    _gg = GGDiagram()          # friction-ellipse utilisation tracker
+    _tb = TrailBrakingDetector()  # trail-braking overlap detector
     # BSTSLogger: CSV episode logger wired to _bsts.record() calls below
     _bsts_log = BSTSLogger(win=50, log_dir="results") if _RESEARCH_MODULES else None
     _rbuf = ReplayBuffer(cap=200000) if _RESEARCH_MODULES else None
@@ -863,6 +875,11 @@ def run(hparams):
     ep_crash_lidar_min = None  # lidar min at crash
     ep_corner_speeds = []
     ep_graze_count = 0
+    # v220: reset GG-diagram instruments
+    _gg.reset()
+    _tb.reset()
+    ep_vpc_vals = []   # v220 velocity-profile compliance per step
+    ep_ca_vals  = []   # v220 curvature anticipation per step
     # v29: crash-antecedent kinematics ring buffer
     _ANTE_WIN = 20
     ep_ante_buf = []
@@ -1436,6 +1453,7 @@ def run(hparams):
                 _A_MAX_BRAKE = 3.0
                 _stop_dist = (_v_perp_barrier**2) / (2*_A_MAX_BRAKE + 1e-8)
                 _braking_intent = 1 if (_act_throttle < -0.1 or _accel < -0.5) else 0  # v32: agent brake OR physical decel  # did agent attempt to brake?
+
                 # v29: STOPPING-DISTANCE CALCULUS REWARD
                 # Reward agent for braking when stop_dist >= dist_to_barrier
                 # This teaches the agent to anticipate braking distance
@@ -1471,33 +1489,64 @@ def run(hparams):
                     elif ep_in_recovery and _dist_from_center < 0.2 * _tw: ep_in_recovery = False
                     if ep_in_recovery: ep_recovery_steps += 1
                     if len(ep_heading_diffs)>=2 and abs(ep_heading_diffs[-1])>5.0 and abs(ep_heading_diffs[-2])<=5.0: ep_turn_entry_speeds.append(_speed_ratio)
-            # Track corner speeds (high heading diff = corner)
+                # Track corner speeds (high heading diff = corner)
                 if len(ep_heading_diffs) > 0 and abs(ep_heading_diffs[-1]) > 5.0:
                     ep_corner_speeds.append(_speed)
                 # Track graze events (curb context but still on track)
                 if _ctx == 1 and not _offtrack:
                     ep_graze_count += 1
+                    
+                # --- v220 GG-diagram per-step ---
+
+                heading_rad = math.radians(_heading)
+                gg_util = gg.step(_speed, heading_rad)
+                in_corner_entry = (len(ep_heading_diffs) >= 2 and
+                                abs(ep_heading_diffs[-1]) > 3.0 and
+                                abs(ep_heading_diffs[-1]) > abs(ep_heading_diffs[-2]))
+                brake_pct = max(0.0, -act_throttle)
+                tb_quality = tb.step(brake_pct, abs(act_steer), in_corner_entry=in_corner_entry)
+
+                curv_for_vpc, _ = compute_track_curvature(waypoints, closest) if waypoints else (curvature, 4.0)
+                v_target_vpc = optimal_speed_at_curvature(curv_for_vpc)
+                vpc = velocity_profile_compliance(speed, v_target_vpc)
+
+                if waypoints and len(waypoints) >= 16:
+                    wps_arr = np.array(waypoints)
+                    cur_wp_idx = closest[1] if len(closest) > 1 else 0
+                    curvs_ahead = multi_horizon_curvature(wps_arr, cur_wp_idx)
+                    ca_score = curvature_anticipation_score(speed, curvs_ahead, bool(braking_intent))
+                else:
+                    ca_score = 0.5
+
+                ep_vpc_vals.append(vpc)    # v220 accumulate for episode summary
+                ep_ca_vals.append(ca_score)
+
+                if v_perp_barrier <= v_perp_safe:
+                    reward += 0.05 * gg_util
+                    reward += 0.04 * tb_quality
+                    reward += 0.06 * vpc
+                    reward += 0.05 * ca_score
             
-                        # --- v4: Record step for failure analysis ---
-            ep_metrics.record_step(rp)  # EpisodeMetricsAccumulator: v_perp braking analysis
-            sampler.record_step({
-                    'x': rp.get('x', 0.0), 'y': rp.get('y', 0.0),
-                    'heading': rp.get('heading', 0), 'speed': _speed,
-                    'steering_angle': _steer, 'progress': _prog,
-                    'closest_waypoints': _closest,
-                    'is_offtrack': _offtrack, 'is_crashed': rp.get('is_crashed', False),
-                    'is_reversed': rp.get('is_reversed', False),
-                    'distance_from_center': _dist, 'track_width': _tw,
-                    'action': action.cpu().numpy().item() if action.numel() == 1 else action.cpu().numpy(), 'reward': reward,
-                    'center_r': _center_r, 'heading_r': _head_r,
-                    'speed_r': _speed_r, 'step': global_step,
-                    'context_pred': int(agent.get_context(tensor(observation).unsqueeze(0))[0]) if hasattr(agent, 'get_context') else -1,
-                    'lidar_min': _lidar_min,
-                    'nearest_object': _nearest_obj,
-                    'barrier_proximity': _barrier_proximity,
-                    'track_width': _track_width,
-                    'dist_from_center': _dist_from_center,
-                })
+                            # --- v4: Record step for failure analysis ---
+                ep_metrics.record_step(rp)  # EpisodeMetricsAccumulator: v_perp braking analysis
+                sampler.record_step({
+                        'x': rp.get('x', 0.0), 'y': rp.get('y', 0.0),
+                        'heading': rp.get('heading', 0), 'speed': _speed,
+                        'steering_angle': _steer, 'progress': _prog,
+                        'closest_waypoints': _closest,
+                        'is_offtrack': _offtrack, 'is_crashed': rp.get('is_crashed', False),
+                        'is_reversed': rp.get('is_reversed', False),
+                        'distance_from_center': _dist, 'track_width': _tw,
+                        'action': action.cpu().numpy().item() if action.numel() == 1 else action.cpu().numpy(), 'reward': reward,
+                        'center_r': _center_r, 'heading_r': _head_r,
+                        'speed_r': _speed_r, 'step': global_step,
+                        'context_pred': int(agent.get_context(tensor(observation).unsqueeze(0))[0]) if hasattr(agent, 'get_context') else -1,
+                        'lidar_min': _lidar_min,
+                        'nearest_object': _nearest_obj,
+                        'barrier_proximity': _barrier_proximity,
+                        'track_width': _track_width,
+                        'dist_from_center': _dist_from_center,
+                    })
             # v16: BSTS seasonal per-step tracking
             bsts_season.record_step(
                 progress=_prog,
@@ -1670,7 +1719,12 @@ def run(hparams):
                                         'lap_time_sec': round(lap_time_sec,2),
                 'term_reason': term_reason,
                 'track_name': _track_name,
-                'track_variant': _track_variant,
+                            'track_variant'                    = track_variant,
+            'gg_ellipse_utilisation'           = round(gg.mean_utilisation, 4),
+            'trail_braking_quality'            = round(tb.mean_overlap, 4),
+            'trail_brake_ratio'                = round(tb.trail_brake_ratio, 4),
+            'velocity_profile_compliance'      = round(float(np.mean(ep_vpc_vals)) if ep_vpc_vals else 0.0, 4),
+            'curvature_anticipation'           = round(float(np.mean(ep_ca_vals))  if ep_ca_vals  else 0.5, 4),
                     # v29 crash antecedent forensics
                     'ante_brake_steps': sum(1 for r in ep_ante_buf if r.get('braking',0)),
                     'ante_mean_accel': round(sum(r.get('accel',0) for r in ep_ante_buf)/max(len(ep_ante_buf),1),3),
@@ -1691,6 +1745,18 @@ def run(hparams):
                     'avg_turn_entry_ratio': round(sum(ep_turn_entry_speeds)/max(len(ep_turn_entry_speeds),1), 4) if ep_turn_entry_speeds else 0.0,
                     }
                     bsts_row.update(_hm_out)
+                    # v220: override hmout with live GG scalars
+                    bsts_row['gg_ellipse_utilisation']      = round(gg.mean_utilisation, 4)
+                    bsts_row['trail_braking_quality']       = round(tb.mean_overlap, 4)
+                    bsts_row['trail_brake_ratio']           = round(tb.trail_brake_ratio, 4)
+                    bsts_row['velocity_profile_compliance'] = round(float(np.mean(ep_vpc_vals)) if ep_vpc_vals else 0.0, 4)
+                    bsts_row['curvature_anticipation']      = round(float(np.mean(ep_ca_vals))  if ep_ca_vals  else 0.5, 4)
+                    # TensorBoard GG metrics
+                    writer.add_scalar('gg/ellipse_utilisation',       bsts_row['gg_ellipse_utilisation'],      global_step)
+                    writer.add_scalar('gg/trail_braking_quality',     bsts_row['trail_braking_quality'],        global_step)
+                    writer.add_scalar('gg/trail_brake_ratio',         bsts_row['trail_brake_ratio'],            global_step)
+                    writer.add_scalar('gg/velocity_profile_compliance', bsts_row['velocity_profile_compliance'], global_step)
+                    writer.add_scalar('gg/curvature_anticipation',    bsts_row['curvature_anticipation'],       global_step)
                     jsonl_file.write(json.dumps(bsts_row) + '\n')
                     jsonl_file.flush()
 
