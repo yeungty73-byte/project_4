@@ -11,6 +11,15 @@ Fixes applied (2026-04-24):
     sum a scalar and produce wrong shapes.
   - actor_mean last-layer index corrected (-2 -> last Linear layer, not Tanh).
   - Added _init_weights() so run.py NaN-guard can call it after checkpoint load.
+
+Fix (2026-04-25):
+  - get_action_and_value: action.view(-1, self.act_dim) crashed with
+    RuntimeError: shape '[-1, 26]' is invalid for input of size 128 when the
+    env was Discrete and run.py had set act_dim=_act_n (e.g. 26).
+    Root cause: ContextAwarePPOAgent always uses a continuous Normal actor
+    (act_dim=2: steering, throttle). _act_dim_agent in run.py must ALWAYS
+    be 2, never _act_n. Guard added here as belt-and-suspenders: if action
+    is already 2D and shape[-1]==self.act_dim, skip reshape entirely.
 """
 
 import torch
@@ -90,14 +99,22 @@ def compute_brake_zone_loss(brake_pred, curvature_pred):
     excess_brake = torch.relu(brake_pred - alpha * curvature_pred.detach())
     return excess_brake.mean()
 
+
 class _ActorProxy:
     """Named proxy so pickle can find this class by module path."""
     def __init__(self, mu_head):
         self.mu_head = mu_head
+
+
 class ContextAwarePPOAgent(PPOAgent):
     # REF: Schulman, J. et al. (2017). Proximal policy optimization algorithms. arXiv:1707.06347.
     # REF: Hettiarachchi, R. et al. (2024). U-Transformer for autonomous racing. arXiv preprint.
     """PPO agent with context classification + intermediary metrics heads.
+
+    IMPORTANT: act_dim must ALWAYS be 2 (continuous: steering, throttle).
+    This agent uses a Normal distribution actor regardless of whether the
+    *environment* action space is Discrete or Box.  run.py must pass
+    act_dim=2 explicitly — never _act_n (the number of discrete bins).
 
     Key fix: obs_dim must be passed from run.py using
         env.observation_space.shape[0]
@@ -111,7 +128,7 @@ class ContextAwarePPOAgent(PPOAgent):
         nn.Module.__init__(self)
 
         self.obs_dim = obs_dim
-        self.act_dim = act_dim
+        self.act_dim = act_dim  # always 2: (steering, throttle)
         self.lidar_latent_dim = lidar_latent_dim
 
         # Shared encoder: obs -> lidar_latent
@@ -223,22 +240,39 @@ class ContextAwarePPOAgent(PPOAgent):
     def get_action_and_value(self, x, action=None):
         """PPO training forward.
 
-        FIX: when action is supplied (PPO update pass), reshape to (batch, act_dim)
-        before computing log_prob so sum(dim=-1) works correctly for both
-        scalar and vector action spaces.
+        FIX (2026-04-25): Robust action reshape that handles all storage shapes:
+          - action is None (rollout step): sample fresh from Normal dist
+          - action is 2D (batch, act_dim): already correct, pass through
+          - action is 1D (batch,) with act_dim==1: unsqueeze to (batch, 1)
+          - action is 1D (batch*act_dim,) flattened: view(-1, act_dim)
+            GUARD: only do this when numel % act_dim == 0, to avoid the
+            original crash 'shape [-1, 26] invalid for size 128' which
+            happened because act_dim was wrongly set to _act_n (e.g. 26).
+
+        The agent ALWAYS uses a 2D continuous Normal action (steering, throttle).
+        act_dim must be 2 in all callers.
         """
         mean, std, value, ctx_logits, intermed_pred = self.forward(x)
         dist = Normal(mean, std)
         if action is None:
             action = dist.sample()
         else:
-            # Ensure shape is (batch, act_dim) for continuous actions
-            if action.dim() == 1 and self.act_dim == 1:
-                action = action.unsqueeze(-1)          # (batch,) → (batch, 1)
-            elif action.dim() == 1 and self.act_dim > 1:
-                # action is (batch*act_dim,) flattened — reshape, don't expand
-                action = action.view(-1, self.act_dim)  # (batch, act_dim)
-            # if already 2D: pass through
+            action = action.float()
+            if action.dim() == 2 and action.shape[-1] == self.act_dim:
+                # Already (batch, act_dim) — correct, no reshape needed
+                pass
+            elif action.dim() == 1:
+                if self.act_dim == 1:
+                    # Scalar actions: (batch,) → (batch, 1)
+                    action = action.unsqueeze(-1)
+                elif action.numel() % self.act_dim == 0:
+                    # Flattened continuous: (batch*act_dim,) → (batch, act_dim)
+                    action = action.view(-1, self.act_dim)
+                else:
+                    # Mismatch (should not happen if act_dim=2 everywhere):
+                    # expand to (batch, act_dim) as fallback
+                    action = action.unsqueeze(-1).expand(-1, self.act_dim).float()
+            # Any other shape: leave as-is and let log_prob handle it
         log_prob = dist.log_prob(action).sum(dim=-1)
         entropy = dist.entropy().sum(dim=-1)
         return action, log_prob, entropy, value.squeeze(-1), ctx_logits, intermed_pred
