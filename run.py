@@ -292,10 +292,7 @@ class BSTSFeedback:
             w['progress'] = w.get('progress', 0.12) + s * 0.10
         t=sum(w.values())
         return {k:v/t for k,v in w.items()} if t>0 else w
-
-
 '''
-
 # REF: Almakhayita, S. K. et al. (2025). Reward design and hyperparameter tuning for generalizable deep RL agents. PLoS ONE, 20(6).
 class AnnealingScheduler:
     """Manages 3 annealing dimensions: reward_weights, hyperparams, architecture."""
@@ -1488,7 +1485,7 @@ def run(hparams):
                 _spd = rp.get("speed", 0.0)
                 # v213: Phase -1 alive bonus — stay on track is enough
                 _t_frac = global_step / max(total_timesteps, 1)
-                if _t_frac < 0.05 and not offtrack and not is_stuck:
+                if _t_frac < 0.05 and not _offtrack and not _is_stuck:
                     reward += 0.03
                 if _wps and len(_wps) > 1:
                     _los_r = _los.compute(_x, _y, _hdg, _wps, _cwps[0])
