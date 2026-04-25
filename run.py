@@ -1272,7 +1272,6 @@ def run(hparams):
                 waypoints=_env_waypoints,
                 track_width=float(_init_rp.get("track_width", 0.6)),
                 track_variant=_track_variant,
-                action_space=env.action_space,
             )
             n_harvested = harvest_htm_pilots(env, _bc_pilot, td3sac,
                                              n_episodes=12, min_progress=5.0)
@@ -1452,8 +1451,8 @@ def run(hparams):
             #   (4) clip to action_space.low/high
 
             # --- v213 FIX: use process_action for ALL action dispatch (discrete + continuous) ---
-            rawaction = action.cpu().numpy()          # ← must be BEFORE process_action call
-            _step_action = process_action(rawaction, env.action_space)
+            raw_action = action.cpu().numpy()          # ← must be BEFORE process_action call
+            _step_action = process_action(raw_action, env.action_space)
             # v40.2: removed duplicate env.step that used un-remapped action (caused 100% stuck episodes)
             # v40.3: comprehensive action dispatch telemetry for first 20 steps of each episode
             try:
@@ -1472,8 +1471,8 @@ def run(hparams):
             observation, reward, terminated, truncated, info = env.step(_step_action)
             # v1.0.13: continuous arc-progress update — runs every step, not just episode end
             _rp_now = info.get("reward_params", {}) if isinstance(info, dict) else {}
-            ep_centerline_progress_m, ep_track_length_m, ep_progress_pct, _prog_delta, episode_progress_state = \
-                update_episode_centerline_progress(_rp_now, _track_progress_cache, episode_progress_state)
+            ep_centerline_progress_m, ep_track_length_m, ep_progress_pct, _prog_delta, _episode_progress_state = \
+                update_episode_centerline_progress(_rp_now, _track_progress_cache, _episode_progress_state)
             ep_progress = ep_centerline_progress_m
             # logger.info(f"[TRUNCATE] ep_step={ep_step_count} >= 500, forcing truncation")
             # Debug: log reward_params for first 3 steps
@@ -2385,11 +2384,6 @@ def run(hparams):
                 ep_centerline_progress_m = 0.0
                 ep_track_length_m      = 100.0
                 ep_track_progress_pct  = 0.0
-                # v1.0.13: arc-length progress update (replaces raw rp['progress'])
-                _rp_step = info.get("reward_params", {}) if isinstance(info, dict) else {}
-                ep_centerline_progress_m, ep_track_length_m, ep_progress_pct, _prog_delta, _episode_progress_state = \
-                    update_episode_centerline_progress(_rp_step, _track_progress_cache, _episode_progress_state)
-                ep_progress = ep_centerline_progress_m   # metres traveled this episode
                 ep_context_preds       = []
                 ep_lidar_mins          = []
                 ep_barrier_proximities = []
@@ -2460,6 +2454,11 @@ def run(hparams):
                 for _rtry in range(3):
                     try:
                         observation, info = env.reset()
+                        # v1.0.14: init arc-progress state for NEW episode spawn position
+                        _new_rp = info.get("reward_params", {}) if isinstance(info, dict) else {}
+                        _episode_progress_state = reset_episode_centerline_progress(
+                            _new_rp, _track_progress_cache
+                        )
                         break
                     except Exception as e:
                         logger.warning(f"mid-training reset attempt {_rtry+1}/3 failed: {e}")
