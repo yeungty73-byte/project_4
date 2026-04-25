@@ -860,16 +860,17 @@ class BootstrapRewardController:
             "completion", "decel", "obstacle", "steering"
         }
         w = {k: 0.0 for k in keys}
+        # v1.1.0: boosted progress weight, added strong heading to keep car on track
         w.update({
-            "progress": 0.55,
-            "heading": 0.13,
-            "center": 0.11,
-            "min_speed": 0.10,
-            "braking": 0.05,
-            "completion": 0.03,
+            "progress": 0.62,   # v1.1.0 was 0.55 — get there, ONLY objective
+            "heading": 0.18,    # v1.1.0 was 0.13 — point forward!
+            "center": 0.08,     # v1.1.0 was 0.11
+            "min_speed": 0.06,  # v1.1.0 was 0.10
+            "braking": 0.03,
+            "completion": 0.02,
             "racing_line": 0.01,
-            "corner": 0.01,
-            "speed_steering": 0.01,
+            "corner": 0.00,
+            "speed_steering": 0.00,
             "curv_speed": 0.00,
             "decel": 0.00,
             "obstacle": 0.00,
@@ -1549,11 +1550,15 @@ def run(hparams):
             _delta_prog = _prog - _prev_prog_tracker
             _bootstrap_active = bootstrap_rewards.active(global_step, total_timesteps)
             if _delta_prog > 0:
-                reward += _delta_prog * (3.0 if _bootstrap_active else 0.5)
+                # v1.1.0: amplified bootstrap progress signal (was 3.0 → 8.0)
+                 reward += _delta_prog * (8.0 if _bootstrap_active else 1.5)
             elif _bootstrap_active and ep_step_count > 3:
-                reward -= 0.02
+                reward = reward * 0.88  # v1.1.0: no-progress ATTENUATION during bootstrap (12% cut per step, no additive penalty)
             if _bootstrap_active and not _offtrack and not _is_stuck:
-                reward += 0.02
+                reward += 0.05  # v1.1.0: stronger alive bonus during bootstrap (was 0.02)
+                # v1.1.0: heading-to-waypoint bonus: fire for first 8 steps of episode
+                if ep_step_count <= 8 and "_head_r" in dir() and _head_r > 0.5:
+                    reward += 0.20 * _head_r  # strong initial heading alignment incentive
             _prev_prog_tracker = _prog
             # v23: alive bonus
             # if not _offtrack and not _is_stuck:  # MUTED v25
@@ -1744,9 +1749,11 @@ def run(hparams):
                 # v18: wire stuck-antecedent bonus into reward
                 # v39: Un-muted _stuck_bonus (was MUTED v25)
                 if _approaching_stuck and _stuck_bonus > 0:
-                    reward += (0.0 if _bootstrap_active else min(float(_stuck_bonus), 0.5))  # v1.0.13 cap stuck bonus; disabled during bootstrap
-                    if _speed < 1.0 and _approaching_stuck:
-                        reward += 0.5  # extra bonus for cautious approach near stuck zones
+                     # v1.1.0: use small stuck_bonus during bootstrap (10% strength) so agent DOES get escape signal
+                     _sb_frac = 0.1 if _bootstrap_active else 1.0
+                     reward += min(float(_stuck_bonus) * _sb_frac, 0.5 if not _bootstrap_active else 0.05)
+                if _speed < 1.0 and _approaching_stuck:
+                    reward += 0.5  # extra bonus for cautious approach near stuck zones
                 # v19: SAC exploration bonus
                 # ICM/SAC curiosity: only reward novelty that comes WITH forward progress
                 try:
@@ -1774,14 +1781,14 @@ def run(hparams):
                     #    Agent pays -0.08/step for creeping. At 200 steps/ep thats -16.0 ep_return.
                     #    But crashing at speed at least earns the speed bonus before dying.
                     if _spd < 0.15:
-                        reward -= 0.15  # creep tax: strictly worse than moving at any speed
+                        reward = reward * 0.70  # v1.1.0: creep ATTENUATION (30% cut, not subtractive — avoids freeze trap)
                     # 4) Raceline compliance bonus when moving (reward the incompatible behavior)
                     if _spd > 0.3 and ep_dist_from_center:
                         _ctr = abs(float(ep_dist_from_center[-1]))
                         reward += 0.25 * max(0.0, 1.0 - _ctr / 0.5)  # on-line + moving = bonus  # v39: boosted from 0.06
-                    # 5) Reverse is penalized but less than standing still
+                    # 5) Reverse is attenuated but NOT additively penalized (v1.1.0: multiplicative)
                     if _is_rev:
-                        reward -= 0.12
+                        reward = reward * 0.80  # 20% cut for reversing; frozen agent near 0 gets ~0 cut
                 except Exception:
                     pass
 
@@ -1791,6 +1798,13 @@ def run(hparams):
                 else:
                     ep_offtrack_steps = max(0, ep_offtrack_steps - 1)  # recover
                 _offtrack_stuck = _offtrack and ep_offtrack_steps > 10  # v39: grace period
+                # v1.1.0: v_perp offtrack ATTENUATION — multiplicative, not additive
+                # Division avoids freeze-to-avoid-penalty trap (frozen agent near 0 reward gets 0 cut)
+                # At v_perp=0: factor=1.0. At v_perp=3.6: factor≈0.41 (59% reward cut).
+                if _offtrack:
+                    _vperp_val = float(_v_perp_barrier) if "_v_perp_barrier" in dir() else 1.0
+                    _offtrack_attn = 1.0 / (1.0 + max(0.0, _vperp_val) * 0.40)
+                    reward = reward * _offtrack_attn  # never subtracts; just scales earned reward down
                 _is_stuck = (_speed < 0.3) or _offtrack_stuck or _is_rev  # v39: uses grace
                 if anneal['reward_boost'] > 1.0:
     #                     # reward += (anneal['reward_boost'] - 1.0) * 0.2 * _prog_r  # MUTED v25
@@ -2005,11 +2019,14 @@ def run(hparams):
                 ep_progress_pct = max(ep_progress_pct, float(raw_prog))   # take sim pct as floor for lap gate
                 lap_completed = 1.0 if ep_progress_pct >= 100.0 and not _bad_end else 0.0
                 bootstrap_rewards.update_episode(ep_progress_pct, lap_completed > 0.0)
-                bootstrap_rewards.update_episode(ep_progress, lap_completed == 1.0)
+                # v1.1.0: removed duplicate update_episode (was using metres not pct) — single call above
                 lap_time_sec = time.time() - ep_start_time  # v24: wall-clock episode time
                 episode_count += 1
                 # --- v6: episode stuck update ---
-                _escaped = ep_progress_pct > 20.0  # centerline pct
+                # v1.1.0: progressive escaped threshold — starts at 5% (early training), grows to 20%
+                _t_frac_ep = global_step / max(total_timesteps, 1)
+                _escaped_thresh = 5.0 + 15.0 * min(_t_frac_ep / 0.30, 1.0)  # 5% @ t=0 → 20% @ t=30%
+                _escaped = ep_progress_pct > _escaped_thresh  # v1.1.0
                 if stuck_tracker._cur_stuck_cluster is not None:
                     _escaped = ep_progress_pct> (stuck_tracker._cur_stuck_cluster / 120.0 * 100.0 + 15.0)
                 stuck_tracker.episode_update(
