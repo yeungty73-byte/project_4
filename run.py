@@ -1,11 +1,9 @@
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "packages"))
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import deepracer_gym
+import sys, os; sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "packages")); import deepracer_gym
 # REF: Balaji, B. et al. (2020). DeepRacer: Autonomous Racing Platform for Sim2Real RL. IEEE ICRA.
 # REF: Salazar, J. et al. (2024). Deep RL for Autonomous Driving in AWS DeepRacer. Information, 15(2).
 # REF: Samant, N. & Deshpande, A. (2020). How we broke into the top 1% of AWS DeepRacer. Building Fynd.
 import math, socket, hashlib
+import sys; sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.dirname(__import__('os').path.abspath(__file__))))
 import yaml
 import time
 import signal
@@ -26,6 +24,7 @@ from agents import PPOAgent, RandomAgent
 # REF: Schulman, J. et al. (2017). Proximal Policy Optimization Algorithms. arXiv:1707.06347.
 from context_aware_agent import ContextAwarePPOAgent
 from failure_analysis import FailurePointSampler
+from brake_field import BrakeField
 # REF: Sutton, R. S. & Barto, A. G. (2018). Reinforcement Learning: An Introduction (2nd ed.). MIT Press.
 from stuck_tracker import StuckTracker
 # REF: Kolter, J. Z. & Ng, A. Y. (2009). Near-Bayesian exploration in polynomial time. ICML.
@@ -127,6 +126,23 @@ def compute_track_curvature(waypoints, closest, lookahead=5):
     safe_speed = min(4.0, max(1.0, 0.8 * (1.0 / (curv + 1e-6))**0.5))
     return curv, safe_speed
 
+
+def compute_racing_line_offset(waypoints, closest, tw, lookahead=8):
+    """Return lateral offset from centerline for racing line (-0.7 to 0.7)."""
+    if not waypoints or len(waypoints) < 3:
+        return 0.0
+    n = len(waypoints)
+    idx = closest[1] if len(closest) > 1 else 0
+    p0 = waypoints[idx]
+    pa = waypoints[(idx + lookahead) % n]
+    pb = waypoints[(idx - 3) % n]
+    dx1, dy1 = p0[0] - pb[0], p0[1] - pb[1]
+    dx2, dy2 = pa[0] - p0[0], pa[1] - p0[1]
+    cross = dx1 * dy2 - dy1 * dx2
+    mag = (dx1**2 + dy1**2)**0.5 * (dx2**2 + dy2**2)**0.5 + 1e-8
+    return max(-0.7, min(0.7, -cross / mag * 3.0))
+
+
 def _compute_crash_v_perp(speed, heading, closest_wp, waypoints):
     """Velocity component perpendicular to track tangent at closest waypoint."""
     if not waypoints or not closest_wp or len(closest_wp) < 2:
@@ -156,7 +172,7 @@ def _compute_crash_v_tang(speed, heading, closest_wp, waypoints):
 
 def compute_racing_line_offset(waypoints, closest, tw, lookahead=8):
     if not waypoints or len(waypoints) < 3: return 0.0
-    n = len(waypoints); idx = closest[1] % n if len(closest) > 1 else 0
+    n = len(waypoints); idx = closest[1] if len(closest) > 1 else 0
     p0 = waypoints[idx]; pa = waypoints[(idx + lookahead) % n]; pb = waypoints[(idx - 3) % n]
     dx1, dy1 = p0[0] - pb[0], p0[1] - pb[1]; dx2, dy2 = pa[0] - p0[0], pa[1] - p0[1]
     cross = dx1 * dy2 - dy1 * dx2; mag = (dx1**2 + dy1**2)**0.5 * (dx2**2 + dy2**2)**0.5 + 1e-8
@@ -285,6 +301,13 @@ class AnnealingScheduler:
         self.total_steps = total_steps
         self.explore_end = 0.25
         self.transition_end = 0.60
+        # PHASE -1: adaptive survival bootstrap; also enforced by BootstrapRewardController.
+        self.rw_phase_m1 = {
+            "center": 0.05, "heading": 0.10, "racing_line": 0.02, "braking": 0.05,
+            "progress": 0.60, "corner": 0.02, "speed_steering": 0.02,
+            "curv_speed": 0.00, "min_speed": 0.12, "completion": 0.02,
+            "decel": 0.00, "obstacle": 0.00, "steering": 0.00,
+        }
         # PHASE 0: Completion-first (0–30% of training)
         # Positioning, heading, brake-field, racing line dominate. Speed suppressed.
         self.rw_phase0 = {
@@ -348,9 +371,12 @@ class AnnealingScheduler:
 
     def get_reward_weights(self, step):
         t = step / self.total_steps
-        if t < 0.30:
-            # Phase 0→1 linear blend
-            alpha = t / 0.30
+        if t < 0.05:
+            alpha = t / 0.05
+            src, dst = self.rw_phase_m1, self.rw_phase0
+        elif t < 0.30:
+            # Phase 0→1 linear blend after bootstrap
+            alpha = (t - 0.05) / 0.25
             src, dst = self.rw_phase0, self.rw_phase1
         elif t < 0.65:
             # Phase 1→2 linear blend
@@ -384,6 +410,28 @@ class AnnealingScheduler:
     def get_architecture_params(self, step):
         dropout = 0.15 + (0.02 - 0.15) * self._sigmoid_blend(step, 0.2, 0.6)
         return {"dropout": dropout}
+
+
+# v27: barrier-relative velocity helpers
+def _compute_crash_v_perp(speed, heading, closest_wp, waypoints):
+    if not waypoints or not closest_wp or len(closest_wp) < 2: return 0.0
+    try:
+        dx = waypoints[closest_wp[1]][0] - waypoints[closest_wp[0]][0]
+        dy = waypoints[closest_wp[1]][1] - waypoints[closest_wp[0]][1]
+        delta = math.radians(heading - math.degrees(math.atan2(dy, dx)))
+        return abs(speed * math.sin(delta))
+    except: return 0.0
+
+def _compute_crash_v_tang(speed, heading, closest_wp, waypoints):
+    if not waypoints or not closest_wp or len(closest_wp) < 2: return 0.0
+    try:
+        dx = waypoints[closest_wp[1]][0] - waypoints[closest_wp[0]][0]
+        dy = waypoints[closest_wp[1]][1] - waypoints[closest_wp[0]][1]
+        delta = math.radians(heading - math.degrees(math.atan2(dy, dx)))
+        return abs(speed * math.cos(delta))
+    except: return 0.0
+
+
 
 # --- v205 auto-bootstrap: start deepracer container if needed ---
 def _auto_bootstrap_deepracer(max_wait=60):
@@ -585,36 +633,40 @@ def _apply_phase_env(args, phase, current_env=None):
 HTM_PILOT_EPISODES = 50   # collect 50 clean HTM completions
 MIN_PILOT_PROGRESS = 80.0  # only keep episodes that hit 80%+
 
-def harvest_htm_pilots(env, htm_agent, td3sac, n_episodes=50, min_progress=80.0):
+def harvest_htm_pilots(env, htm_agent, td3sac, n_episodes=12, min_progress=5.0):
     """
-    Run HTM deterministic controller, collect (s,a,r,s',done) tuples,
-    push only high-progress episodes into td3sac.replay (the BC seed buffer).
+    Run deterministic pilot and seed replay for BC/TD3. Critical fixes:
+      - call pilot.act(reward_params), not pilot.act(obs)
+      - process/clip expert actions through the real env action_space
+      - keep low-progress but non-empty pilot rollouts during bootstrap
     """
-    pilot_count = 0
-    for ep in range(n_episodes * 3):  # 3x budget to hit n target pilots
+    pilot_count, stored = 0, 0
+    for ep in range(max(n_episodes * 3, n_episodes)):
         obs, info = env.reset()
+        rp = info.get('reward_params', {}) if isinstance(info, dict) else {}
         ep_buf, ep_prog = [], 0.0
         terminated, truncated = False, False
-        _harvest_rp = info.get('reward_params', {}) if isinstance(info, dict) else {}
         while not (terminated or truncated):
-            # HTMPilotDriver.act() expects reward_params dict, NOT the obs array
-            action = htm_agent.act(_harvest_rp)  # deterministic waypoint-follower
+            raw_action = htm_agent.act(rp)
+            action = process_action(raw_action, env.action_space)
             next_obs, reward, terminated, truncated, info = env.step(action)
-            _harvest_rp = info.get('reward_params', {}) if isinstance(info, dict) else {}
-            ep_prog = _harvest_rp.get('progress', 0.0)
-            act_t = torch.tensor(action, dtype=torch.float32)
+            next_rp = info.get('reward_params', {}) if isinstance(info, dict) else {}
+            _, _, prog_pct = centerline_progress_from_reward_params(next_rp, {})
+            ep_prog = max(ep_prog, float(prog_pct))
+            act_t = torch.tensor(np.asarray(action), dtype=torch.float32)
             obs_t = torch.tensor(obs_to_array(obs), dtype=torch.float32)
             nobs_t = torch.tensor(obs_to_array(next_obs), dtype=torch.float32)
-            ep_buf.append((obs_t, act_t, reward, nobs_t, float(terminated)))
-            obs = next_obs
-        if ep_prog >= min_progress:
+            ep_buf.append((obs_t, act_t, float(reward), nobs_t, float(terminated or truncated)))
+            obs, rp = next_obs, next_rp
+        if ep_buf and ep_prog >= float(min_progress):
             for transition in ep_buf:
                 td3sac.store_transition(*transition)
+                stored += 1
             pilot_count += 1
-            logger.info(f"HTM Pilot {pilot_count}/{n_episodes}: prog={ep_prog:.1f}%")
+            logger.info(f"BC pilot {pilot_count}/{n_episodes}: centerline_progress={ep_prog:.1f}% steps={len(ep_buf)}")
         if pilot_count >= n_episodes:
             break
-    logger.info(f"HTM pilot harvest done: {pilot_count} episodes → {len(td3sac.replay)} transitions in BC buffer")
+    logger.info(f"BC pilot harvest done: {pilot_count} episodes, {stored} transitions, replay={len(td3sac.replay)}")
     return pilot_count
 
 def pretrain_td3_bc(td3sac, ppo_agent, bc_steps=2000):
@@ -630,6 +682,187 @@ def pretrain_td3_bc(td3sac, ppo_agent, bc_steps=2000):
             logger.info(f"BC pretrain step {step}: critic_loss={result.get('critic_loss',0):.4f}, "
                         f"replay_size={result.get('replay_size',0)}")
     logger.info("BC pre-training complete — TD3 critics bootstrapped on expert trajectories")
+
+def preflightgymbridge():
+    """Verify GYMPORT is reachable before training starts."""
+    import os, socket
+    host = os.environ.get('GYMHOST', '127.0.0.1')
+    port = int(os.environ.get('GYMPORT', 8888))
+    try:
+        with socket.create_connection((host, port), timeout=5):
+            print(f"preflight v202 gym bridge {host}:{port} OPEN", flush=True)
+            return True
+    except Exception as e:
+        print(f"preflight v202 gym bridge {host}:{port} UNREACHABLE {e}", flush=True)
+        return False
+# --- v213: BCPilot — internal deterministic expert for BC seeding ---
+# Replaces htm_reference.HTMPilotDriver when unavailable. No external deps.
+
+class BCPilot:
+    """Small deterministic expert for BC seeding; consumes reward_params, not obs arrays."""
+    def __init__(self, waypoints, track_width=0.6, track_variant="timetrial", action_space=None):
+        self.waypoints = list(waypoints or [])
+        self.track_width = float(track_width or 0.6)
+        self.track_variant = track_variant
+        self.action_space = action_space
+
+    def act(self, rp: dict):
+        rp = rp if isinstance(rp, dict) else {}
+        waypoints = rp.get("waypoints", self.waypoints)
+        closest = rp.get("closest_waypoints", [0, 1])
+        speed = float(rp.get("speed", 0.0) or 0.0)
+        heading = float(rp.get("heading", 0.0) or 0.0)
+        tw = float(rp.get("track_width", self.track_width) or self.track_width)
+        dist_ctr = float(rp.get("distance_from_center", 0.0) or 0.0)
+        is_left = bool(rp.get("is_left_of_center", False))
+        if not waypoints or len(waypoints) < 3:
+            raw = np.array([0.0, 0.35], dtype=np.float32)
+            return process_action(raw, self.action_space) if self.action_space is not None else raw
+        n = len(waypoints)
+        idx = int(closest[1] if len(closest) > 1 else closest[0]) % n
+        look = min(8, max(2, n // 20))
+        tx = float(waypoints[(idx + look) % n][0]) - float(waypoints[idx][0])
+        ty = float(waypoints[(idx + look) % n][1]) - float(waypoints[idx][1])
+        target_heading = math.degrees(math.atan2(ty, tx))
+        heading_err = ((target_heading - heading + 180.0) % 360.0) - 180.0
+        steer_heading = np.clip(heading_err / 45.0, -1.0, 1.0)
+        try:
+            rl_offset = compute_racing_line_offset(waypoints, closest, tw)
+        except Exception:
+            rl_offset = 0.0
+        actual_lat = dist_ctr * (1.0 if is_left else -1.0)
+        target_lat = rl_offset * tw * 0.5
+        steer_lat = np.clip((target_lat - actual_lat) / max(tw * 0.5, 1e-3), -1.0, 1.0)
+        steering = float(np.clip(0.65 * steer_heading + 0.35 * steer_lat, -1.0, 1.0))
+        try:
+            _, _, safe_speed, dist_to_corner = lookahead_curvature_scan(waypoints, closest, max_lookahead=15)
+        except Exception:
+            safe_speed, dist_to_corner = 2.2, 5.0
+        # Box throttle channel in this repo is [-1, 1]. Positive accelerates, negative brakes.
+        if abs(heading_err) > 55.0:
+            throttle = -0.25
+        elif speed > safe_speed * 1.08:
+            throttle = -0.35
+        elif speed < safe_speed * 0.80:
+            throttle = 0.75
+        else:
+            throttle = 0.25
+        raw = np.array([steering, throttle], dtype=np.float32)
+        return process_action(raw, self.action_space) if self.action_space is not None else raw
+
+
+# --- v1.0.13: centerline arc-length progress + bootstrap reward controller ---
+def arc_track_length(waypoints) -> float:
+    """Total centerline arc length of the closed track in metres."""
+    if not waypoints or len(waypoints) < 2:
+        return 100.0
+    total = 0.0
+    n = len(waypoints)
+    for i in range(n):
+        x0, y0 = float(waypoints[i][0]), float(waypoints[i][1])
+        x1, y1 = float(waypoints[(i + 1) % n][0]), float(waypoints[(i + 1) % n][1])
+        total += math.hypot(x1 - x0, y1 - y0)
+    return max(total, 1.0)
+
+def centerline_progress_from_reward_params(rp: dict, cache: dict | None = None):
+    """
+    Return (distance_m, track_len_m, percent) where percent is
+    centerline distance traveled / actual centerline track length * 100.
+    This replaces raw simulator progress as the training/logging metric.
+    """
+    if cache is None:
+        cache = {}
+    waypoints = rp.get("waypoints", []) if isinstance(rp, dict) else []
+    closest = rp.get("closest_waypoints", [0, 1]) if isinstance(rp, dict) else [0, 1]
+    if not waypoints or len(waypoints) < 2:
+        raw = float(rp.get("progress", 0.0) or 0.0) if isinstance(rp, dict) else 0.0
+        return raw, 100.0, raw
+    n = len(waypoints)
+    key = id(waypoints)
+    if cache.get("key") != key or cache.get("n") != n:
+        seg = []
+        cum = [0.0]
+        for i in range(n):
+            x0, y0 = float(waypoints[i][0]), float(waypoints[i][1])
+            x1, y1 = float(waypoints[(i + 1) % n][0]), float(waypoints[(i + 1) % n][1])
+            d = math.hypot(x1 - x0, y1 - y0)
+            seg.append(d)
+            cum.append(cum[-1] + d)
+        cache.clear()
+        cache.update({"key": key, "n": n, "seg": seg, "cum": cum, "total": max(cum[-1], 1.0)})
+    try:
+        prev_i = int(closest[0]) % n
+        next_i = int(closest[1]) % n
+    except Exception:
+        prev_i, next_i = 0, 1
+    x = float(rp.get("x", waypoints[prev_i][0]) or waypoints[prev_i][0])
+    y = float(rp.get("y", waypoints[prev_i][1]) or waypoints[prev_i][1])
+    x0, y0 = float(waypoints[prev_i][0]), float(waypoints[prev_i][1])
+    x1, y1 = float(waypoints[next_i][0]), float(waypoints[next_i][1])
+    vx, vy = x1 - x0, y1 - y0
+    denom = vx * vx + vy * vy
+    frac = 0.0 if denom <= 1e-12 else max(0.0, min(1.0, ((x - x0) * vx + (y - y0) * vy) / denom))
+    seg_len = cache["seg"][prev_i]
+    dist_m = cache["cum"][prev_i] + frac * seg_len
+    total_m = cache["total"]
+    pct = 100.0 * dist_m / total_m
+    raw = float(rp.get("progress", pct) or pct)
+    # If the simulator reports lap completion, trust completion while keeping metres meaningful.
+    if raw >= 100.0:
+        dist_m, pct = total_m, 100.0
+    return float(dist_m), float(total_m), float(max(0.0, min(100.0, pct)))
+
+class BootstrapRewardController:
+    """Adaptive initial-stage shaping: force completion-first rewards until laps appear."""
+    def __init__(self, window=100, max_train_frac=0.60):
+        self.window = int(window)
+        self.max_train_frac = float(max_train_frac)
+        self.recent = []
+        self.best_progress = 0.0
+        self.completions = 0
+
+    def update_episode(self, progress_pct, completed=False):
+        progress_pct = float(progress_pct or 0.0)
+        self.best_progress = max(self.best_progress, progress_pct)
+        self.completions += int(bool(completed))
+        self.recent.append((progress_pct, bool(completed)))
+        if len(self.recent) > self.window:
+            self.recent = self.recent[-self.window:]
+
+    def active(self, global_step, total_steps):
+        if total_steps <= 0:
+            return True
+        recent_completions = sum(1 for _, done in self.recent if done)
+        return (global_step / float(total_steps) < self.max_train_frac
+                and recent_completions == 0
+                and self.best_progress < 95.0)
+
+    def weights(self, base):
+        # Preserve all keys but make progress/min_speed/heading dominate.
+        keys = set(base.keys()) | {
+            "center", "heading", "racing_line", "braking", "progress",
+            "corner", "speed_steering", "curv_speed", "min_speed",
+            "completion", "decel", "obstacle", "steering"
+        }
+        w = {k: 0.0 for k in keys}
+        w.update({
+            "progress": 0.55,
+            "heading": 0.13,
+            "center": 0.11,
+            "min_speed": 0.10,
+            "braking": 0.05,
+            "completion": 0.03,
+            "racing_line": 0.01,
+            "corner": 0.01,
+            "speed_steering": 0.01,
+            "curv_speed": 0.00,
+            "decel": 0.00,
+            "obstacle": 0.00,
+            "steering": 0.00,
+        })
+        s = sum(w.values()) or 1.0
+        return {k: v / s for k, v in w.items()}
+
 
 def run(hparams):
     # v203: allow bypass when GYM_BRIDGE_OPTIONAL=1 (Ed #586 local-loop mode)
@@ -830,11 +1063,13 @@ def run(hparams):
 
     # --- v4: Meta-Annealing Scheduler ---
     scheduler = AnnealingScheduler(total_timesteps)
+    bootstrap_rewards = BootstrapRewardController(window=100, max_train_frac=0.60)
     
         # --- v4: Failure Point Sampler ---
     sampler = FailurePointSampler(save_dir='results', num_segments=10, max_samples=50)
     # EpisodeMetricsAccumulator: step-level state accumulator for braking/speed analysis
     ep_metrics = EpisodeMetricsAccumulator()
+    _track_progress_cache = {}
 
     # --- v200: JSONL metrics file for BSTS analysis ---
     os.makedirs('results', exist_ok=True)
@@ -878,9 +1113,6 @@ def run(hparams):
             "braking": [], "turn_align": []
     }
     ep_speeds = []
-    ep_jerk_abs = []
-    ep_brake_before_barrier = []
-    ep_speed_prev = None
     ep_headings = []  # v26
     ep_closest_wps = []  # v26
     ep_dist_from_center = []
@@ -916,6 +1148,9 @@ def run(hparams):
     ep_first_offtrack_step = None
     ep_progress_hist = []
     ep_progress = 0.0
+    ep_centerline_progress_m = 0.0
+    ep_track_length_m = 100.0
+    ep_track_progress_pct = 0.0
     ep_start_time = time.time()  # v24: lap time tracking
     ep_reversed_count = 0
     ep_zero_speed_count = 0
@@ -936,6 +1171,9 @@ def run(hparams):
     ep_prev_steer = 0.0
     # v37 per-episode lists — must exist before hard-truncation block
     ep_ang_vel_centerline: list = []
+    ep_speed_prev = None
+    ep_jerk_abs: list = []
+    ep_brake_before_barrier: list = []
 
     # Initialize env to get observation shape
     # Retry env.reset() - recreate env on failure (ZMQ socket state)
@@ -984,22 +1222,33 @@ def run(hparams):
         from htm_reference import HTMPilotDriver
         _init_rp = _init_info.get("reward_params", {}) if isinstance(_init_info, dict) else {}
         _env_waypoints = _init_rp.get("waypoints", [])
-
-        # GUARD: don't build HTM pilot on empty waypoints
-        if len(_env_waypoints) < 10:
-            logger.warning("[HTM] waypoints empty at init — skipping BC harvest")
-        else:
-            htm_pilot = HTMPilotDriver(
+        htm_pilot = HTMPilotDriver(
+            waypoints=_env_waypoints,
+            track_width=float(_init_rp.get("track_width", 0.6)),
+            track_variant=_track_variant,
+        )
+        n_harvested = harvest_htm_pilots(env, htm_pilot, td3sac,
+                                         n_episodes=12, min_progress=5.0)
+        if n_harvested >= 10:
+            pretrain_td3_bc(td3sac, agent, bc_steps=2000)
+    except ImportError:
+        # BCPilot: internal fallback, no external dependency
+        logger.warning("[HTM] htm_reference not found – falling back to BCPilot")
+        _init_rp = _init_info.get("reward_params", {}) if isinstance(_init_info, dict) else {}
+        _env_waypoints = _init_rp.get("waypoints", [])
+        if len(_env_waypoints) >= 10:
+            _bc_pilot = BCPilot(
                 waypoints=_env_waypoints,
                 track_width=float(_init_rp.get("track_width", 0.6)),
                 track_variant=_track_variant,
+                action_space=env.action_space,
             )
-            n_harvested = harvest_htm_pilots(env, htm_pilot, td3sac,
-                                            n_episodes=50, min_progress=80.0)
+            n_harvested = harvest_htm_pilots(env, _bc_pilot, td3sac,
+                                             n_episodes=12, min_progress=5.0)
             if n_harvested >= 10:
                 pretrain_td3_bc(td3sac, agent, bc_steps=2000)
-    except ImportError:
-        logger.warning("[HTM] htm_reference not found – skipping BC seed harvest")
+        else:
+            logger.warning("[BC] waypoints empty at init — skipping BC harvest")
     except Exception as _htm_e:
         logger.warning(f"[HTM] BC harvest failed: {_htm_e} – continuing without BC seed")
     # rollout storage
@@ -1050,7 +1299,7 @@ def run(hparams):
             hp['ent_coef'] = min(hp['ent_coef'] * 1.5, 0.05)  # explore more on plateau
             hp['lr'] = min(hp['lr'] * 1.3, 5e-4)
         elif _bt.get('phase') == 'declining':
-            hp['ent_coef'] = min(hp['ent_coef'] * 1.5, 0.03)  # strong explore on decline
+            hp['ent_coef'] = min(hp['ent_coef'] * 2.0, 0.08)  # strong explore on decline
         elif _bt.get('phase') == 'improving' and _bt.get('return_slope', 0) > 0.5:
             hp['ent_coef'] = max(hp['ent_coef'] * 0.8, 0.005)  # exploit on strong improvement
         # --- v6: architecture annealing ---
@@ -1059,6 +1308,8 @@ def run(hparams):
         hp['clip_coef'] = max(0.05, hp['clip_coef'] - 0.03 * (1.0 - _worst_br))
         arch = scheduler.get_architecture_params(global_step)
         rw = scheduler.get_reward_weights(global_step)
+        if bootstrap_rewards.active(global_step, total_timesteps):
+            rw = bootstrap_rewards.weights(rw)
         # v16: BSTS season-aware reward weight adjustment
         _bs = bsts_season.get_season() if hasattr(bsts_season, 'get_season') else {}
         _worst_segs = _bs.get('worst_segments', [])
@@ -1139,8 +1390,8 @@ def run(hparams):
             #   (4) clip to action_space.low/high
 
             # --- v213 FIX: use process_action for ALL action dispatch (discrete + continuous) ---
-            _raw_action = action.cpu().numpy()          # ← must be BEFORE process_action call
-            _step_action = process_action(_raw_action, env.action_space)
+            rawaction = action.cpu().numpy()          # ← must be BEFORE process_action call
+            _step_action = process_action(rawaction, env.action_space)
             # v40.2: removed duplicate env.step that used un-remapped action (caused 100% stuck episodes)
             # v40.3: comprehensive action dispatch telemetry for first 20 steps of each episode
             try:
@@ -1211,14 +1462,24 @@ def run(hparams):
             if ep_step_count == 1 and global_step < 600:
                 logger.info(f"[REWARD_DIAG] rp keys={list(rp.keys())}, rp={rp}")
             # v23: base progress reward
-            _prog = rp.get("progress", 0)
+            _prog_raw = float(rp.get("progress", 0.0) or 0.0)
+            _center_m, _total_m, _center_pct = centerline_progress_from_reward_params(rp, _track_progress_cache)
+            _prog = _center_pct
+            ep_centerline_progress_m = max(ep_centerline_progress_m, _center_m)
+            ep_track_length_m = max(ep_track_length_m, _total_m)
+            ep_track_progress_pct = max(ep_track_progress_pct, _center_pct)
             _offtrack = rp.get("is_offtrack", False)
             _is_stuck = rp.get("is_stuck", False) if "is_stuck" in rp else False
             _speed = rp.get("speed", 0.0)
             _steer = abs(rp.get("steering_angle", 0))
             _delta_prog = _prog - _prev_prog_tracker
+            _bootstrap_active = bootstrap_rewards.active(global_step, total_timesteps)
             if _delta_prog > 0:
-                reward += _delta_prog * 0.5
+                reward += _delta_prog * (3.0 if _bootstrap_active else 0.5)
+            elif _bootstrap_active and ep_step_count > 3:
+                reward -= 0.02
+            if _bootstrap_active and not _offtrack and not _is_stuck:
+                reward += 0.02
             _prev_prog_tracker = _prog
             # v23: alive bonus
             # if not _offtrack and not _is_stuck:  # MUTED v25
@@ -1227,6 +1488,8 @@ def run(hparams):
             # v39: Re-enabled speed reward (was MUTED v25), now v_perp-aware
             if _speed > 0.1: reward += min(_speed, 4.0) * 0.05  # v39: halved from 0.1
             ep_step_count += 1  # v28: FIX missing increment
+            
+            _brake_field = BrakeField()
             if rp:
                 _speed = rp.get("speed", 0)
                 # v4-bsts: barrier proximity from LIDAR and objects
@@ -1246,10 +1509,12 @@ def run(hparams):
                 _aot = rp.get("all_wheels_on_track", True)
                 _heading = rp.get("heading", 0)
                 _waypoints = rp.get("waypoints", [])
-                # v16: lazy-init race engine with track waypoints
+                # v16: Lazy-init BrakeField alongside race engine
                 if _waypoints and race_engine is None:
                     race_engine = MultiRaceLineEngine(_waypoints)
                     logger.info(f"[V16] MultiRaceLineEngine initialized with {len(_waypoints)} waypoints")
+                    _brake_field.set_waypoints(np.array(_waypoints)) # v222
+                    logger.info(f"[V41] BrakeField waypoints set: {len(_waypoints)} wps")
 
                 # === Build racing line map lazily on first step ===
                 # v39: Force track discovery before meaningful training
@@ -1259,7 +1524,6 @@ def run(hparams):
                     _race_map = build_racing_line_map(_waypoints, _tw, v_max=4.0)
                     logger.info(f'[RACE_MAP] Built racing line map: {len(_race_map)} waypoints')
                 _closest = rp.get("closest_waypoints", [0, 1])
-                _closest = [c % max(len(_waypoints), 1) for c in _closest]  # ← modulo wrap
 
                 # --- v5: Track geometry ---
                 _curvature, _safe_speed = compute_track_curvature(_waypoints, _closest)
@@ -1276,7 +1540,6 @@ def run(hparams):
                 _actual_lateral = _dist_from_center * (1 if rp.get("is_left_of_center", False) else -1)
                 _racing_line_err = abs(_actual_lateral - _optimal_dist) / max(_tw / 2.0, 0.1)
                 _decel = ep_prev_speed - _speed if ep_prev_speed > 0 else 0.0
-                _prev_speed_for_accel = ep_prev_speed  # capture before update
                 ep_prev_speed = _speed
                 # compute sub-rewards
                 _center_pct = _dist / (0.5 * _tw) if _tw > 0 else 0
@@ -1374,16 +1637,35 @@ def run(hparams):
                     # v221: brake-field aware speed gate
                     # Speed reward only fires at full strength when:
                     #   (a) not in brake field, OR (b) already braking correctly
+                    # v222: Coherent speed gate via actual BrakeField.step() API
+                    # So here we derive it from the same source directly:
+                    _is_braking_now = bool(
+                        (len(_af) > 1 and float(_af[1]) < -0.1)  # throttle < -0.1
+                        or (_speed < ep_prev_speed - 0.05)         # physical decel proxy (ep_prev_speed set L1241)
+                    )
+
+                    try:
+                        _bf_step         = _brake_field.step(
+                                            wp_idx=_closest[0] if _closest else 0,
+                                            speed=_speed,
+                                            is_braking=_is_braking_now
+                                        )
+                        _in_brake_field  = _bf_step['in_brake_field']   # True if BrakeField.potential > 0
+                        _brake_potential = _bf_step['brake_potential']   # Phi in [0, 1]
+                        _bf_ok           = (not _in_brake_field) or _is_braking_now
+                    except Exception:
+                        _in_brake_field  = False
+                        _brake_potential = 0.0
+                        _bf_ok           = True
 
                     _position_compliance = max(0.0, 1.0 - (_dist_from_center / max(_track_width * 0.5, 0.1)))
-                    _rl_compliance = max(0.0, 1.0 - _racing_line_err)  # racing_line_err already computed
+                    _rl_compliance       = max(0.0, 1.0 - _racing_line_err)
 
-                    # Speed gate: product of (speed > 0.3), position compliance, RL compliance, brake compliance
                     _speed_gate = (
-                        max(0.1, min(1.0, (_speed - 0.3) / 1.2))   # base speed gate
-                        * (0.4 + 0.6 * _position_compliance)         # position penalty: max 40% base if off-line
-                        * (0.5 + 0.5 * _rl_compliance)               # racing-line gate
-                        * (1.0 if _bf_ok else 0.3)                   # brake-field gate: 70% penalty if in field & not braking
+                        max(0.1, min(1.0, (_speed - 0.3) / 1.2))   # base: speed > 0.3 to get full gate
+                        * (0.4 + 0.6 * _position_compliance)         # off-centerline: floor at 40%
+                        * (0.5 + 0.5 * _rl_compliance)               # off-raceline: floor at 50%
+                        * (1.0 if _bf_ok else max(0.3, 1.0 - _brake_potential))  # brake-zone: scales with how deep in field
                     )
                     shaped_reward = shaped_reward * _speed_gate - 0.02
                 # Blend: mostly racing-line shaped, small env signal
@@ -1392,7 +1674,7 @@ def run(hparams):
                 # v18: wire stuck-antecedent bonus into reward
                 # v39: Un-muted _stuck_bonus (was MUTED v25)
                 if _approaching_stuck and _stuck_bonus > 0:
-                    reward += _stuck_bonus  # reward agent for navigating historically-stuck waypoints
+                    reward += (0.0 if _bootstrap_active else min(float(_stuck_bonus), 0.5))  # v1.0.13 cap stuck bonus; disabled during bootstrap
                     if _speed < 1.0 and _approaching_stuck:
                         reward += 0.5  # extra bonus for cautious approach near stuck zones
                 # v19: SAC exploration bonus
@@ -1531,7 +1813,8 @@ def run(hparams):
                 ep_lidar_mins.append(_lidar_min)
                 ep_barrier_proximities.append(_barrier_proximity)
                 # v29: crash-antecedent kinematics
-                _accel = (_speed - _prev_speed_for_accel) / 0.1  # m/s^2 (dt~0.1s)
+                _accel = (_speed - ep_prev_speed) / 0.1  # m/s^2 (dt~0.1s)
+                ep_prev_speed = _speed
                 _af = action.flatten() if hasattr(action, 'flatten') else (np.array(action).flatten() if hasattr(action, '__iter__') else [action])
                 _act_steer = float(_af[0].item() if hasattr(_af[0], 'item') else float(_af[0]))
                 _act_throttle = float(_af[1].item() if hasattr(_af[1], "item") else float(_af[1])) if len(_af) > 1 else 0.0  # v32: throttle/brake command, negative=brake
@@ -1640,12 +1923,18 @@ def run(hparams):
             if terminated or truncated:
                 ep_return = cumulative_ep_reward
                 ep_length = ep_step_count
-                ep_progress = info.get("reward_params", {}).get("progress", 0.0)
-                lap_completed = 1.0 if ep_progress >= 100.0 else 0.0
+                _final_rp = info.get("reward_params", {}) if isinstance(info, dict) else {}
+                _final_m, _final_total_m, _final_pct = centerline_progress_from_reward_params(_final_rp, _track_progress_cache)
+                ep_centerline_progress_m = max(ep_centerline_progress_m, _final_m)
+                ep_track_length_m = max(ep_track_length_m, _final_total_m)
+                ep_progress = max(ep_track_progress_pct, _final_pct)
+                _raw_final_progress = float(_final_rp.get("progress", 0.0) or 0.0)
+                lap_completed = 1.0 if (ep_progress >= 99.0 or _raw_final_progress >= 100.0) else 0.0
+                bootstrap_rewards.update_episode(ep_progress, lap_completed >= 1.0)
                 lap_time_sec = time.time() - ep_start_time  # v24: wall-clock episode time
                 episode_count += 1
                 # --- v6: episode stuck update ---
-                _escaped = ep_progress > 20.0
+                _escaped = ep_progress > 20.0  # centerline pct
                 if stuck_tracker._cur_stuck_cluster is not None:
                     _escaped = ep_progress > (stuck_tracker._cur_stuck_cluster / 120.0 * 100.0 + 15.0)
                 stuck_tracker.episode_update(
@@ -1732,6 +2021,8 @@ def run(hparams):
                 )
 
                 writer.add_scalar('charts/track_progress', ep_progress, global_step)
+                writer.add_scalar('charts/track_progress_m', ep_centerline_progress_m, global_step)
+                writer.add_scalar('charts/track_length_m', ep_track_length_m, global_step)
                 writer.add_scalar('charts/lap_completed', lap_completed, global_step)
                 writer.add_scalar('charts/episodic_return', ep_return, global_step)
                 writer.add_scalar('charts/episodic_length', ep_length, global_step)
@@ -1968,40 +2259,63 @@ def run(hparams):
                 except Exception as e:
                     pass  # BSTS update failure is non-fatal
 
+                                # TensorBoard context/crash/barrier scalars — only when we have context data
                 if ep_context_preds:
-                    writer.add_scalar('context/obstacle_ratio', bsts_metrics.get('ctx_obstacle_ratio', 0), global_step)
-                    writer.add_scalar('context/curb_ratio', bsts_metrics.get('ctx_curb_ratio', 0), global_step)
-                    writer.add_scalar('context/avg_corner_speed', bsts_metrics.get('avg_corner_speed', 0), global_step)
-                    writer.add_scalar('context/graze_count', bsts_metrics.get('graze_count', 0), global_step)
-                    writer.add_scalar('crash/ctx_at_crash', bsts_metrics.get('crash_ctx', -1), global_step)
-                    writer.add_scalar('crash/speed_at_crash', bsts_metrics.get('crash_speed', 0), global_step)
-                    writer.add_scalar('crash/lidar_min_at_crash', bsts_metrics.get('crash_lidar_min', 1), global_step)
-                    writer.add_scalar('barrier/avg_lidar_min', bsts_metrics.get('avg_lidar_min', 1), global_step)
-                    writer.add_scalar('barrier/avg_proximity', bsts_metrics.get('avg_barrier_proximity', 0), global_step)
-                    writer.add_scalar('barrier/avg_nearest_obj', bsts_metrics.get('avg_nearest_object', 999), global_step)
+                    writer.add_scalar('context/obstacle_ratio',  bsts_metrics.get('ctx_obstacle_ratio', 0),  global_step)
+                    writer.add_scalar('context/curb_ratio',      bsts_metrics.get('ctx_curb_ratio', 0),      global_step)
+                    writer.add_scalar('context/avg_corner_speed',bsts_metrics.get('avg_corner_speed', 0),    global_step)
+                    writer.add_scalar('context/graze_count',     bsts_metrics.get('graze_count', 0),         global_step)
+                    writer.add_scalar('crash/ctx_at_crash',      bsts_metrics.get('crash_ctx', -1),          global_step)
+                    writer.add_scalar('crash/speed_at_crash',    bsts_metrics.get('crash_speed', 0),         global_step)
+                    writer.add_scalar('crash/lidar_min_at_crash',bsts_metrics.get('crash_lidar_min', 1),     global_step)
+                    writer.add_scalar('barrier/avg_lidar_min',   bsts_metrics.get('avg_lidar_min', 1),       global_step)
+                    writer.add_scalar('barrier/avg_proximity',   bsts_metrics.get('avg_barrier_proximity', 0),global_step)
+                    writer.add_scalar('barrier/avg_nearest_obj', bsts_metrics.get('avg_nearest_object', 999),global_step)
 
-                    # Reset accumulators
-                    ep_rewards_components = {k: [] for k in ep_rewards_components}
-                    ep_speeds = []
-                    ep_headings = []  # v26
-                    ep_closest_wps = []  # v26
-                    ep_dist_from_center = []
-                    ep_offtrack_count = 0
-                    ep_offtrack_steps = 0
-                    ep_step_count = 0
-                    cumulative_ep_reward = 0.0
-                    _prev_prog_tracker = 0.0  # v23: reset
-                    ep_context_preds = []
-                    ep_lidar_mins = []
-                    ep_barrier_proximities = []
-                    ep_nearest_objects = []
-                    ep_crash_ctx = None
-                    ep_crash_speed = None
-                    ep_crash_heading = None  # v26
-                    ep_crash_closest_wp = None  # v26
-                    ep_crash_lidar_min = None
-                    ep_corner_speeds = []
-                    ep_graze_count = 0
+                # Reset accumulators — ALWAYS, not gated on ep_context_preds
+                _brake_field.reset()
+                ep_rewards_components  = {k: [] for k in ep_rewards_components}
+                ep_speeds              = []
+                ep_headings            = []
+                ep_closest_wps         = []
+                ep_dist_from_center    = []
+                ep_offtrack_count      = 0
+                ep_offtrack_steps      = 0
+                ep_step_count          = 0
+                cumulative_ep_reward   = 0.0
+                _prev_prog_tracker     = 0.0
+                ep_context_preds       = []
+                ep_lidar_mins          = []
+                ep_barrier_proximities = []
+                ep_nearest_objects     = []
+                ep_crash_ctx           = None
+                ep_crash_speed         = None
+                ep_crash_heading       = None
+                ep_crash_closest_wp    = None
+                ep_crash_lidar_min     = None
+                ep_corner_speeds       = []
+                ep_graze_count         = 0
+                ep_heading_diffs = []
+                ep_ang_vel_centerline = []  # v37
+                ep_speed_prev = None  # v37
+                ep_jerk_abs = []  # v37
+                ep_brake_before_barrier = []  # v37
+                ep_steerings_raw = []
+                ep_prev_speed = 0.0
+                ep_decel_penalties = []
+                ep_safe_speed_ratios = []
+                ep_racing_line_errors = []
+                _ep_step_log = []
+                ep_recovery_steps = 0
+                ep_in_recovery = False
+                ep_turn_entry_speeds = []
+                ep_positions = []
+                ep_first_offtrack_step = None
+                ep_progress_hist = []
+                ep_reversed_count = 0
+                ep_zero_speed_count = 0
+                ep_offtrack_steps = 0 
+                ep_start_time = time.time()  # v24: reset lap timer
                 # v17-bsts feedback: wire analysis -> annealing
                 if bsts_season is not None:
                     try:
@@ -2027,39 +2341,32 @@ def run(hparams):
                             logger.info(f"Live analysis ep{episode_count}: {_a}")
                     except Exception as _e:
                         logger.debug(f"Live analysis skip: {_e}")
-                _rl_phase = min(1.0, global_step / (scheduler.total_steps * 0.8))
-                ep_heading_diffs = []
-                ep_ang_vel_centerline = []  # v37
-                ep_steerings_raw = []
-                ep_prev_speed = 0.0
-                ep_decel_penalties = []
-                ep_safe_speed_ratios = []
-                ep_racing_line_errors = []
-                _ep_step_log = []
-                ep_recovery_steps = 0
-                ep_in_recovery = False
-                ep_turn_entry_speeds = []
-                ep_positions = []
-                ep_first_offtrack_step = None
-                ep_progress_hist = []
-                ep_reversed_count = 0
-                ep_zero_speed_count = 0
-                ep_offtrack_steps = 0 
-                ep_start_time = time.time()  # v24: reset lap timer
 
                 for _rtry in range(3):
                     try:
                         observation, info = env.reset()
                         break
-                    except Exception as _e:
-                        logger.warning(f"mid-training reset attempt {_rtry+1}/3 failed: {_e}; recreating env")
-                        try:
-                            env.close()
-                        except Exception:
-                            pass
-                        env = _apply_phase_env(args, _phase)  # v212 FIX: respects current phase track/variant
+                    except Exception as e:
+                        logger.warning(f"mid-training reset attempt {_rtry+1}/3 failed: {e}")
+                        if _rtry < 2:
+                            # Simple retry first — ZMQ may just need a moment
+                            time.sleep(5)
+                        else:
+                            # All 3 simple retries exhausted — full ZMQ rebuild
+                            logger.warning("mid-training: all retries failed, rebuilding env with ZMQ teardown")
+                            try:
+                                env.close()
+                            except Exception:
+                                pass
+                            time.sleep(10)  # let OS release the socket before rebind
+                            env = _apply_phase_env(args, _phase)
+                            # Brief preflight to confirm port 8888 is back up before handing off
+                            for _wait in range(6):
+                                if preflightgymbridge():
+                                    break
+                                time.sleep(5)
                 else:
-                    raise RuntimeError("mid-training env.reset() unrecoverable after 3 retries")
+                    raise RuntimeError("mid-training env.reset unrecoverable after 3 retries")
                 next_obs = tensor(obs_to_array(observation))
                 next_done = torch.zeros(1, device=DEVICE)
             if ep_progress > 10 and ep_return > best_return:  # v41: must have >10% progress to be best
@@ -2115,15 +2422,11 @@ def run(hparams):
                 _, newlogprob, entropy, newvalue, new_ctx_logits, _new_intermed = agent.get_action_and_value(
                     b_obs[mb_inds], b_actions[mb_inds]
                 )
-                # Clamp logratio BEFORE exp to prevent inf
-                logratio = (newlogprob - b_logprobs[mb_inds]).clamp(-10.0, 10.0)  # ← add clamp
+                logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
                 with torch.no_grad():
                     approx_kl = ((ratio - 1) - logratio).mean()
-                    if torch.isnan(approx_kl) or torch.isinf(approx_kl):
-                        logger.warning(f"[PPO] approx_kl is {approx_kl} — skipping minibatch")
-                        continue  # skip this minibatch, don't poison the optimizer
                     clipfracs.append(
                         ((ratio - 1.0).abs() > hp['clip_coef']).float().mean().item()
                     )
