@@ -1,9 +1,11 @@
-import sys, os; sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "packages")); import deepracer_gym
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "packages"))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import deepracer_gym
 # REF: Balaji, B. et al. (2020). DeepRacer: Autonomous Racing Platform for Sim2Real RL. IEEE ICRA.
 # REF: Salazar, J. et al. (2024). Deep RL for Autonomous Driving in AWS DeepRacer. Information, 15(2).
 # REF: Samant, N. & Deshpande, A. (2020). How we broke into the top 1% of AWS DeepRacer. Building Fynd.
 import math, socket, hashlib
-import sys; sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.dirname(__import__('os').path.abspath(__file__))))
 import yaml
 import time
 import signal
@@ -382,28 +384,6 @@ class AnnealingScheduler:
     def get_architecture_params(self, step):
         dropout = 0.15 + (0.02 - 0.15) * self._sigmoid_blend(step, 0.2, 0.6)
         return {"dropout": dropout}
-
-
-# v27: barrier-relative velocity helpers
-def _compute_crash_v_perp(speed, heading, closest_wp, waypoints):
-    if not waypoints or not closest_wp or len(closest_wp) < 2: return 0.0
-    try:
-        dx = waypoints[closest_wp[1]][0] - waypoints[closest_wp[0]][0]
-        dy = waypoints[closest_wp[1]][1] - waypoints[closest_wp[0]][1]
-        delta = math.radians(heading - math.degrees(math.atan2(dy, dx)))
-        return abs(speed * math.sin(delta))
-    except: return 0.0
-
-def _compute_crash_v_tang(speed, heading, closest_wp, waypoints):
-    if not waypoints or not closest_wp or len(closest_wp) < 2: return 0.0
-    try:
-        dx = waypoints[closest_wp[1]][0] - waypoints[closest_wp[0]][0]
-        dy = waypoints[closest_wp[1]][1] - waypoints[closest_wp[0]][1]
-        delta = math.radians(heading - math.degrees(math.atan2(dy, dx)))
-        return abs(speed * math.cos(delta))
-    except: return 0.0
-
-
 
 # --- v205 auto-bootstrap: start deepracer container if needed ---
 def _auto_bootstrap_deepracer(max_wait=60):
@@ -1394,11 +1374,6 @@ def run(hparams):
                     # v221: brake-field aware speed gate
                     # Speed reward only fires at full strength when:
                     #   (a) not in brake field, OR (b) already braking correctly
-                    try:
-                        from brake_field import BrakeFieldChecker
-                        _bf_ok = not _in_brake_field or _is_braking  # defined upstream in rp block
-                    except Exception:
-                        _bf_ok = True
 
                     _position_compliance = max(0.0, 1.0 - (_dist_from_center / max(_track_width * 0.5, 0.1)))
                     _rl_compliance = max(0.0, 1.0 - _racing_line_err)  # racing_line_err already computed
