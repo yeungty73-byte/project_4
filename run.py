@@ -699,10 +699,12 @@ def harvest_htm_pilots(env, htm_agent, td3sac, n_episodes=12, min_progress=2.0):
             nobs_t = torch.tensor(obs_to_array(next_obs), dtype=torch.float32)
             # v1.1.0: normalize pixel obs before replay storage to prevent critic NaN
             # Raw DeepRacer obs values are in [0,255]; must be [0,1] for stable critic training.
-            _obs_scale = obs_t.abs().max().item()
-            if _obs_scale > 2.0:
-                obs_t  = obs_t  / max(_obs_scale, 1.0)
-                nobs_t = nobs_t / max(nobs_t.abs().max().item(), 1.0)
+            # v1.1.1 FIX: use FIXED scale=255 (not per-batch adaptive) so ALL replay obs are [0,1].
+            # Adaptive scale caused mixed-scale replay (obs_t/255 vs obs_t/128), producing NaN Q-targets.
+            # REF: Fujimoto et al. (2018) — critic input scale instability causes Q-divergence.
+            _obs_scale_fixed = 255.0
+            obs_t  = obs_t  / _obs_scale_fixed
+            nobs_t = nobs_t / _obs_scale_fixed
             _bc_reward = float(max(-10.0, min(10.0, reward)))
             ep_buf.append((obs_t, act_t, _bc_reward, nobs_t, float(terminated or truncated)))
             obs, rp = next_obs, next_rp
@@ -781,7 +783,6 @@ class BCPilot:
 
     def _heading_to_track(self, rp):
         """Compute signed angle between car heading and track tangent (deg)."""
-        import math as _math
         waypoints = rp.get("waypoints", self.waypoints)
         closest = rp.get("closest_waypoints", [0, 1])
         heading = float(rp.get("heading", 0.0))
@@ -791,7 +792,7 @@ class BCPilot:
             n = len(waypoints)
             p0 = waypoints[closest[0] % n]
             p1 = waypoints[closest[1] % n]
-            track_angle = _math.degrees(_math.atan2(p1[1] - p0[1], p1[0] - p0[0]))
+            track_angle = math.degrees(math.atan2(p1[1] - p0[1], p1[0] - p0[0]))
             diff = heading - track_angle
             # Normalize to [-180, 180]
             while diff > 180:  diff -= 360
@@ -802,7 +803,7 @@ class BCPilot:
 
     def act(self, rp: dict):
         import numpy as _np
-        import math as _math
+        import math as math
         waypoints = rp.get("waypoints", self.waypoints)
         closest = rp.get("closest_waypoints", [0, 1])
         speed = float(rp.get("speed", 0.0))
@@ -885,7 +886,7 @@ def extract_compact_obs(obs_raw, rp: dict, waypoints, closest) -> np.ndarray:
     Falls back to zeros for missing fields. Always returns shape (12,).
     Use this alongside or instead of raw obs for RL state.
     """
-    import math as _math
+    import math as math
     try:
         speed = float(rp.get("speed", 0.0))
         dist_ctr = float(rp.get("distance_from_center", 0.0))
@@ -901,7 +902,7 @@ def extract_compact_obs(obs_raw, rp: dict, waypoints, closest) -> np.ndarray:
             n = len(waypoints)
             p0 = waypoints[closest[0] % n]
             p1 = waypoints[closest[1] % n]
-            track_angle = _math.degrees(_math.atan2(p1[1]-p0[1], p1[0]-p0[0]))
+            track_angle = math.degrees(math.atan2(p1[1]-p0[1], p1[0]-p0[0]))
             hdiff = heading - track_angle
             while hdiff > 180: hdiff -= 360
             while hdiff < -180: hdiff += 360
@@ -1086,6 +1087,121 @@ class BootstrapRewardController:
         s = sum(w.values()) or 1.0
         return {k: v / s for k, v in w.items()}
 
+
+# ─────────────────────────────────────────────────────────────────
+# v1.1.1: DIAGNOSTIC PROBE — stochastic spatial awareness reporter
+# Fires for ~5% of episodes (every ~20 eps). Zero training impact.
+# Reports what the agent "sees" w/r barriers, center, trajectory.
+# ─────────────────────────────────────────────────────────────────
+import math as _probemath
+
+def _probe_spatial_awareness(rp: dict, v_perp: float, v_tang: float,
+                              episode_count: int, ep_step: int,
+                              objects_dist: list = None,
+                              sample_rate: int = 20) -> None:
+    """Stochastic per-episode spatial awareness diagnostic.
+
+    Args:
+        rp: reward_params dict from env
+        v_perp: velocity perpendicular to track tangent (m/s)
+        v_tang: velocity tangential to track (m/s)
+        episode_count: current episode number
+        ep_step: current step within episode
+        objects_dist: list of object distances (optional)
+        sample_rate: log every N episodes (default 20 = ~5%)
+    """
+    if episode_count % sample_rate != 0 or ep_step > 3:
+        return
+    if not rp:
+        return
+
+    # ── 1. Barrier proximity ────────────────────────────────────────
+    dist_ctr = float(rp.get("distance_from_center", 0.0))
+    tw = float(rp.get("track_width", 1.0))
+    barrier_prox_pct = 100.0 * (dist_ctr / max(tw * 0.5, 0.01))
+    on_track = bool(rp.get("all_wheels_on_track", True))
+    is_offtrack = bool(rp.get("is_offtrack", False))
+    is_crashed = bool(rp.get("is_crashed", False))
+    is_reversed = bool(rp.get("is_reversed", False))
+
+    # ── 2. Heading alignment ────────────────────────────────────────
+    waypoints = rp.get("waypoints", [])
+    closest = rp.get("closest_waypoints", [0, 1])
+    heading = float(rp.get("heading", 0.0))
+    heading_err_deg = 0.0
+    track_tangent_deg = 0.0
+    if waypoints and len(waypoints) >= 2 and len(closest) >= 2:
+        try:
+            n = len(waypoints)
+            p0 = waypoints[closest[0] % n]
+            p1 = waypoints[closest[1] % n]
+            track_tangent_deg = _probemath.degrees(
+                _probemath.atan2(p1[1] - p0[1], p1[0] - p0[0]))
+            heading_err_deg = heading - track_tangent_deg
+            while heading_err_deg > 180:  heading_err_deg -= 360
+            while heading_err_deg < -180: heading_err_deg += 360
+        except Exception:
+            pass
+
+    # ── 3. Object permanence (angle of objects relative to chassis) ──
+    obj_locs = rp.get("objects_location", [])
+    x = float(rp.get("x", 0.0))
+    y = float(rp.get("y", 0.0))
+    obj_angles = []
+    if obj_locs and isinstance(obj_locs, (list, tuple)):
+        for ol in obj_locs:
+            try:
+                ox, oy = float(ol[0]), float(ol[1])
+                abs_angle = _probemath.degrees(_probemath.atan2(oy - y, ox - x))
+                rel_angle = abs_angle - heading
+                while rel_angle > 180:  rel_angle -= 360
+                while rel_angle < -180: rel_angle += 360
+                dist = _probemath.hypot(ox - x, oy - y)
+                obj_angles.append(f"d={dist:.2f}m @{rel_angle:.1f}°")
+            except Exception:
+                pass
+
+    # ── 4. Trajectory vs barriers ───────────────────────────────────
+    speed = float(rp.get("speed", 0.0))
+    A_MAX = 3.0
+    stop_dist_perp = v_perp**2 / (2 * A_MAX + 1e-8)
+
+    # ── 5. Next corner distance ─────────────────────────────────────
+    dist_to_corner = "N/A"
+    safe_spd = "N/A"
+    if waypoints and len(waypoints) >= 3:
+        try:
+            from corner_analysis import lookahead_curvature_scan
+            _, _, _ss, _dc = lookahead_curvature_scan(
+                waypoints, closest, max_lookahead=12)
+            dist_to_corner = f"{_dc:.2f}m"
+            safe_spd = f"{_ss:.2f}m/s"
+        except Exception:
+            pass
+
+    # ── 6. Nearest obstacle ─────────────────────────────────────────
+    near_obs = "none"
+    if objects_dist:
+        near_obs = f"{min(objects_dist):.2f}m"
+
+    # ── 7. Print report ─────────────────────────────────────────────
+    _prob_lines = [
+        f"[PROBE ep={episode_count} step={ep_step}] ── Spatial Awareness ──",
+        f"  POSITION : dist_from_center={dist_ctr:.3f}m / half_tw={tw/2:.3f}m  "
+            f"→ {barrier_prox_pct:.1f}% to curb | on_track={on_track}",
+        f"  STATUS   : offtrack={is_offtrack} crashed={is_crashed} reversed={is_reversed}",
+        f"  HEADING  : car={heading:.1f}° track_tangent={track_tangent_deg:.1f}° "
+            f"→ error={heading_err_deg:+.1f}° (|err|<15° = aligned)",
+        f"  TRAJECTORY: speed={speed:.2f}m/s  v_tang={v_tang:.2f}m/s  v_perp={v_perp:.2f}m/s",
+        f"             stop_dist(perp)={stop_dist_perp:.3f}m  "
+            f"→ {'⚠ WILL HIT BARRIER' if stop_dist_perp > tw*0.4 else 'OK'}",
+        f"  WP       : closest={list(closest)}  total_wps={len(waypoints)}",
+        f"  CORNER   : dist_to_next={dist_to_corner}  safe_speed={safe_spd}",
+        f"  OBJECTS  : nearest={near_obs}  " +
+            (f"angles=[{', '.join(obj_angles)}]" if obj_angles else "none visible"),
+    ]
+    for _line in _prob_lines:
+        logger.info(_line)
 
 def run(hparams):
     # v203: allow bypass when GYM_BRIDGE_OPTIONAL=1 (Ed #586 local-loop mode)
@@ -1958,10 +2074,22 @@ def run(hparams):
                     _is_braking_now = bool(_speed < _step_speed_snap - 0.05)
 
                     try:
+                        # v1.1.0: compute SwinUNet++ clearance once per step
+                        _swin_clear = None
+                        try:
+                            from utransformer import SwinUNetObsWrapper
+                            if not hasattr(_brake_field, '_swin_wrapper'):
+                                _brake_field._swin_wrapper = SwinUNetObsWrapper()
+                            _obs_flat = obs_step.cpu().numpy() if hasattr(obs_step, 'cpu') else np.array(obs_step, dtype=np.float32)
+                            _swin_clear = _brake_field._swin_wrapper.get_clearance(_obs_flat.flatten())
+                        except Exception:
+                            _swin_clear = None
+
                         _bf_step         = _brake_field.step(
                                             wp_idx=_closest[0] if _closest else 0,
                                             speed=_speed,
-                                            is_braking=_is_braking_now
+                                            is_braking=_is_braking_now,
+                                            swin_clearance=_swin_clear  # v1.1.0
                                         )
                         _in_brake_field  = _bf_step['in_brake_field']   # True if BrakeField.potential > 0
                         _brake_potential = _bf_step['brake_potential']   # Phi in [0, 1]
@@ -1970,6 +2098,32 @@ def run(hparams):
                         _in_brake_field  = False
                         _brake_potential = 0.0
                         _bf_ok           = True
+
+                    # v1.1.0: Race engine combined reward (obstacle-aware, Swin-gated)
+                    _rle_reward = 0.0
+                    _rle_info   = {}
+                    if race_engine is not None and _waypoints:
+                        try:
+                            _rle_reward, _rle_info = race_engine.get_combined_reward(
+                                wp_idx       = _closest[0] if _closest else 0,
+                                car_lat_pos  = _dist_from_center * (1.0 if rp.get('is_left_of_center', False) else -1.0),
+                                car_speed    = _speed,
+                                car_heading  = _heading,
+                                track_width  = _track_width,
+                                context      = int(context_labels[step]) if step < len(context_labels) else 0,
+                                lidar_min    = _lidar_min,
+                                nearest_obj  = _nearest_obj,
+                                bot_progress = rp.get('progress', 0.0),
+                                own_progress = _prog,
+                                car_x        = rp.get('x', 0.0),
+                                car_y        = rp.get('y', 0.0),
+                                swin_clearance = _swin_clear,   # v1.1.0
+                            )
+                            # Weight: 0.08 during bootstrap, 0.18 in phase 1+
+                            _rle_w = 0.08 if bootstrap_active else rw.get('racing_line', 0.14)
+                            reward += float(_rle_reward) * _rle_w
+                        except Exception:
+                            pass
 
                     _position_compliance = max(0.0, 1.0 - (_dist_from_center / max(_track_width * 0.5, 0.1)))
                     _rl_compliance       = max(0.0, 1.0 - _racing_line_err)
@@ -2214,6 +2368,16 @@ def run(hparams):
                 'dist_barrier': round(_dist_barrier,3), 'stop_dist': round(_stop_dist,3),
                 'braking': _braking_intent, 'heading': round(_heading,1)}
             ep_ante_buf.append(_ante_rec)
+            # v1.1.1: stochastic spatial awareness probe (5% episode sample rate, first 3 steps only)
+            _probe_spatial_awareness(
+                rp=rp,
+                v_perp=float(_v_perp_barrier) if '_v_perp_barrier' in dir() else 0.0,
+                v_tang=float(_v_tang_barrier) if '_v_tang_barrier' in dir() else 0.0,
+                episode_count=episode_count,
+                ep_step=ep_step_count,
+                objects_dist=list(_objects_dist) if '_objects_dist' in dir() else [],
+                sample_rate=20,  # log every 20 episodes (~5% sampling rate)
+            )
             if len(ep_ante_buf) > _ANTE_WIN:
                 ep_ante_buf.pop(0)
             if _objects_dist:
@@ -2273,9 +2437,12 @@ def run(hparams):
             # v19: off-policy replay store
             try:
                 _nobs_t = next_obs.cpu() if isinstance(next_obs, torch.Tensor) else torch.tensor(obs_to_array(observation), dtype=torch.float32)
-                # Store the continuous action tensor (what the critic sees), not the discretized env action
+                # v1.1.1: normalize BOTH obs to [0,1] with fixed scale before replay storage
+                # Matches harvest_htm_pilots normalization — consistent replay scale prevents NaN critic.
+                _obs_replay  = (obs[step].cpu()  / 255.0).clamp(0.0, 1.0)
+                _nobs_replay = (_nobs_t          / 255.0).clamp(0.0, 1.0)
                 _td3_action = action.squeeze(0).detach().cpu()
-                td3sac.store_transition(obs[step], _td3_action, reward, next_obs, terminated or truncated)
+                td3sac.store_transition(_obs_replay, _td3_action, reward, _nobs_replay, terminated or truncated)
             except Exception:
                 pass
             # context label: 0=straight, 1=left_curve, 2=right_curve
@@ -2326,6 +2493,9 @@ def run(hparams):
                 
                             # v4: End episode for failure analysis
                 term_reason = "crashed" if info.get("reward_params",{}).get("is_crashed",False) else ("offtrack" if info.get("reward_params",{}).get("is_offtrack",False) else ("completed" if ep_progress>=95 else "stuck")); sampler.end_episode(ep_progress, ep_return, ep_length, terminated_reason=term_reason)
+                # v1.1.0: telemetry fix — if episode ended as offtrack, ensure count ≥ 1
+                if term_reason == "offtrack" and ep_offtrack_count == 0:
+                    ep_offtrack_count = 1
 
                 # === BSTS AWS (2020)TheRayG (2020) ===
                 if _bsts is not None:
