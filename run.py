@@ -646,11 +646,14 @@ MIN_PILOT_PROGRESS = 80.0  # only keep episodes that hit 80%+
 
 def harvest_htm_pilots(env, htm_agent, td3sac, n_episodes=12, min_progress=5.0):
     """
-    Run deterministic pilot and seed replay for BC/TD3. Critical fixes:
-      - call pilot.act(reward_params), not pilot.act(obs)
-      - process/clip expert actions through the real env action_space
-      - keep low-progress but non-empty pilot rollouts during bootstrap
+    Run deterministic pilot and seed replay for BC/TD3.
+    v1.1.1 fixes:
+      - BCPilot now outputs env-space [steer, throttle∈[0,1]] directly.
+        Do NOT call process_action() on BCPilot outputs — it would re-remap throttle.
+        For HTMPilotDriver (if available), keep process_action for safety.
+      - _bc_is_bc_pilot flag: skip process_action remap for BCPilot instances.
     """
+    _is_bc_pilot = isinstance(htm_agent, BCPilot)  # v1.1.1: detect BCPilot
     pilot_count, stored = 0, 0
     for ep in range(max(n_episodes * 3, n_episodes)):
         obs, info = env.reset()
@@ -661,16 +664,20 @@ def harvest_htm_pilots(env, htm_agent, td3sac, n_episodes=12, min_progress=5.0):
         terminated, truncated = False, False
         while not (terminated or truncated):
             raw_action = htm_agent.act(rp)
-            action = process_action(raw_action, env.action_space)
+            # v1.1.1: BCPilot outputs env-space actions — skip process_action remap
+            if _is_bc_pilot:
+                action = np.clip(np.asarray(raw_action, dtype=np.float32),
+                                 env.action_space.low, env.action_space.high)
+            else:
+                action = process_action(raw_action, env.action_space)
             next_obs, reward, terminated, truncated, info = env.step(action)
             next_rp = info.get('reward_params', {}) if isinstance(info, dict) else {}
-            _, _, prog_pct, _, _bc_progress_state = update_episode_centerline_progress(next_rp, _bc_progress_cache, _bc_progress_state)
+            _, _, prog_pct, _, _bc_progress_state = update_episode_centerline_progress(
+                next_rp, _bc_progress_cache, _bc_progress_state)
             ep_prog = max(ep_prog, float(prog_pct))
             act_t = torch.tensor(np.asarray(action), dtype=torch.float32)
             obs_t = torch.tensor(obs_to_array(obs), dtype=torch.float32)
             nobs_t = torch.tensor(obs_to_array(next_obs), dtype=torch.float32)
-            # v1.1.0: clip reward for BC buffer — raw shaped rewards can be 500+
-            # and overflow uninitialized critics → NaN in Bellman targets
             _bc_reward = float(max(-10.0, min(10.0, reward)))
             ep_buf.append((obs_t, act_t, _bc_reward, nobs_t, float(terminated or truncated)))
             obs, rp = next_obs, next_rp
@@ -715,31 +722,110 @@ def preflightgymbridge():
         return False
 # --- v213: BCPilot — internal deterministic expert for BC seeding ---
 # Replaces htm_reference.HTMPilotDriver when unavailable. No external deps.
+# Bugs fixed:
+#   1. Throttle was in tanh [-1,1] space but process_action() re-maps (t+1)/2, so
+#      braking command -0.5 became 0.25 env throttle — car never braked.
+#      Fix: output throttle directly in env space [0,1]; skip process_action remapping.
+#   2. No heading alignment recovery — car spawns perpendicular to track (~-77deg),
+#      BCPilot tried racing-line steering immediately → immediate offtrack.
+#      Fix: if |heading_to_track| > 45deg, apply recovery steering override first.
+#   3. Waypoint reversal not handled — if car spawns reversed (heading~180deg from
+#      track tangent), pilot was steering toward BEHIND waypoints.
+#      Fix: detect reversal from is_reversed flag; apply countersteering.
+
 class BCPilot:
-    """Deterministic BC pilot. No htmreference dependency, no OOB possible."""
+    """Deterministic BC pilot. No htm_reference dependency, no OOB possible.
+    v1.1.1: Fixed throttle space bug + heading recovery + reversal handling.
+    """
     def __init__(self, waypoints, track_width=0.6, track_variant="timetrial"):
-        self.waypoints=list(waypoints); self.track_width=float(track_width)
-        self.track_variant=track_variant
+        self.waypoints = list(waypoints)
+        self.track_width = float(track_width)
+        self.track_variant = track_variant
+
+    def _heading_to_track(self, rp):
+        """Compute signed angle between car heading and track tangent (deg)."""
+        import math as _math
+        waypoints = rp.get("waypoints", self.waypoints)
+        closest = rp.get("closest_waypoints", [0, 1])
+        heading = float(rp.get("heading", 0.0))
+        if len(waypoints) < 2:
+            return 0.0
+        try:
+            n = len(waypoints)
+            p0 = waypoints[closest[0] % n]
+            p1 = waypoints[closest[1] % n]
+            track_angle = _math.degrees(_math.atan2(p1[1] - p0[1], p1[0] - p0[0]))
+            diff = heading - track_angle
+            # Normalize to [-180, 180]
+            while diff > 180:  diff -= 360
+            while diff < -180: diff += 360
+            return diff
+        except Exception:
+            return 0.0
+
     def act(self, rp: dict):
         import numpy as _np
-        waypoints=rp.get("waypoints",self.waypoints)
-        closest=rp.get("closest_waypoints",[0,1])
-        speed=float(rp.get("speed",0.0))
-        dist_ctr=float(rp.get("distance_from_center",0.0))
-        is_left=bool(rp.get("is_left_of_center",False))
-        tw=float(rp.get("track_width",self.track_width))
-        if len(waypoints)<3: return _np.array([0.0,0.5],dtype=_np.float32)
-        try: _,_,safe_speed,dist_to_corner=lookahead_curvature_scan(waypoints,closest,max_lookahead=15)
-        except: safe_speed,dist_to_corner=2.5,5.0
-        try: rl_offset=compute_racing_line_offset(waypoints,closest,tw)
-        except: rl_offset=0.0
-        lat_err=(rl_offset*tw/2.0) - dist_ctr*(1 if is_left else -1)
-        steering=float(_np.clip(lat_err/max(tw*0.5,0.01)*1.5,-1.0,1.0))
-        try: braker=compute_braking_reward(speed,safe_speed,dist_to_corner)
-        except: braker=1.0 if speed<safe_speed*0.95 else 0.5
-        throttle=-0.5 if braker<0.4 else (0.8 if speed<safe_speed*0.85 else 0.4)
-        return _np.array([steering,throttle],dtype=_np.float32)
+        import math as _math
+        waypoints = rp.get("waypoints", self.waypoints)
+        closest = rp.get("closest_waypoints", [0, 1])
+        speed = float(rp.get("speed", 0.0))
+        dist_ctr = float(rp.get("distance_from_center", 0.0))
+        is_left = bool(rp.get("is_left_of_center", False))
+        tw = float(rp.get("track_width", self.track_width))
+        is_reversed = bool(rp.get("is_reversed", False))
 
+        if len(waypoints) < 3:
+            # v1.1.1: output in env space [steer in [-1,1], throttle in [0,1]]
+            return _np.array([0.0, 0.3], dtype=_np.float32)
+
+        # --- Heading recovery: if >45deg off track tangent, align first ---
+        hdiff = self._heading_to_track(rp)
+        if abs(hdiff) > 45.0:
+            # Hard steer toward track direction; moderate throttle to keep moving
+            steer_sign = -1.0 if hdiff > 0 else 1.0
+            steer_strength = min(1.0, abs(hdiff) / 90.0)
+            # v1.1.1: env space throttle [0,1]
+            return _np.array([steer_sign * steer_strength, 0.35], dtype=_np.float32)
+
+        # --- Reversal recovery ---
+        if is_reversed:
+            # Countersteer and brake gently to kill reverse momentum
+            return _np.array([0.0, 0.05], dtype=_np.float32)  # near-zero throttle, no steer
+
+        # --- Normal racing line control ---
+        try:
+            _, _, safe_speed, dist_to_corner = lookahead_curvature_scan(
+                waypoints, closest, max_lookahead=15
+            )
+        except Exception:
+            safe_speed, dist_to_corner = 2.5, 5.0
+
+        try:
+            rl_offset = compute_racing_line_offset(waypoints, closest, tw)
+        except Exception:
+            rl_offset = 0.0
+
+        lat_err = (rl_offset * tw / 2.0) - dist_ctr * (1 if is_left else -1)
+        steering = float(_np.clip(lat_err / max(tw * 0.5, 0.01) * 1.5, -1.0, 1.0))
+
+        # v1.1.1: throttle directly in env space [0,1] — NO process_action remapping
+        # braker<0.4 → needs to brake → throttle=0.05 (near zero)
+        # braker>=0.4 and speed < safe_speed*0.85 → accelerate → throttle=0.8
+        # otherwise → maintain → throttle=0.45
+        try:
+            braker = compute_braking_reward(speed, safe_speed, dist_to_corner)
+        except Exception:
+            braker = 1.0 if speed < safe_speed * 0.95 else 0.5
+
+        if braker < 0.4:
+            throttle = 0.05   # v1.1.1: was -0.5 (tanh space) → became 0.25 env (still throttling!)
+        elif speed < safe_speed * 0.85:
+            throttle = 0.80   # v1.1.1: was 0.8 tanh → (0.8+1)/2=0.9 env. Now direct 0.8.
+        else:
+            throttle = 0.45   # v1.1.1: was 0.4 tanh → (0.4+1)/2=0.7 env. Now direct 0.45.
+
+        return _np.array([steering, throttle], dtype=_np.float32)
+    
 # --- v1.0.13: centerline arc-length progress + bootstrap reward controller ---
 def _arc_track_length(waypoints) -> float:
     if not waypoints or len(waypoints)<2: return 100.0
@@ -1341,7 +1427,6 @@ def run(hparams):
     _curvature = 0.0  # default for context label
     _reset_rp = info.get("reward_params", {}) if isinstance(info, dict) else {}
     ep_prev_speed = float(_reset_rp.get("speed", 0.0))
-    _step_speed_snap = ep_prev_speed
     _decel = 0.0; _speed_ratio = 0.0; _racing_line_err = 0.0
     ep_return = float('-inf')
 
@@ -2066,6 +2151,7 @@ def run(hparams):
             )
 
             _rl_blend = min(1.0, _rl_blend + _rl_blend_rate)
+            _step_speed_snap = _speed  # v1.1.1: update AFTER reward, ensures next step sees correct prev speed
             rewards[step] = tensor(np.array(reward))
             # v19: off-policy replay store
             try:

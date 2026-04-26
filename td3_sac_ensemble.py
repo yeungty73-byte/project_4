@@ -143,7 +143,7 @@ class TD3SACEnsemble(nn.Module):
                     policy_noise=0.2, noise_clip=0.5):
         if len(self.replay) < batch_size:
             return {'critic_loss': 0.0, 'alpha': self.alpha,
-                    'q1_mean': 0.0, 'q2_mean': 0.0}
+                    'q1_mean': 0.0, 'q2_mean': 0.0, 'replay_size': len(self.replay)}
 
         obs, act, rew, nobs, done = self.replay.sample(batch_size)
         obs  = torch.as_tensor(obs,  dtype=torch.float32).to(self.device)
@@ -151,11 +151,11 @@ class TD3SACEnsemble(nn.Module):
         rew  = torch.as_tensor(rew,  dtype=torch.float32).to(self.device)
         done = torch.as_tensor(done, dtype=torch.float32).to(self.device)
 
-        # act from replay: shape (batch, ?) — normalize to (batch, 2)
+        # act from replay: shape (batch, ?) — normalize to (batch, act_dim)
         act = torch.as_tensor(act, dtype=torch.float32).to(self.device)
         act = act.view(act.shape[0], -1)          # (batch, act_dim_stored)
         if act.shape[-1] != self.q1.net[0].in_features - obs.shape[-1]:
-            # stored action dim mismatch: take first 2 or pad
+            # stored action dim mismatch: take first N or pad
             target_adim = self.q1.net[0].in_features - obs.shape[-1]
             if act.shape[-1] >= target_adim:
                 act = act[:, :target_adim]
@@ -163,28 +163,46 @@ class TD3SACEnsemble(nn.Module):
                 act = torch.cat([act, torch.zeros(act.shape[0], target_adim - act.shape[-1], device=self.device)], dim=-1)
 
         with torch.no_grad():
-            # ppo_agent.forward returns (mean, std, value, ctx_logits, intermed_pred)
-            # mean shape is (batch, agent_act_dim) — may be 26 for discrete heads
-            # We need (batch, critic_act_dim=2): take only first 2 dims
-            _mean = ppo_agent.forward(nobs)[0].float()   # (batch, agent_act_dim)
+            # v1.1.0: ppo_agent.forward returns (mean, std, value, ctx_logits, intermed_pred)
+            # mean shape can be (1, agent_act_dim) or (batch, agent_act_dim).
+            # We need (batch, critic_act_dim=2): squeeze extra batch dims then slice.
+            _fwd = ppo_agent.forward(nobs)
+            _mean = _fwd[0].float()
+            # Squeeze spurious leading dim if agent returned (1, batch, act_dim)
+            if _mean.ndim == 3 and _mean.shape[0] == 1:
+                _mean = _mean.squeeze(0)
             critic_act_dim = self.q1.net[0].in_features - nobs.shape[-1]
             if _mean.shape[-1] >= critic_act_dim:
-                next_action = _mean[:, :critic_act_dim]  # slice to (batch, 2)
+                next_action = _mean[:, :critic_act_dim]
             else:
-                next_action = torch.cat([_mean, torch.zeros(_mean.shape[0], critic_act_dim - _mean.shape[-1], device=self.device)], dim=-1)
+                next_action = torch.cat([
+                    _mean,
+                    torch.zeros(_mean.shape[0], critic_act_dim - _mean.shape[-1], device=self.device)
+                ], dim=-1)
 
             # TD3: target policy smoothing noise
-            noise = (torch.randn_like(next_action) * policy_noise).clamp(-noise_clip, noise_clip)
+            # v1.1.0: always apply at least small noise — policy_noise=0.0 causes Q collapse
+            _eff_noise = max(float(policy_noise), 0.05)
+            noise = (torch.randn_like(next_action) * _eff_noise).clamp(-noise_clip, noise_clip)
             next_action = (next_action + noise).clamp(-1.0, 1.0)
 
             q1_targ = self.q1_target(nobs, next_action)
             q2_targ = self.q2_target(nobs, next_action)
             min_q_targ = torch.min(q1_targ, q2_targ)
             target_q = rew + (1.0 - done) * self.gamma * min_q_targ
+            # v1.1.0: clamp Bellman target — BC rewards can be 500+; overflow → NaN
+            # REF: Fujimoto et al. (2018) §4 — bounded Q-targets improve stability
+            target_q = target_q.clamp(-50.0, 50.0)
 
         q1_pred = self.q1(obs, act)
         q2_pred = self.q2(obs, act)
         critic_loss = F.mse_loss(q1_pred, target_q) + F.mse_loss(q2_pred, target_q)
+
+        # v1.1.0: NaN guard — skip this batch if loss is non-finite
+        # This prevents a single corrupted batch from poisoning the critic weights.
+        if not torch.isfinite(critic_loss):
+            return {'critic_loss': float('nan'), 'alpha': self.alpha,
+                    'q1_mean': 0.0, 'q2_mean': 0.0, 'replay_size': len(self.replay)}
 
         self.critic_optim.zero_grad()
         critic_loss.backward()
