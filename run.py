@@ -1164,8 +1164,8 @@ def run(hparams):
     ep_heading_diffs = []
     _ep_step_log = []  # collect per-step dicts for extract_intermediary_metrics
     ep_steerings_raw = []
-    _init_rp = _init_info.get("reward_params", {}) if isinstance(_init_info, dict) else {}
-    ep_prev_speed   = float(_init_rp.get("speed", 0.0))  # seed from actual first obs speed
+    _init_rp = {}
+    ep_prev_speed   = 0.0  # seed from actual first obs speed
     _step_speed_snap = 0.0   # v1.0.14: single snapshot, updated ONCE at bottom of step
     ep_prev_accel   = None   # v1.0.14: for jerk computation
     ep_decel_penalties = []
@@ -1236,7 +1236,7 @@ def run(hparams):
                 _init_obs, _init_info = _reset_result
             logger.info(f"env.reset() succeeded on attempt {_retry+1}")
             break
-        except (Exception, TimeoutError) as e:
+        except Exception as e:
             logger.warning(f"env.reset() attempt {_retry+1}/10 failed: {e}")
             try:
                 env.close()
