@@ -825,7 +825,74 @@ class BCPilot:
             throttle = 0.45   # v1.1.1: was 0.4 tanh → (0.4+1)/2=0.7 env. Now direct 0.45.
 
         return _np.array([steering, throttle], dtype=_np.float32)
-    
+
+# v1.1.1: Lightweight observation preprocessor
+# obs_dim=38464 is a flattened LIDAR/camera image — too large for BC bootstrap.
+# Extract 12 scalar features from reward_params for a compact RL state.
+
+def extract_compact_obs(obs_raw, rp: dict, waypoints, closest) -> np.ndarray:
+    """
+    v1.1.1: Extract 12 interpretable scalar features from reward_params.
+    Falls back to zeros for missing fields. Always returns shape (12,).
+    Use this alongside or instead of raw obs for RL state.
+    """
+    import math as _math
+    try:
+        speed = float(rp.get("speed", 0.0))
+        dist_ctr = float(rp.get("distance_from_center", 0.0))
+        tw = float(rp.get("track_width", 1.0))
+        heading = float(rp.get("heading", 0.0))
+        is_left = 1.0 if rp.get("is_left_of_center", False) else -1.0
+        progress = float(rp.get("progress", 0.0)) / 100.0
+        is_reversed = 1.0 if rp.get("is_reversed", False) else 0.0
+        is_offtrack = 1.0 if rp.get("is_offtrack", False) else 0.0
+
+        # Heading error to track tangent
+        if waypoints and len(waypoints) >= 2 and len(closest) >= 2:
+            n = len(waypoints)
+            p0 = waypoints[closest[0] % n]
+            p1 = waypoints[closest[1] % n]
+            track_angle = _math.degrees(_math.atan2(p1[1]-p0[1], p1[0]-p0[0]))
+            hdiff = heading - track_angle
+            while hdiff > 180: hdiff -= 360
+            while hdiff < -180: hdiff += 360
+            heading_err = hdiff / 180.0  # normalized [-1,1]
+            # Lateral position normalized
+            lat_pos = dist_ctr / max(tw * 0.5, 0.01) * is_left  # [-1,1]
+        else:
+            heading_err = 0.0
+            lat_pos = 0.0
+
+        # Curvature ahead
+        try:
+            from corner_analysis import lookahead_curvature_scan
+            _, _, safe_speed, dist_to_corner = lookahead_curvature_scan(
+                waypoints, closest, max_lookahead=10)
+            curv_signal = (speed - safe_speed) / max(safe_speed, 0.1)  # >0 means too fast
+            dist_corner_norm = min(dist_to_corner / 5.0, 1.0)
+        except Exception:
+            curv_signal = 0.0
+            dist_corner_norm = 1.0
+
+        speed_norm = speed / 4.0  # normalize to [0,1]
+
+        return np.array([
+            speed_norm,         # 0: speed
+            lat_pos,            # 1: lateral position [-1,1]
+            heading_err,        # 2: heading error to track [-1,1]
+            curv_signal,        # 3: overspeed vs safe_speed
+            dist_corner_norm,   # 4: distance to next corner
+            progress,           # 5: lap progress [0,1]
+            is_reversed,        # 6: reversed flag
+            is_offtrack,        # 7: offtrack flag
+            is_left,            # 8: left/right of center
+            float(closest[0] % len(waypoints)) / max(len(waypoints),1),  # 9: wp position
+            tw / 2.0,           # 10: half track width (scale)
+            0.0,                # 11: reserved
+        ], dtype=np.float32)
+    except Exception:
+        return np.zeros(12, dtype=np.float32)
+
 # --- v1.0.13: centerline arc-length progress + bootstrap reward controller ---
 def _arc_track_length(waypoints) -> float:
     if not waypoints or len(waypoints)<2: return 100.0
