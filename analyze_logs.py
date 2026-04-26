@@ -262,13 +262,6 @@ class BSTSKalmanFilter:
             # Smooth update: don't jump sigma_obs abruptly
             self.R = 0.8 * self.R + 0.2 * rolling_var
 
-    # CALL THESE inside update_online() after computing residual:
-    # self._residuals = getattr(self, '_residuals', [])
-    # self._residuals.append(residual)
-    # if self._t % 10 == 0:
-    #     self._adapt_sigma_obs()
-    #     self._apply_spike_slab()
-
     def _obs_vector(self, X_t: Optional[np.ndarray] = None) -> np.ndarray:
         """Observation vector Z_t: y_t = Z_t @ state_t + eps."""
         Z = np.zeros(self.d)
@@ -286,7 +279,19 @@ class BSTSKalmanFilter:
         self.P = self.T @ self.P @ self.T.T + self.Q
     
     def update(self, y_t: float, X_t: Optional[np.ndarray] = None):
-        """Kalman update step."""
+        """Kalman update step.
+
+        v1.1.0: Adaptive sigma_obs and spike-and-slab variable selection now
+        fire automatically every 10 updates inside this method.  The previously
+        commented-out stub block has been removed; the calls live here.
+
+        REF: Scott & Varian (2014) Predicting the present with BSTS.
+             Int. J. Math. Model. Numer. Optim., 5(1-2), 4-23.
+        REF: George & McCulloch (1993) Variable selection via Gibbs sampling.
+             JASA, 88(423), 881-889.
+        """
+        # --- step counter (drives the periodic adapt/prune cadence) ---
+        self._t = getattr(self, '_t', 0) + 1
         Z = self._obs_vector(X_t)
         y_pred = Z @ self.state
         residual = y_t - y_pred
@@ -294,6 +299,12 @@ class BSTSKalmanFilter:
         K = self.P @ Z / (S + 1e-12)  # Kalman gain
         self.state = self.state + K * residual
         self.P = self.P - np.outer(K, Z) @ self.P
+        # v1.1.0: adaptive sigma_obs + spike-and-slab (every 10 updates)
+        self._residuals = getattr(self, '_residuals', [])
+        self._residuals.append(float(residual))
+        if self._t % 10 == 0:
+            self._adapt_sigma_obs()
+            self._apply_spike_slab()
         return {
             'y_pred': float(y_pred),
             'residual': float(residual),
@@ -348,63 +359,76 @@ class BSTSKalmanFilter:
 # IV. Race Line Analysis & Perpendicular Velocity Calculus
 # ============================================================
 
-def compute_optimal_race_line(waypoints: List[Tuple[float, float]]) -> dict:
-# REF: Hart, P. E., Nilsson, N. J., & Raphael, B. (1968). A formal basis for heuristic determination of minimum cost paths. IEEE Trans. SSC, 4(2), 100-107.
+def compute_optimal_race_line(waypoints: List[Tuple[float, float]],
+                              track_width: float = 0.6) -> dict:
     """Compute optimal race line geometry.
-    
-    The optimal line minimizes integral of curvature^2 while staying within
-    track bounds. Uses the principle that v_perp must be zero at barriers.
-    
+
+    v1.1.0 HARMONIZED: delegates curvature calculation to race_line_engine
+    (Menger-correct circumradius) so analyze_logs.py and run.py share ONE
+    implementation.  The old standalone finite-difference curvature loop is
+    used only as a fallback when race_line_engine is not importable.
+    The backward brake-propagation pass is preserved here for batch analysis.
+
+    REF: Heilmeier et al. (2020) Minimum-curvature QP racing line. Proc. IMechE.
+    REF: Hart et al. (1968) A* heuristic. IEEE Trans. SSC, 4(2), 100-107.
+    REF: Menger (1930) three-point circumradius (correct curvature estimator).
+    REF: Brayshaw & Harrison (2005) Quasi-steady-state lap simulation. Proc. IMechE.
+
     Returns dict with:
       - race_line: list of (x,y) optimal positions
-      - curvatures: curvature at each waypoint
-      - max_speeds: theoretical max speed at each point (v = sqrt(a_lat_max / kappa))
-      - brake_points: indices where braking should begin
-      - brake_zone_integral: total braking distance (to minimize)
+      - curvatures: Menger curvature at each waypoint
+      - max_speeds: theoretical max speed (backward-pass brake-propagated)
+      - brake_points: indices where braking must begin
+      - brake_zone_integral: total braking distance (to minimise)
+      - normals: (nx, ny) unit normal at each wp (for v_perp barrier check)
     """
     if not waypoints or len(waypoints) < 4:
         return {'race_line': waypoints, 'curvatures': [], 'max_speeds': [],
-                'brake_points': [], 'brake_zone_integral': 0.0}
-    
+                'brake_points': [], 'brake_zone_integral': 0.0, 'normals': []}
+
     pts = np.array(waypoints, dtype=float)
     n = len(pts)
-    
-    # Compute curvatures using finite differences
-    dx = np.gradient(pts[:, 0])
-    dy = np.gradient(pts[:, 1])
-    d2x = np.gradient(dx)
-    d2y = np.gradient(dy)
-    denom = (dx**2 + dy**2)**1.5 + 1e-8
-    curvatures = np.abs(dx * d2y - dy * d2x) / denom
-    
-    # Max speed at each point: v_max = sqrt(a_lat_max / kappa)
-    a_lat_max = 4.0  # lateral acceleration limit (m/s^2 proxy)
-    max_speeds = np.sqrt(a_lat_max / (curvatures + 1e-6))
-    max_speeds = np.clip(max_speeds, 0, 4.0)  # DeepRacer max speed
-    
-    # Backward pass: propagate speed limits (braking constraint)
-    # v_i^2 <= v_{i+1}^2 + 2*a_brake*ds
-    a_brake = 3.0  # braking deceleration
+
+    # --- Curvature: prefer Menger (race_line_engine), fall back to finite diff ---
+    try:
+        from race_line_engine import _curvature_radius, _optimal_speed
+        wpts_list = [(float(p[0]), float(p[1])) for p in pts]
+        curvatures = np.array([
+            1.0 / max(_curvature_radius(wpts_list, i), 1e-4)
+            for i in range(n)
+        ])
+        max_speeds = np.array([_optimal_speed(1.0 / max(k, 1e-4)) for k in curvatures])
+    except ImportError:
+        dx = np.gradient(pts[:, 0])
+        dy = np.gradient(pts[:, 1])
+        d2x = np.gradient(dx)
+        d2y = np.gradient(dy)
+        denom = (dx**2 + dy**2)**1.5 + 1e-8
+        curvatures = np.abs(dx * d2y - dy * d2x) / denom
+        a_lat_max = 4.0
+        max_speeds = np.clip(np.sqrt(a_lat_max / (curvatures + 1e-6)), 0, 4.0)
+
+    # --- Backward brake-propagation pass (Brayshaw & Harrison 2005) ---
+    a_brake = 3.0
     ds = np.sqrt(np.diff(pts[:, 0])**2 + np.diff(pts[:, 1])**2)
-    ds = np.append(ds, ds[-1])  # pad
-    
+    ds = np.append(ds, ds[-1])
     brake_limited = max_speeds.copy()
     for i in range(n - 2, -1, -1):
         v_next = brake_limited[i + 1]
-        v_brake = math.sqrt(v_next**2 + 2 * a_brake * ds[i])
+        v_brake = math.sqrt(v_next**2 + 2 * a_brake * float(ds[i]))
         brake_limited[i] = min(brake_limited[i], v_brake)
-    
-    # Identify brake points (where brake_limited < max_speeds)
+
     brake_mask = brake_limited < max_speeds * 0.95
     brake_points = np.where(brake_mask)[0].tolist()
     brake_zone_integral = float(np.sum(ds[brake_mask]))
-    
-    # Normal vectors at each point (for perpendicular velocity check)
-    tangent_x = dx / (np.sqrt(dx**2 + dy**2) + 1e-8)
-    tangent_y = dy / (np.sqrt(dx**2 + dy**2) + 1e-8)
-    normal_x = -tangent_y  # perpendicular (rotate 90 deg)
-    normal_y = tangent_x
-    
+
+    # Normal vectors (for v_perp . n_barrier dot-product at barrier)
+    dx2 = np.gradient(pts[:, 0])
+    dy2 = np.gradient(pts[:, 1])
+    mag = np.sqrt(dx2**2 + dy2**2) + 1e-8
+    tangent_x, tangent_y = dx2 / mag, dy2 / mag
+    normal_x, normal_y = -tangent_y, tangent_x
+
     return {
         'race_line': pts.tolist(),
         'curvatures': curvatures.tolist(),
