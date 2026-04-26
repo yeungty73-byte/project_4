@@ -164,8 +164,23 @@ class TD3SACEnsemble(nn.Module):
 
         with torch.no_grad():
             # v1.1.0: ppo_agent.forward returns (mean, std, value, ctx_logits, intermed_pred)
-            # mean shape can be (1, agent_act_dim) or (batch, agent_act_dim).
-            # We need (batch, critic_act_dim=2): squeeze extra batch dims then slice.
+            # v1.1.4: shape guard — if nobs.shape[-1] != agent.obs_dim, pad/trim to match.
+            #         Prevents "mat1 and mat2 shapes cannot be multiplied" crash when
+            #         replay contains compact-obs (dim 12) from an earlier run/checkpoint.
+            _agent_obs_dim = getattr(ppo_agent, 'obs_dim', nobs.shape[-1])
+            if nobs.shape[-1] != _agent_obs_dim:
+                if nobs.shape[-1] < _agent_obs_dim:
+                    _pad = torch.zeros(nobs.shape[0], _agent_obs_dim - nobs.shape[-1], device=self.device)
+                    nobs = torch.cat([nobs, _pad], dim=-1)
+                else:
+                    nobs = nobs[:, :_agent_obs_dim]
+                obs_safe = obs
+                if obs.shape[-1] != _agent_obs_dim:
+                    if obs.shape[-1] < _agent_obs_dim:
+                        _pad2 = torch.zeros(obs.shape[0], _agent_obs_dim - obs.shape[-1], device=self.device)
+                        obs_safe = torch.cat([obs, _pad2], dim=-1)
+                    else:
+                        obs_safe = obs[:, :_agent_obs_dim]
             _fwd = ppo_agent.forward(nobs)
             _mean = _fwd[0].float()
             # Squeeze spurious leading dim if agent returned (1, batch, act_dim)
@@ -230,6 +245,14 @@ class TD3SACEnsemble(nn.Module):
             return {"td3_actor_loss": 0.0}
         obs_b, act_b, rew_b, next_obs_b, done_b = self.replay.sample(batch_size)
         obs_b = obs_b.to(self.device)
+        # v1.1.4: shape guard — same as update_critics fix
+        _agent_obs_dim_a = getattr(ppo_agent, 'obs_dim', obs_b.shape[-1])
+        if obs_b.shape[-1] != _agent_obs_dim_a:
+            if obs_b.shape[-1] < _agent_obs_dim_a:
+                _pad_a = torch.zeros(obs_b.shape[0], _agent_obs_dim_a - obs_b.shape[-1], device=self.device)
+                obs_b = torch.cat([obs_b, _pad_a], dim=-1)
+            else:
+                obs_b = obs_b[:, :_agent_obs_dim_a]
         # Get deterministic action from PPO agent actor (mean, no sampling)
         mean, std, value, ctx_logits, intermed_pred = ppo_agent.forward(obs_b)
         # mean may be (batch, 26) for discrete heads — slice to critic's expected act_dim

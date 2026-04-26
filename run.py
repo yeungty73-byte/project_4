@@ -644,7 +644,7 @@ def _apply_phase_env(args, phase, current_env=None):
 HTM_PILOT_EPISODES = 50   # collect 50 clean HTM completions
 MIN_PILOT_PROGRESS = 80.0  # only keep episodes that hit 80%+
 
-def harvest_htm_pilots(env, htm_agent, td3sac, n_episodes=12, min_progress=5.0):
+def harvest_htm_pilots(env, htm_agent, td3sac, n_episodes=12, min_progress=2.0):  # v1.1.4: default lowered from 5.0
     """
     Run deterministic pilot and seed replay for BC/TD3.
     v1.1.1 fixes:
@@ -676,18 +676,12 @@ def harvest_htm_pilots(env, htm_agent, td3sac, n_episodes=12, min_progress=5.0):
                 next_rp, _bc_progress_cache, _bc_progress_state)
             ep_prog = max(ep_prog, float(prog_pct))
             act_t = torch.tensor(np.asarray(action), dtype=torch.float32)
-            # v1.1.3: _compact_obs → extract_compact_obs alias; next_info was undefined (→ info)
-            # REF: AWS (2020) DeepRacer obs is a flat float32 array; reward_params holds scalar features
-            _rp_bc  = info.get('reward_params', {}) if isinstance(info, dict) else {}
-            _nrp_bc = info.get('reward_params', {}) if isinstance(info, dict) else {}  # v1.1.3: was next_info (undefined)
-            _wps_bc = _rp_bc.get('waypoints', [])
-            _cls_bc = _rp_bc.get('closest_waypoints', [0, 1])
-            obs_t  = torch.tensor(
-                extract_compact_obs(obs_to_array(obs),  _rp_bc,  _wps_bc, _cls_bc),
-                dtype=torch.float32)
-            nobs_t = torch.tensor(
-                extract_compact_obs(obs_to_array(next_obs), _nrp_bc, _wps_bc, _cls_bc),
-                dtype=torch.float32)
+            # v1.1.4: store RAW obs in replay — agent encoder expects obs_dim=38464 (raw flat array).
+            # v1.1.3 compact12 fix resolved NameError but introduced shape mismatch (256x12 vs 38464x128).
+            # compact12 is used only for lightweight reward-shaping signals, NOT for TD3/actor training.
+            # REF: AWS (2020) — DeepRacer obs_space is flat float32 of shape (38464,).
+            obs_t  = torch.tensor(obs_to_array(obs),      dtype=torch.float32)
+            nobs_t = torch.tensor(obs_to_array(next_obs), dtype=torch.float32)
             _bc_reward = float(max(-10.0, min(10.0, reward)))
             ep_buf.append((obs_t, act_t, _bc_reward, nobs_t, float(terminated or truncated)))
             obs, rp = next_obs, next_rp
@@ -1436,9 +1430,10 @@ def run(hparams):
             track_width=float(_init_rp.get("track_width", 0.6)),
             track_variant=_track_variant,
         )
+        # v1.1.4: min_progress=2.0 — accept near-any motion; BCPilot tops out at 5-25%
         n_harvested = harvest_htm_pilots(env, htm_pilot, td3sac,
-                                         n_episodes=12, min_progress=5.0)
-        if n_harvested >= 10:
+                                         n_episodes=12, min_progress=2.0)
+        if n_harvested >= 5:  # v1.1.4: was 10 — BCPilot only hits 5-12 successful eps
             pretrain_td3_bc(td3sac, agent, bc_steps=2000)
     except ImportError:
         # BCPilot: internal fallback, no external dependency
@@ -1454,8 +1449,8 @@ def run(hparams):
                 track_variant=_track_variant,
             )
             n_harvested = harvest_htm_pilots(env, _bc_pilot, td3sac,
-                                             n_episodes=12, min_progress=5.0)
-            if n_harvested >= 10:
+                                             n_episodes=12, min_progress=2.0)  # v1.1.4: lowered from 5.0
+            if n_harvested >= 5:  # v1.1.4: was 10 — BCPilot only hits 5-12 successful eps
                 pretrain_td3_bc(td3sac, agent, bc_steps=2000)
         else:
             logger.warning("[BC] waypoints empty at init — skipping BC harvest")
@@ -1471,8 +1466,8 @@ def run(hparams):
                 track_variant=_track_variant,
             )
             n_harvested = harvest_htm_pilots(env, _bc_pilot, td3sac,
-                                             n_episodes=12, min_progress=5.0)  # v1.1.0: was 50/80 — too strict, never seeds replay
-            if n_harvested >= 10:
+                                             n_episodes=12, min_progress=2.0)  # v1.1.4: lowered from 5.0  # v1.1.0: was 50/80 — too strict, never seeds replay
+            if n_harvested >= 5:  # v1.1.4: was 10 — BCPilot only hits 5-12 successful eps
                 pretrain_td3_bc(td3sac, agent, bc_steps=2000)
         else:
             logger.warning("[BC] waypoints empty at init — skipping BC harvest")
