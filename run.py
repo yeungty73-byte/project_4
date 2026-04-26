@@ -1036,7 +1036,16 @@ def run(hparams):
         feedback_strength=0.15,
         race_type=_track_variant,   # race-type tagging live from init
     )
-    bsts_season = bsts_feedback.model("ep_return", period=100) 
+    # v1.1.0: replace _NullModel stub with real BSTSSeasonal instance
+    # bsts_feedback.model() returns _NullModel (backward-compat only) — record_step()/_flush_episode()
+    # were silently no-ops, so BSTS-Kalman trends stayed 0.0 forever.
+    try:
+        from bsts_seasonal import BSTSSeasonal as _BSTSSeasonal
+        bsts_season = _BSTSSeasonal(n_segments=12, save_dir=os.path.join("results", run_name), alpha=0.02)
+        logger.info("[BSTS] BSTSSeasonal instantiated — record_step/_flush_episode now active")
+    except Exception as _e_bsts:
+        bsts_season = bsts_feedback.model("ep_return", period=100)  # fallback to null
+        logger.warning(f"[BSTS] BSTSSeasonal import failed, using NullModel: {_e_bsts}") 
 
     # v16: Race-line blend factor: starts at 0.0 (all rigid), anneals to 1.0 (all race-line)
     _rl_blend = 0.0
@@ -1895,6 +1904,22 @@ def run(hparams):
                     # top-level info keys are: reward_params, episode_status, goal
                     # Using _step_info.get('x') was ALWAYS 0 — causing all BSTS zeros.
                     _rp_log = rp if rp else (info.get("reward_params", {}) if isinstance(info, dict) else {})
+                    # v1.1.0: record_step for BSTSSeasonal live buffer
+                    try:
+                        if bsts_season is not None and hasattr(bsts_season, 'record_step'):
+                            _rl_err_step = float(_racing_line_err) if '_racing_line_err' in dir() else 0.0
+                            bsts_season.record_step(
+                                progress=float(_prog) if '_prog' in dir() else 0.0,
+                                speed=float(_speed) if '_speed' in dir() else 0.0,
+                                steering=float(action[0]) if hasattr(action, '__getitem__') else 0.0,
+                                heading_err=float(_heading) * 3.14159 / 180.0 if '_heading' in dir() else 0.0,
+                                raceline_err=_rl_err_step,
+                                reward=float(reward),
+                                lidar_min=float(_lidar_min_step) if '_lidar_min_step' in dir() else 1.0,
+                                wp_idx=int(_closest[0]) if isinstance(_closest, (list,tuple)) and _closest else 0,
+                            )
+                    except Exception:
+                        pass
                     _ep_step_log.append({
                         'x':                    float(_rp_log.get('x', 0.0)),
                         'y':                    float(_rp_log.get('y', 0.0)),
@@ -1905,7 +1930,8 @@ def run(hparams):
                         'reward':               float(reward),
                         'all_wheels_on_track':  bool(_rp_log.get('all_wheels_on_track', True)),
                         'distance_from_center': float(_dist_from_center) if '_dist_from_center' in dir() else float(_rp_log.get('distance_from_center', 0.0)),
-                        'closest_wp_idx':       int(_closest[1]) if isinstance(_closest, (list, tuple)) and len(_closest) > 1 else -1,
+                        'closest_waypoint':     int(_closest[0]) if isinstance(_closest, (list, tuple)) and len(_closest) > 0 else -1,  # v1.1.0: fix: was 'closest_wp_idx'[1]; hm needs 'closest_waypoint'[0]
+                        'dist_to_raceline':   float(_racing_line_err) if '_racing_line_err' in dir() else 0.0,  # v1.1.0: was missing → race_line_adherence=0
                         # v1.1.0: fields _translate_step() / extract_intermediary_metrics() need
                         'braking':              int(_braking_intent) if '_braking_intent' in dir() else 0,
                         'is_offtrack':          bool(_offtrack),
@@ -2188,7 +2214,7 @@ def run(hparams):
                     try:
                         _hm_track_width = float(rp.get('track_width', 1.0)) if rp else 1.0
                         _hm_n_wp = len(rp.get('waypoints', [])) if rp else None
-                        _hm_out = _hm.compute_all(_ep_step_log, float(_prog), n_waypoints=_hm_n_wp, track_width=_hm_track_width)
+                        _hm_out = _hm.compute_all(_ep_step_log, float(_prog), n_waypoints=_hm_n_wp, track_width=_hm_track_width, waypoints=_waypoints if '_waypoints' in dir() else None)  # v1.1.0: pass waypoints for arc-progress
                     except Exception as _e_hm:
                         _hm_out = {}
                     # v213: race-type tag for plot/CSV differentiation
@@ -2296,6 +2322,16 @@ def run(hparams):
                         'track_length_m': float(ep_track_length_m),
                         'lap_completed': float(lap_completed),  # v1.0.14 strict completion gate
                     }
+                    # v1.1.0: merge harmonized_metrics output into bsts_metrics
+                    # so avg_speed_centerline, track_progress, race_line_adherence reach BSTS EMA
+                    if _hm_out:
+                        bsts_metrics.update({
+                            'avg_speed_centerline': float(_hm_out.get('avg_speed_centerline', 0.0)),
+                            'track_progress':       float(_hm_out.get('track_progress', 0.0)),
+                            'race_line_adherence':  float(_hm_out.get('race_line_adherence', 0.0)),
+                            'brake_compliance':     float(_hm_out.get('brake_compliance', 0.0)),
+                            'smoothness_jerk_rms':  float(_hm_out.get('smoothness_jerk_rms', 0.0)),
+                        })
                     bsts_feedback.update(bsts_metrics)
                 # --- Compute BSTS-adjusted reward weights ---
                 _adjusted_rw = bsts_feedback.adjust_weights(rw)
@@ -2475,6 +2511,17 @@ def run(hparams):
                 ep_decel_penalties = []
                 ep_safe_speed_ratios = []
                 ep_racing_line_errors = []
+                # v1.1.0: flush BSTSSeasonal episode buffer before resetting
+                if bsts_season is not None and hasattr(bsts_season, '_flush_episode'):
+                    try:
+                        bsts_season._flush_episode(lap_completed > 0.5)
+                        # periodic Kalman fit from step buffer (every 20 episodes)
+                        if episode_count % 20 == 0 and len(getattr(bsts_season, '_ep_buf', [])) >= getattr(bsts_season, 'STEP_BUFFER_MIN_EPISODES', 20):
+                            bsts_season._fit_from_step_buffer()
+                            _bsts_trend = bsts_season.get_trend() if hasattr(bsts_season, 'get_trend') else {}
+                            logger.info(f"[BSTS-Kalman] ep={episode_count} trend={_bsts_trend}")
+                    except Exception as _fe:
+                        logger.debug(f"BSTS flush error: {_fe}")
                 _ep_step_log = []
                 ep_recovery_steps = 0
                 ep_in_recovery = False
