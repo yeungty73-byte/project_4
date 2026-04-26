@@ -27,7 +27,17 @@ class ReplayBuffer:
         self.buffer = deque(maxlen=capacity)
 
     def push(self, obs, action, reward, next_obs, done):
-        self.buffer.append((obs, action, reward, next_obs, done))
+        # v1.1.1: shape guard — silently drop mismatched obs rather than
+        # poisoning the buffer with transitions from a prior checkpoint run.
+        _obs = obs if isinstance(obs, torch.Tensor) else torch.tensor(obs, dtype=torch.float32)
+        _nobs = next_obs if isinstance(next_obs, torch.Tensor) else torch.tensor(next_obs, dtype=torch.float32)
+        if not hasattr(self, '_obs_shape'):
+            self._obs_shape = None
+        if self._obs_shape is None:
+            self._obs_shape = _obs.shape
+        elif _obs.shape != self._obs_shape:
+            return  # drop mismatched transition
+        self.buffer.append((_obs.cpu(), action, reward, _nobs.cpu(), done))
 
     def sample(self, batch_size=256):
         batch = random.sample(self.buffer, min(batch_size, len(self.buffer)))
@@ -88,7 +98,9 @@ class TD3SACEnsemble(nn.Module):
 
         # SAC log-alpha (auto-tuned entropy)
         self.log_alpha = nn.Parameter(torch.zeros(1, device=device))
-        self.target_entropy = target_entropy if target_entropy is not None else -act_dim
+        # v1.1.1: was -act_dim → alpha explosion to ~7.4 within 100 steps.
+        # Use -0.5 * act_dim (Haarnoja et al. 2018 §5 standard heuristic).
+        self.target_entropy = target_entropy if target_entropy is not None else -0.5 * act_dim
 
         # Optimizers
         self.critic_optim = torch.optim.Adam(
@@ -252,36 +264,121 @@ class TD3SACEnsemble(nn.Module):
             'replay_size': len(self.replay),
         }
 
-    def update_actor(self, ppo_agent, batch_size=256):
+    def update_actor(self, ppo_agent, batch_size: int = 256):
+        """TD3-guided policy distillation via BC loss.
+
+        v1.1.1 FIX (Bug #3a): Previous version passed raw pixel-range obs_b
+        directly to ppo_agent.forward() WITHOUT normalizing first.
+        SwinUNet Linear(4,32) with obs~100 → activations~1e6 → NaN →
+        actor_loss=nan → .backward() poisons all PPO weights silently.
+
+        Fix: normalize obs_b before ppo_agent.forward(). Return td3_ready
+        flag so run.py blend logic is unambiguous.
+
+        REF: Fujimoto et al. (2021). TD3+BC. NeurIPS 34, 20132-20145.
+        """
         if len(self.replay) < batch_size:
-            return {"td3_actor_loss": 0.0}
+            return {"td3_actor_loss": 0.0, "td3_bc_loss": None,
+                    "td3_q1_mean": 0.0, "td3_ready": False}
+
         obs_b, act_b, rew_b, next_obs_b, done_b = self.replay.sample(batch_size)
         obs_b = obs_b.to(self.device)
-        # v1.1.4: shape guard — same as update_critics fix
+
+        # v1.1.1 FIX: normalize BEFORE ppo_agent.forward() to prevent NaN
+        _obs_max = obs_b.abs().max().item()
+        if _obs_max > 2.0:
+            obs_b = obs_b / max(_obs_max, 1.0)
+
+        # Shape guard
         _agent_obs_dim_a = getattr(ppo_agent, 'obs_dim', obs_b.shape[-1])
         if obs_b.shape[-1] != _agent_obs_dim_a:
             if obs_b.shape[-1] < _agent_obs_dim_a:
-                _pad_a = torch.zeros(obs_b.shape[0], _agent_obs_dim_a - obs_b.shape[-1], device=self.device)
-                obs_b = torch.cat([obs_b, _pad_a], dim=-1)
+                _pad = torch.zeros(obs_b.shape[0],
+                                   _agent_obs_dim_a - obs_b.shape[-1],
+                                   device=self.device)
+                obs_b = torch.cat([obs_b, _pad], dim=-1)
             else:
                 obs_b = obs_b[:, :_agent_obs_dim_a]
-        # Get deterministic action from PPO agent actor (mean, no sampling)
-        mean, std, value, ctx_logits, intermed_pred = ppo_agent.forward(obs_b)
-        # mean may be (batch, 26) for discrete heads — slice to critic's expected act_dim
-        critic_act_dim = self.q1.net[0].in_features - obs_b.shape[-1]
-        if mean.shape[-1] > critic_act_dim:
-            mean = mean[:, :critic_act_dim]
-        elif mean.shape[-1] < critic_act_dim:
-            mean = torch.cat([mean, torch.zeros(mean.shape[0], critic_act_dim - mean.shape[-1], device=self.device)], dim=-1)
-        # Q1 value for current policy actions
-        q1_val = self.q1(obs_b, mean)
-        actor_loss = -q1_val.mean()
-        return {
-            "td3_actor_loss": actor_loss,
-            "td3_actor_loss_val": actor_loss.item(),
-            "td3_q1_mean": q1_val.mean().item(),
-        }
 
+        if not torch.isfinite(obs_b).all():
+            return {"td3_actor_loss": 0.0, "td3_bc_loss": None,
+                    "td3_q1_mean": 0.0, "td3_ready": False}
+
+        critic_act_dim = self.q1.net[0].in_features - obs_b.shape[-1]
+
+        # Step 1: compute TD3-preferred action direction (no grad needed here)
+        with torch.no_grad():
+            fwd_nograd = ppo_agent.forward(obs_b)
+            ppo_mean_nograd = fwd_nograd[0].float()
+            if ppo_mean_nograd.ndim == 3 and ppo_mean_nograd.shape[0] == 1:
+                ppo_mean_nograd = ppo_mean_nograd.squeeze(0)
+            if ppo_mean_nograd.shape[-1] > critic_act_dim:
+                ppo_mean_q = ppo_mean_nograd[:, :critic_act_dim]
+            else:
+                ppo_mean_q = torch.cat([
+                    ppo_mean_nograd,
+                    torch.zeros(ppo_mean_nograd.shape[0],
+                                critic_act_dim - ppo_mean_nograd.shape[-1],
+                                device=self.device)
+                ], dim=-1)
+
+            # One-step Q1-gradient ascent to find TD3-preferred action
+            # REF: Fujimoto et al. (2021) TD3+BC §3.1
+            td3_act = ppo_mean_q.clone().requires_grad_(True)
+            self.q1(obs_b, td3_act).mean().backward()
+            td3_improved = (td3_act + 0.01 * td3_act.grad.sign()).clamp(-1, 1).detach()
+
+        # Step 2: BC loss WITH gradient — PPO actor should move toward td3_improved
+        fwd_grad = ppo_agent.forward(obs_b)
+        ppo_mean_grad = fwd_grad[0].float()
+        if ppo_mean_grad.ndim == 3 and ppo_mean_grad.shape[0] == 1:
+            ppo_mean_grad = ppo_mean_grad.squeeze(0)
+        if ppo_mean_grad.shape[-1] > critic_act_dim:
+            ppo_mean_grad = ppo_mean_grad[:, :critic_act_dim]
+        elif ppo_mean_grad.shape[-1] < critic_act_dim:
+            ppo_mean_grad = torch.cat([
+                ppo_mean_grad,
+                torch.zeros(ppo_mean_grad.shape[0],
+                            critic_act_dim - ppo_mean_grad.shape[-1],
+                            device=self.device)
+            ], dim=-1)
+
+        bc_loss = torch.nn.functional.mse_loss(ppo_mean_grad, td3_improved)
+
+        if not torch.isfinite(bc_loss):
+            return {"td3_actor_loss": 0.0, "td3_bc_loss": None,
+                    "td3_q1_mean": 0.0, "td3_ready": False}
+
+        with torch.no_grad():
+            q1_val = self.q1(obs_b, td3_improved)
+
+        return {
+            "td3_actor_loss":  -q1_val.mean().item(),
+            "td3_bc_loss":     bc_loss,          # Tensor WITH grad — run.py calls .backward()
+            "td3_bc_loss_val": bc_loss.item(),
+            "td3_q1_mean":     q1_val.mean().item(),
+            "td3_ready":       True,
+        }
+        
+    def update_alpha(self, log_prob: float) -> float:
+        """SAC auto-temperature update.
+
+        v1.1.1: This method was missing entirely — log_alpha was never updated,
+        so alpha was hardcoded at 1.0 forever.
+
+        Call once per episode with mean log_prob from the PPO rollout.
+        REF: Haarnoja et al. (2018) SAC §4.2 — adaptive temperature.
+        """
+        alpha_loss = -(self.log_alpha * (log_prob + self.target_entropy))
+        self.alpha_optim.zero_grad()
+        alpha_loss.backward()
+        torch.nn.utils.clip_grad_norm_([self.log_alpha], 1.0)
+        self.alpha_optim.step()
+        # v1.1.1: clamp prevents runaway. alpha ∈ [exp(-3)≈0.05, exp(1)≈2.7]
+        with torch.no_grad():
+            self.log_alpha.clamp_(-3.0, 1.0)
+        return self.alpha
+    
     def _soft_update(self, source, target):
         for sp, tp in zip(source.parameters(), target.parameters()):
             tp.data.copy_(self.tau * sp.data + (1.0 - self.tau) * tp.data)

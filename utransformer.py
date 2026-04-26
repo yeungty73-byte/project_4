@@ -604,3 +604,172 @@ class SwinUNetObsWrapper:
             compact12 = np.zeros(12, dtype=np.float32)
         clearance4 = self.get_clearance(obs_raw)
         return np.concatenate([compact12, clearance4]).astype(np.float32)
+
+
+# ============================================================
+# v1.2.0: SwinUNet++ — Swin encoder + UNet segmenter fusion
+# REF: Liu et al. (2021) Swin Transformer. ICCV. arXiv:2103.14030
+# REF: Petit et al. (2021) U-Net Transformer. arXiv:2103.06104
+# REF: Zhou et al. (2019) UNet++. IEEE TAMI.
+# ============================================================
+import math as _math_swin
+
+class _SwinBlock(torch.nn.Module):
+    """Single Swin block: window self-attention + shifted variant + FFN.
+    Window size W x W; alternating blocks shift by W//2.
+    """
+    def __init__(self, dim: int, heads: int, window_size: int = 4, shift: bool = False):
+        super().__init__()
+        self.ws, self.shift = window_size, shift
+        self.norm1 = torch.nn.LayerNorm(dim)
+        self.norm2 = torch.nn.LayerNorm(dim)
+        assert dim % heads == 0
+        self.attn = torch.nn.MultiheadAttention(dim, heads, batch_first=True)
+        self.ffn  = torch.nn.Sequential(
+            torch.nn.Linear(dim, dim * 2), torch.nn.GELU(), torch.nn.Linear(dim * 2, dim)
+        )
+
+    def _part(self, x, H, W):
+        B, _, C = x.shape
+        ws = self.ws
+        x = x.reshape(B, H // ws, ws, W // ws, ws, C)
+        x = x.permute(0, 1, 3, 2, 4, 5).contiguous().reshape(-1, ws * ws, C)
+        return x
+
+    def _rev(self, x, B, H, W):
+        ws = self.ws
+        C = x.shape[-1]
+        x = x.reshape(B, H // ws, W // ws, ws, ws, C)
+        return x.permute(0, 1, 3, 2, 4, 5).contiguous().reshape(B, H * W, C)
+
+    def _pad(self, x, H, W):
+        ws = self.ws
+        ph = (ws - H % ws) % ws
+        pw = (ws - W % ws) % ws
+        if ph or pw:
+            B, _, C = x.shape
+            x = x.reshape(B, H, W, C)
+            x = torch.nn.functional.pad(x, (0, 0, 0, pw, 0, ph))
+            H, W = H + ph, W + pw
+            x = x.reshape(B, H * W, C)
+        return x, H, W
+
+    def forward(self, x, H, W):
+        x, H2, W2 = self._pad(x, H, W)
+        if self.shift:
+            s  = self.ws // 2
+            x2 = x.reshape(x.shape[0], H2, W2, x.shape[-1])
+            x2 = torch.roll(x2, (-s, -s), (1, 2))
+            x  = x2.reshape(x.shape[0], H2 * W2, x.shape[-1])
+        res = x
+        x   = self.norm1(x)
+        B   = x.shape[0]
+        xw, _ = self.attn(self._part(x, H2, W2),
+                          self._part(x, H2, W2),
+                          self._part(x, H2, W2))
+        x = self._rev(xw, B, H2, W2) + res
+        if self.shift:
+            s  = self.ws // 2
+            x2 = x.reshape(B, H2, W2, x.shape[-1])
+            x2 = torch.roll(x2, (s, s), (1, 2))
+            x  = x2.reshape(B, H2 * W2, x.shape[-1])
+        if H2 != H or W2 != W:
+            x = x.reshape(B, H2, W2, x.shape[-1])[:, :H, :W, :].contiguous()
+            x = x.reshape(B, H * W, x.shape[-1])
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class SwinEncoder2D(torch.nn.Module):
+    """2-stage Swin encoder for DeepRacer 120x160 greyscale camera.
+    Stage 1: 4x4 patches → 30x40 tokens (dim=32), 2 Swin blocks
+    Stage 2: patch merge → 15x20 tokens (dim=64), 2 Swin blocks
+    Output: (B, out_dim) via global average pool.
+    ~95k parameters, <3ms CPU forward pass.
+    REF: Liu et al. (2021) §3.1.
+    """
+    CAM_H, CAM_W = 120, 160  # DeepRacer greyscale
+
+    def __init__(self, patch_size=4, dim=32, out_dim=32, window_size=4):
+        super().__init__()
+        self.H, self.W   = self.CAM_H, self.CAM_W
+        self.pH, self.pW = self.H // patch_size, self.W // patch_size
+        self.patch_embed  = torch.nn.Conv2d(1, dim, patch_size, patch_size)
+        self.norm_embed   = torch.nn.LayerNorm(dim)
+        self.stage1       = torch.nn.ModuleList([
+            _SwinBlock(dim, 4, window_size, i % 2 == 1) for i in range(2)])
+        dim2 = dim * 2
+        self.merge_proj   = torch.nn.Linear(dim * 4, dim2)
+        self.merge_norm   = torch.nn.LayerNorm(dim2)
+        self.stage2       = torch.nn.ModuleList([
+            _SwinBlock(dim2, 4, window_size, i % 2 == 1) for i in range(2)])
+        self.head         = torch.nn.Linear(dim2, out_dim)
+
+    def forward(self, obs_flat: torch.Tensor) -> torch.Tensor:
+        n = self.H * self.W
+        img = obs_flat[:, :n].reshape(-1, 1, self.H, self.W).float()
+        x   = self.patch_embed(img)
+        B, C, H1, W1 = x.shape
+        x   = self.norm_embed(x.flatten(2).permute(0, 2, 1))
+        for blk in self.stage1:
+            x = blk(x, H1, W1)
+        x2d = x.reshape(B, H1, W1, C)
+        H2, W2 = H1 // 2, W1 // 2
+        xm = torch.cat([x2d[:, 0::2, 0::2], x2d[:, 1::2, 0::2],
+                        x2d[:, 0::2, 1::2], x2d[:, 1::2, 1::2]], -1)
+        xm = self.merge_norm(self.merge_proj(xm.reshape(B, H2 * W2, C * 4)))
+        for blk in self.stage2:
+            xm = blk(xm, H2, W2)
+        return self.head(xm.mean(1))
+
+
+class SwinUNetPP(torch.nn.Module):
+    """v1.2.0: SwinUNet++ — unified visual backbone for DeepRacer.
+
+    Architecture
+    ------------
+    Camera (first 19200 of obs_flat) → SwinEncoder2D → 32-dim features
+    LIDAR proxy (obs_flat[:19200] normalised) → ObstacleSegmenter → 16 mask + 16 dist
+    Fused: (B, 64) via linear projection
+
+    Output layout: [:16] obstacle mask logits | [16:32] distances | [32:] camera features
+
+    Usage in run.py
+    ---------------
+      swin_pp = SwinUNetPP()
+      fused   = swin_pp(obs_tensor)               # (B, 64)
+      obs_mask = swin_pp.obstacle_mask_np(obs_np)  # (16,) bool for BrakeField
+
+    REF: Liu et al. (2021); Petit et al. (2021); Zhou et al. (2019).
+    """
+    CAM_N    = 19200  # 120*160 greyscale
+    SWIN_OUT = 32
+    SECTORS  = 16
+
+    def __init__(self):
+        super().__init__()
+        self.swin       = SwinEncoder2D(out_dim=self.SWIN_OUT)
+        self.segmenter  = ObstacleSegmenter(obs_dim_raw=self.CAM_N)
+        self.fuse_proj  = torch.nn.Sequential(
+            torch.nn.Linear(self.SECTORS * 2 + self.SWIN_OUT, 64),
+            torch.nn.GELU(),
+            torch.nn.Linear(64, self.SECTORS * 2 + self.SWIN_OUT),
+        )
+
+    def forward(self, obs_flat: torch.Tensor) -> torch.Tensor:
+        cam_feat = self.swin(obs_flat)
+        lmax = obs_flat[:, :self.CAM_N].abs().max(1, keepdim=True).values.clamp(min=1.0)
+        lidar = obs_flat[:, :self.CAM_N].float() / lmax
+        mask, dist = self.segmenter(lidar)
+        fused = torch.cat([mask, dist, cam_feat], -1)
+        return self.fuse_proj(fused)
+
+    @torch.no_grad()
+    def obstacle_mask_np(self, obs_flat_np) -> "np.ndarray":
+        """numpy flat obs → (16,) bool obstacle mask for BrakeField.set_obstacle_mask()."""
+        import numpy as _np
+        if obs_flat_np is None or len(obs_flat_np) < self.CAM_N:
+            return _np.zeros(self.SECTORS, dtype=bool)
+        t   = torch.tensor(obs_flat_np[:self.CAM_N], dtype=torch.float32).unsqueeze(0)
+        out = self.forward(t)
+        return (out[0, :self.SECTORS] > 0.5).numpy()

@@ -181,7 +181,7 @@ class BSTSKalmanFilter:
         
         # Initial state and covariance
         self.state = np.zeros(self.d)
-        self.P = np.eye(self.d) * 10.0  # diffuse prior
+        self.P = np.eye(self.d) * 1e4  # diffuse prior
         
         # Noise variances
         self.sigma_obs = sigma_obs

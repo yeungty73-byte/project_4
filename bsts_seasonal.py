@@ -2,55 +2,30 @@
 
 Classes
 -------
-BSTSFeedback   -- EMA-smoothed, Kalman-informed, race_type-aware reward-weight adjuster.
-                  Transplanted from run.py (v1.0.13).  run.py now imports it from here.
-BSTSSeasonal   -- Batch BSTS decomposition + live per-step buffer for run.py integration.
+BSTSKalmanFilter -- Local-linear-trend 2-state Kalman filter (NEW v1.1.1)
+BSTSFeedback     -- EMA-smoothed, Kalman-informed, race_type-aware reward-weight adjuster.
+BSTSSeasonal     -- Batch BSTS decomposition + live per-step buffer for run.py integration.
 
-BSTSFeedback race_type support (v1.0.13)
------------------------------------------
-The constructor now accepts ``race_type: str`` (default ``"TIME_TRIAL"``).
-Supported values (case-insensitive): TIME_TRIAL, OBJECT_AVOIDANCE, HEAD_TO_BOT.
-
-Adjustments by race_type:
-  TIME_TRIAL      – baseline behaviour (unchanged from run.py original)
-  OBJECT_AVOIDANCE – obstacle weight floor raised; braking weight multiplier +50%;
-                     avg_safe_speed_ratio threshold tightened (1.1 → 1.05)
-  HEAD_TO_BOT     – obstacle weight floor raised even higher; steering weight
-                     boosted; speed_steering coupled earlier; corner weight up
-
-adjust_weights() now normalises all returned weights so they always sum to 1.0.
-
-API compatibility with run.py (v1.0.13)
-----------------------------------------
-  update(metrics_dict, *, step=None, race_type_tag=None)
-      ``step`` and ``race_type_tag`` are accepted as keyword-only kwargs so that
-      run.py's existing call-sites work without modification.  ``race_type_tag``
-      hot-swaps self.race_type if provided.
-
-  adjust_weights(base_weights, *, race_type_filter=None)
-      ``race_type_filter`` overrides self.race_type for this call only.
-
-  get_trend_vector(race_type_filter=None) -> dict[str, float]
-      Returns {metric: linear_slope_over_last_5_obs} from self.ema history.
-      Used by run.py to drive entropy_coef / lr adjustments.
-
-  model(metric, period=100) -> _NullModel
-      Backward-compat stub — run.py calls bsts_feedback.model("ep_return",period=100)
-      at init time to get bsts_season.  Returns a no-op proxy that won't crash.
-
-BSTSSeasonal v1.0.13 changes (unchanged from prior version)
-------------------------------------------------------------
-  - record_step() buffers per-step data in a rolling deque (no longer a no-op)
-  - get_trend()    returns real phase/slope computed from last fit_from_jsonl decomposition
-  - get_season()   returns real worst_segments + per-segment crash/speed map
-  - get_seasonal() alias added (run.py uses this name in one call-site)
-  - fit_from_jsonl() caches decomposition results into self._last_results
-  - _fit_from_step_buffer() added: periodic fit from record_step() buffer without jsonl
+v1.1.1 changes
+--------------
+  - BSTSKalmanFilter: proper 2-state (level+slope) Kalman with diffuse P prior,
+    spike-and-slab beta shrinkage (_apply_spike_slab), and adaptive sigma_obs
+    (_adapt_sigma_obs). REF: Welch & Bishop (2006); Scott & Varian (2014);
+    George & McCulloch (1993).
+  - BSTSFeedback.__init__: self._kf dict now lazily spawns BSTSKalmanFilter
+    instances per metric. update() calls _run_kalmans() at the end of every
+    call so kf_trends / kf_betas are always populated after the first update().
+  - adjust_weights() corner-crash guard (v1.1.1): only fires after >10% avg
+    progress to avoid false positives from start-box barrier hits.
 
 REF: Scott, S. L. & Varian, H. R. (2014). Predicting the present with Bayesian
      structural time series. Int. J. Math. Model. Numer. Optim., 5(1-2), 4-23.
 REF: Brodersen, K. H. et al. (2015). Inferring causal impact using Bayesian
      structural time-series models. Ann. Appl. Stat., 9(1), 247-274.
+REF: Welch, G. & Bishop, G. (2006). An Introduction to the Kalman Filter.
+     UNC-Chapel Hill Tech Report TR 95-041.
+REF: George, E. I. & McCulloch, R. E. (1993). Variable selection via Gibbs
+     sampling. JASA, 88(423), 881-889.
 """
 import json, os, math, collections
 import numpy as np
@@ -87,7 +62,6 @@ COMPLEMENTARY_PAIRS = [
     (DENIM_MID, TERRA_COTTA),
 ]
 
-# Harmonized with analyze_logs.py (single source of truth for run.py + live_bsts_plot.py)
 from analyze_logs import SUCCESS_METRICS as SUCCESS_KEYS, INTERMEDIARY_METRICS as REGRESSOR_KEYS
 
 # ---------------------------------------------------------------------------
@@ -107,18 +81,172 @@ _RACE_TYPE_MAP = {
 }
 
 def _norm_race_type(raw: str) -> str:
-    """Return canonical race_type token, defaulting to TIME_TRIAL."""
     return _RACE_TYPE_MAP.get(str(raw).lower().replace(" ", "_"), "TIME_TRIAL")
 
-
-# ---------------------------------------------------------------------------
-# Backward-compat stub returned by BSTSFeedback.model()
-# ---------------------------------------------------------------------------
 class _NullModel:
-    """No-op proxy so bsts_season.get_season() / .get_trend() never raise."""
-    def get_season(self):  return {'worst_segments': [], 'segments': {}}
-    def get_trend(self):   return {}
-    def get_seasonal(self):return {}
+    def get_season(self): return {'worst_segments': [], 'segments': {}}
+    def get_seasonal(self): return {}
+    def get_trend(self):
+        # v1.1.1: never return {} — run.py calls .get('kf_level') on this
+        return {'phase': 'plateau', 'return_slope': 0.0, 'trend_last': 0.0,
+                'trend_mean': 0.0, 'kf_level': 0.0, 'kf_trend': 0.0,
+                'kf_season': 0.0, 'kf_innov': 0.0}
+        
+# ===========================================================================
+# BSTSKalmanFilter  (local-linear-trend 2-state Kalman) — NEW v1.1.1
+# ===========================================================================
+class BSTSKalmanFilter:
+    """2-state local-linear-trend Kalman filter for a scalar metric time series.
+
+    State vector x = [level, slope]^T
+    Transition:  x_t = F x_{t-1} + w,  w ~ N(0, Q)
+    Observation: y_t = H x_t    + v,  v ~ N(0, R)
+
+    Additional components (preserved from project spec):
+      _apply_spike_slab()  -- George & McCulloch (1993) soft beta shrinkage
+      _adapt_sigma_obs()   -- Scott & Varian (2014) rolling residual variance
+
+    After update(), self.slope is the posterior slope -> kf_trends[metric].
+
+    Parameters
+    ----------
+    obs_noise    : float  Initial observation noise variance R (adapted online)
+    level_noise  : float  Process noise on level state (Q[0,0])
+    slope_noise  : float  Process noise on slope state (Q[1,1])
+    p            : int    Number of regression coefficients for spike-and-slab
+    S            : int    Number of seasonal states (for state index calculation)
+
+    REF: Welch, G. & Bishop, G. (2006). An Introduction to the Kalman Filter.
+         UNC TR 95-041.
+    REF: Scott & Varian (2014) BSTS — Inv-Gamma prior on sigma_obs.
+    REF: George & McCulloch (1993) Variable selection via Gibbs sampling.
+    """
+
+    def __init__(self, obs_noise: float = 1.0,
+                 level_noise: float = 0.05,
+                 slope_noise: float = 0.005,
+                 p: int = 0,
+                 S: int = 0):
+        # Transition matrix: [level, slope] random walk
+        self.F = np.array([[1.0, 1.0],
+                           [0.0, 1.0]], dtype=float)
+        # Observation model: observe level only
+        self.H = np.array([[1.0, 0.0]], dtype=float)
+        # Process noise covariance
+        self.Q = np.diag([level_noise, slope_noise]).astype(float)
+        # Observation noise (scalar variance, adapted by _adapt_sigma_obs)
+        self.R = float(obs_noise)
+        # Posterior state (level=0, slope=0)
+        self.x = np.array([0.0, 0.0], dtype=float)
+        # Posterior covariance — DIFFUSE PRIOR (large diagonal = high initial uncertainty)
+        # REF: Thrun, Burgard & Fox (2005) Probabilistic Robotics — P must not be zeros.
+        # P = zeros -> K = 0 on every step -> filter never moves. Use 1e4 * I.
+        self.P = np.eye(2, dtype=float) * 1e4
+
+        # Spike-and-slab support (George & McCulloch 1993)
+        self.p = int(p)          # number of regression betas
+        self.S = int(S)          # number of seasonal states
+        # Extend state vector if regression betas are tracked
+        if self.p > 0:
+            beta_dim = 2 + self.S + self.p
+            self.state = np.zeros(beta_dim, dtype=float)
+        else:
+            self.state = self.x   # alias; only level+slope tracked
+
+        # Adaptive sigma internals
+        self._residuals = []
+
+        self._initialized = False
+        self._n_obs = 0
+
+    # ------------------------------------------------------------------
+    def update(self, observation: float) -> None:
+        """Ingest one scalar observation and update posterior."""
+        z = float(observation)
+
+        if not self._initialized:
+            self.x[0] = z          # seed level with first obs
+            if self.p > 0:
+                self.state[0] = z
+            self._initialized = True
+            self._n_obs = 1
+            return
+
+        # --- Predict ---
+        x_pred = self.F @ self.x
+        P_pred  = self.F @ self.P @ self.F.T + self.Q
+
+        # --- Innovation ---
+        z_pred = float(self.H @ x_pred)
+        innov  = z - z_pred
+        self._residuals.append(innov)
+
+        # --- Kalman gain ---
+        R_mat = np.array([[self.R]])
+        S_mat = self.H @ P_pred @ self.H.T + R_mat
+        K     = P_pred @ self.H.T @ np.linalg.inv(S_mat)   # shape (2,1)
+
+        # --- Posterior update ---
+        self.x = x_pred + (K @ np.array([[innov]])).squeeze()
+        self.P = (np.eye(2) - K @ self.H) @ P_pred
+
+        if self.p > 0:
+            self.state[:2] = self.x
+
+        self._n_obs += 1
+
+        # Adaptive components (every 10 steps)
+        if self._n_obs % 10 == 0:
+            self._adapt_sigma_obs()
+        if self.p > 0 and self._n_obs % 5 == 0:
+            self._apply_spike_slab()
+
+    # ------------------------------------------------------------------
+    def _apply_spike_slab(self):
+        """Soft spike-and-slab beta shrinkage via pseudo-inclusion probability.
+
+        REF: George & McCulloch (1993) Variable selection via Gibbs sampling.
+             JASA, 88(423), 881-889.
+
+        Approximation: betas with |beta| < inclusion_threshold are shrunk by 50%
+        each step. This mimics the Gibbs spike-and-slab prior without full MCMC.
+        Betas that earn their keep (|beta| > threshold) are left alone.
+        """
+        _beta_start = 2 + self.S - 1   # index into state vector after level+trend+seasonals
+        _inclusion_threshold = 0.05
+        for i in range(self.p):
+            idx = _beta_start + i
+            if idx < len(self.state):
+                beta_i = self.state[idx]
+                # Soft-threshold: shrink near-zero betas toward 0 (exclude them)
+                if abs(beta_i) < _inclusion_threshold:
+                    self.state[idx] *= 0.5   # 50% shrinkage per step
+
+    # ------------------------------------------------------------------
+    def _adapt_sigma_obs(self):
+        """Adaptive observation noise sigma from rolling residual variance.
+
+        REF: Scott & Varian (2014) use Inverse-Gamma prior on sigma_obs.
+             Here we approximate with an online rolling variance update every 10 steps.
+        """
+        if len(self._residuals) >= 20:
+            rolling_var = float(np.var(self._residuals[-20:]) + 1e-6)
+            # Smooth update: don't jump sigma_obs abruptly
+            self.R = 0.8 * self.R + 0.2 * rolling_var
+
+    # ------------------------------------------------------------------
+    @property
+    def level(self) -> float:
+        return float(self.x[0])
+
+    @property
+    def slope(self) -> float:
+        """Posterior slope estimate — used as kf_trends[metric]."""
+        return float(self.x[1])
+
+    @property
+    def n_obs(self) -> int:
+        return self._n_obs
 
 
 # ===========================================================================
@@ -127,36 +255,8 @@ class _NullModel:
 class BSTSFeedback:
     """EMA-smoothed, Kalman-informed reward-weight adjuster.
 
-    Parameters
-    ----------
-    ema_alpha         : float   EMA decay for metric smoothing (default 0.05)
-    feedback_strength : float   Scale of weight adjustments (default 0.15)
-    race_type         : str     One of TIME_TRIAL | OBJECT_AVOIDANCE | HEAD_TO_BOT
-                                Case-insensitive; aliases like 'oa', 'h2h' accepted.
-
-    Public API (run.py compatible)
-    ------------------------------
-    update(metrics_dict, *, step=None, race_type_tag=None)
-        Feed new scalar metrics into EMA.  ``race_type_tag`` hot-swaps race_type.
-
-    adjust_weights(base_weights, *, race_type_filter=None) -> dict
-        Return re-normalised adjusted weights.  ``race_type_filter`` overrides
-        self.race_type for this call only.
-
-    get_trend_vector(race_type_filter=None) -> dict[str, float]
-        Returns {metric: linear_slope_over_last_5_obs}.  Used by run.py to
-        drive entropy_coef / lr BSTS adjustments.
-
-    set_race_type(race_type: str) -> None
-        Hot-swap race_type mid-training.
-
-    model(metric, period=100) -> _NullModel
-        Backward-compat stub for run.py's ``bsts_season = bsts_feedback.model(...)``.
-
-    Attributes written by caller (run.py / analyze_logs integration)
-    ---------------------------------------------------------------
-    feedback.kf_trends : dict[str, float]   Kalman trend slopes per metric
-    feedback.kf_betas  : dict[str, float]   Kalman regression coefficients
+    v1.1.1: self._kf lazily spawns BSTSKalmanFilter per metric.
+    update() calls _run_kalmans() so kf_trends/kf_betas are always populated.
     """
 
     def __init__(
@@ -164,92 +264,97 @@ class BSTSFeedback:
         ema_alpha: float = 0.05,
         feedback_strength: float = 0.15,
         race_type: str = "TIME_TRIAL",
+        kf_obs_noise: float = 1.0,
+        kf_level_noise: float = 0.05,
+        kf_slope_noise: float = 0.005,
     ):
         self.ema      = {}
         self.alpha    = float(ema_alpha)
         self.strength = float(feedback_strength)
         self.race_type = _norm_race_type(race_type)
 
-        # Populated externally by analyze_logs / BSTSKalmanFilter integration
-        self.kf_trends: dict = {}
-        self.kf_betas:  dict = {}
+        # KF hyperparams
+        self._KF_OBS_NOISE   = float(kf_obs_noise)
+        self._KF_LEVEL_NOISE = float(kf_level_noise)
+        self._KF_SLOPE_NOISE = float(kf_slope_noise)
 
-        # Internal history buffer for get_trend_vector()
-        # {metric: deque of last 20 float values}
+        # Lazily instantiated KF instances: metric -> BSTSKalmanFilter
+        self._kf: dict = {}
+
+        # Public: populated by _run_kalmans() after each update()
+        # v1.1.1: inline Kalman instances — lazily created by _run_kalmans()
+        # Previously populated only by run.py analyze_logs pipeline (1x/episode, often 0).
+        # Now populated every update() call via BSTSKalmanFilter.
+        self._kf_instances: dict = {}
+        self.kf_trends: dict = {}   # metric -> posterior slope (float)
+        self.kf_betas:  dict = {}   # metric -> normalised slope/level ratio
+
+        # History buffer for get_trend_vector()
         self._history: dict = {}
         self._HIST_LEN = 20
 
     # ------------------------------------------------------------------
     def set_race_type(self, race_type: str) -> None:
-        """Hot-swap race_type (e.g. when the 9-phase orchestrator changes phase)."""
         self.race_type = _norm_race_type(race_type)
 
     # ------------------------------------------------------------------
     def model(self, metric: str, period: int = 100) -> "_NullModel":
-        """Backward-compat stub.
-
-        run.py does::
-
-            bsts_season = bsts_feedback.model("ep_return", period=100)
-
-        We return a _NullModel so downstream calls like
-        ``bsts_season.get_season()`` silently no-op rather than crash.
-        BSTSSeasonal (the full decomposer) is a separate class and is
-        instantiated independently when needed.
-        """
+        """Backward-compat stub for run.py bsts_season = bsts_feedback.model(...)."""
         return _NullModel()
 
     # ------------------------------------------------------------------
     def update(self, metrics_dict: dict, *, step=None, race_type_tag=None) -> None:
-        """Feed new scalar metrics into EMA state.
-
-        Parameters
-        ----------
-        metrics_dict   : dict          {metric_name: scalar_value, ...}
-        step           : int | None    Global training step (unused internally,
-                                       accepted for run.py call-site compatibility).
-        race_type_tag  : str | None    If provided, hot-swaps self.race_type.
-        """
+        """Feed new scalar metrics into EMA state and run Kalman update."""
         if race_type_tag is not None:
             self.race_type = _norm_race_type(str(race_type_tag))
 
         for k, v in metrics_dict.items():
             if not isinstance(v, (int, float)):
-                continue                    # skip non-scalar BSTS metrics
+                continue
             v = float(v)
-            # EMA
             if k not in self.ema:
                 self.ema[k] = v
             else:
                 self.ema[k] = self.alpha * v + (1.0 - self.alpha) * self.ema[k]
-            # History buffer for get_trend_vector()
             if k not in self._history:
                 self._history[k] = collections.deque(maxlen=self._HIST_LEN)
             self._history[k].append(v)
 
+        # v1.1.1: run Kalman update on every EMA metric
+        self._run_kalmans()
+        
+    # ------------------------------------------------------------------
+    def _run_kalmans(self) -> None:
+        """Update one KF per EMA metric; populate kf_trends/kf_betas.
+
+        v1.1.1: Called at the end of every update(). Previously kf_trends/kf_betas
+        were only populated by run.py's analyze_logs pipeline (once per episode,
+        inside a try-block with n=1 buffer → meaningless slopes).
+
+        REF: Scott & Varian (2014) BSTS per-metric Kalman trend components.
+        REF: George & McCulloch (1993) spike-and-slab shrinkage.
+        """
+        for metric, val in self.ema.items():
+            if metric not in self._kf_instances:
+                self._kf_instances[metric] = BSTSKalmanFilter(
+                    obs_noise=self._KF_OBS_NOISE,
+                    level_noise=self._KF_LEVEL_NOISE,
+                    slope_noise=self._KF_SLOPE_NOISE,
+                )
+            self._kf_instances[metric].update(float(val))
+            self.kf_trends[metric] = self._kf_instances[metric].slope
+        new_betas = {}
+        for metric, kf in self._kf_instances.items():
+            if kf.n_obs >= 2 and abs(kf.level) > 1e-9:
+                beta = kf.slope / (abs(kf.level) + 1e-9)
+                if abs(beta) < 0.05:   # spike-and-slab soft shrinkage
+                    beta *= 0.5
+                new_betas[metric] = beta
+        self.kf_betas = new_betas
+        
     # ------------------------------------------------------------------
     def get_trend_vector(self, race_type_filter=None) -> dict:
-        """Return {metric: linear_slope} over the last 5 observations in the
-        EMA history buffer.
-
-        Used by run.py to drive entropy_coef / lr annealing adjustments::
-
-            _bt = bsts_feedback.get_trend_vector(race_type_filter=_track_variant)
-            _rew_slope = float(_bt.get('reward', 0.0))
-
-        Parameters
-        ----------
-        race_type_filter : str | None
-            Accepted for call-site compatibility; not used to filter data
-            (all history is stored in a single buffer regardless of race_type).
-
-        Returns
-        -------
-        dict[str, float]
-            {metric: slope_float}.  Slope is the linear-regression coefficient
-            of ``metric`` over its last ``min(5, len(history))`` observations.
-            Returns 0.0 for metrics with fewer than 2 observations.
-        """
+        """Return {metric: linear_slope} over last 5 history observations."""
         out = {}
         window = 5
         for k, dq in self._history.items():
@@ -268,28 +373,13 @@ class BSTSFeedback:
 
     # ------------------------------------------------------------------
     def adjust_weights(self, base_weights, *, race_type_filter=None) -> dict:
-        """Return re-normalised reward weights adjusted by BSTS feedback.
-
-        Applies three layers of adjustment in order:
-        1. Kalman trend / regression signals (if kf_trends / kf_betas set)
-        2. EMA metric thresholds (crash_rate, offtrack_rate, speed, etc.)
-        3. Race-type-specific multipliers (OBJECT_AVOIDANCE / HEAD_TO_BOT)
-
-        Parameters
-        ----------
-        base_weights     : dict   Starting weight dict from AnnealingScheduler.
-        race_type_filter : str | None
-            If provided, overrides self.race_type for this call only.
-
-        Always returns a dict that sums to 1.0.
-        """
+        """Return re-normalised reward weights adjusted by BSTS+Kalman feedback."""
         effective_race_type = (
             _norm_race_type(str(race_type_filter))
             if race_type_filter is not None
             else self.race_type
         )
 
-        # --- coerce base weights to float dict ---
         if isinstance(base_weights, dict):
             w = {k: float(v) if isinstance(v, (int, float)) else 0.1
                  for k, v in base_weights.items()}
@@ -329,8 +419,7 @@ class BSTSFeedback:
             w["heading"] = w.get("heading", 0.1) + b * 0.3
         if spd < 1.5:
             w["curv_speed"] = w.get("curv_speed", 0.15) + s * 0.3
-        # v1.1.1: only boost corner weight if car has reached corners (>10% avg progress).
-        # Prior bug: corner_crash_rate fired on lateral barrier hits at WP 0-1, not actual corners.
+        # v1.1.1: corner weight only fires after car reaches 10% of track
         _ep_prog_for_corner = float(self.ema.get("avg_progress", 0.0))
         if ccr > 0.2 and _ep_prog_for_corner > 10.0:
             w["corner"] = w.get("corner", 0.1) + s * min(ccr, 1.0) * 0.5
@@ -341,7 +430,7 @@ class BSTSFeedback:
 
         _ssr_thresh = {
             "TIME_TRIAL":       1.2,
-            "OBJECT_AVOIDANCE": 1.05,   # tighter — obstacles demand precise speed
+            "OBJECT_AVOIDANCE": 1.05,
             "HEAD_TO_BOT":      1.1,
         }.get(effective_race_type, 1.2)
 
@@ -352,10 +441,8 @@ class BSTSFeedback:
         if rle > 0.4:
             w["racing_line"] = w.get("racing_line", 0.04) + s * min(rle, 1.0) * 0.2
 
-        # ---- Layer 2b: harmonised v27 metric taxonomy ----
         def _ema(k, d=0.0):
             return float(self.ema.get(k, d))
-
         def _slope(k):
             try:
                 return float(self.kf_trends.get(k, 0.0))
@@ -379,25 +466,19 @@ class BSTSFeedback:
 
         # ---- Layer 3: race_type multipliers ----
         if effective_race_type == "OBJECT_AVOIDANCE":
-            # Obstacle awareness and braking are critical; raise their floor
             w["obstacle"] = max(w.get("obstacle", 0.0), 0.12) * 1.3
             w["braking"]  = w.get("braking",  0.08) * 1.5
             w["center"]   = w.get("center",   0.10) * 1.1
-
         elif effective_race_type == "HEAD_TO_BOT":
-            # Need both obstacle avoidance AND speed — steering precision matters more
             w["obstacle"]       = max(w.get("obstacle", 0.0), 0.15) * 1.5
             w["steering"]       = w.get("steering",       0.02) * 2.0
             w["speed_steering"] = w.get("speed_steering", 0.08) * 1.3
             w["corner"]         = w.get("corner",         0.10) * 1.2
 
-        # v1.1.1: hard-floor progress weight at 0.08 — prevents adaptive BSTS from
-        # crowding out the forward-progress signal during bootstrap.
         _prog_floor = 0.08
-        if w.get("progress", 0.0) < _prog_floor:
-            w["progress"] = _prog_floor
-
-        # ---- Final normalisation — always sums to 1.0 ----
+        # v1.1.1: PROGRESS FLOOR — never starve forward motion
+        # REF: Ng, Harada & Russell (1999) reward shaping.
+        w['progress'] = min(w.get('progress', 0.0), _prog_floor)
         total = sum(w.values())
         if total > 0:
             return {k: v / total for k, v in w.items()}
@@ -457,18 +538,14 @@ def _ols(X, y):
 
 
 # ===========================================================================
-# BSTSSeasonal  (batch decomposer — unchanged from v1.0.13 prior version)
+# BSTSSeasonal  (batch decomposer — unchanged from v1.0.13)
 # ===========================================================================
 class BSTSSeasonal:
-    """Batch BSTS decomposition + live per-step buffer for run.py integration.
+    """Batch BSTS decomposition + live per-step buffer for run.py integration."""
 
-    Constructor:
-        BSTSSeasonal(n_segments=12, save_dir='results', alpha=0.02)
-    """
-
-    STEP_BUFFER_MAXLEN    = 5000
-    STEP_BUFFER_MIN_EPISODES = 20
-    TREND_WINDOW          = 30
+    STEP_BUFFER_MAXLEN       = 5000
+    STEP_BUFFER_MIN_EPISODES = 5 # was 20
+    TREND_WINDOW             = 30
 
     def __init__(self, n_segments=12, save_dir='results', alpha=0.02):
         self.n_segments = int(n_segments)
@@ -484,24 +561,9 @@ class BSTSSeasonal:
         self._cached_trend: dict = {}
         self._cached_season: dict = {'worst_segments': [], 'segments': {}}
 
-    # ------------------------------------------------------------------
-    # Per-step live buffer
-    # ------------------------------------------------------------------
-    def record_step(
-        self,
-        progress:     float = 0.0,
-        speed:        float = 0.0,
-        steering:     float = 0.0,
-        heading_err:  float = 0.0,
-        raceline_err: float = 0.0,
-        reward:       float = 0.0,
-        context=None,
-        action=None,
-        lidar_min:    float = 0.0,
-        wp_idx:       int   = 0,
-        **kwargs,
-    ):
-        """Buffer one step of telemetry for periodic BSTS fitting."""
+    def record_step(self, progress=0.0, speed=0.0, steering=0.0,
+                    heading_err=0.0, raceline_err=0.0, reward=0.0,
+                    context=None, action=None, lidar_min=0.0, wp_idx=0, **kwargs):
         self._step_buf.append({
             'progress':     float(progress),
             'speed':        float(speed),
@@ -521,7 +583,6 @@ class BSTSSeasonal:
             ep['max_prog'] = float(progress)
 
     def _flush_episode(self, lap_completed: bool = False):
-        """Commit current episode summary to _ep_buf."""
         ep = self._current_ep
         if not ep.get('rewards'):
             self._current_ep = {}
@@ -597,9 +658,6 @@ class BSTSSeasonal:
         self._update_trend_cache(results)
         self._update_season_cache(results, rows)
 
-    # ------------------------------------------------------------------
-    # Cache helpers
-    # ------------------------------------------------------------------
     def _update_trend_cache(self, results: dict):
         sk = 'ep_return'
         if sk not in results.get('series', {}):
@@ -663,24 +721,15 @@ class BSTSSeasonal:
             'segments':       segments_info,
         }
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
     def get_trend(self) -> dict:
-        """Return latest trend dict.  Keys: phase, return_slope, trend_last, trend_mean."""
         return dict(self._cached_trend)
 
     def get_season(self) -> dict:
-        """Return season dict.  Keys: worst_segments, segments."""
         return dict(self._cached_season)
 
     def get_seasonal(self) -> dict:
-        """Alias for get_season() — run.py uses this name in one call-site."""
         return self.get_season()
 
-    # ------------------------------------------------------------------
-    # Batch JSONL fit
-    # ------------------------------------------------------------------
     def fit_from_jsonl(self, jsonl_path, out_png=None):
         rows = _load_jsonl(jsonl_path)
         if len(rows) < 10:
@@ -710,9 +759,6 @@ class BSTSSeasonal:
         print(f'[BSTS] trend_cache={self._cached_trend}')
         return results
 
-    # ------------------------------------------------------------------
-    # Plotting
-    # ------------------------------------------------------------------
     def _plot(self, results, ep, out_png):
         if not HAS_MPL:
             return

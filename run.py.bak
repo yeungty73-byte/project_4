@@ -22,7 +22,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from agents import PPOAgent, RandomAgent
 # REF: Schulman, J. et al. (2017). Proximal Policy Optimization Algorithms. arXiv:1707.06347.
-from context_aware_agent import ContextAwarePPOAgent, compute_intermed_targets
+from context_aware_agent import ContextAwarePPOAgent
 from failure_analysis import FailurePointSampler
 from brake_field import BrakeField
 # REF: Sutton, R. S. & Barto, A. G. (2018). Reinforcement Learning: An Introduction (2nd ed.). MIT Press.
@@ -205,25 +205,94 @@ def obs_to_array(obs):
     return np.array(obs)
 
 
-def obs_to_2d_img(obs, H=120, W=160):
-    """v1.1.0: Restore DeepRacer camera obs back to 2D spatial tensor (H,W).
-    DeepRacer camera: 120x160 grayscale = 19200 floats (first slice of flat obs).
-    Gemini (2026-04-25) confirmed: spatial structure required for Swin-style attention.
-    The SelfAttention1D in utransformer.py operates on 1D sequences, but shifted-window
-    attention needs 2D grid topology. This function gives a safe reshape entry point.
-    Returns: np.ndarray (H, W) float32, or None if obs too short.
-    """
-    flat = obs_to_array(obs)
-    n = H * W  # 19200
-    if flat.size < n:
-        return None
-    return flat[:n].reshape(H, W).astype(np.float32)
-
-
 
 # ============================================================
 # Meta-Annealing Scheduler (3 dimensions)
 # ============================================================
+'''
+class BSTSFeedback:
+    def __init__(self,ema_alpha=0.05,feedback_strength=0.15):
+        self.ema={}
+        self.alpha=ema_alpha
+        self.strength=feedback_strength
+
+    def update(self,metrics_dict):
+        for k,v in metrics_dict.items():
+            if not isinstance(v,(int,float)):  # v34: skip non-scalar BSTS metrics
+                continue
+            v=float(v)
+            if k not in self.ema: self.ema[k]=v
+            else: self.ema[k]=self.alpha*v+(1-self.alpha)*self.ema[k]
+
+    def adjust_weights(self,base_weights):
+        """BSTS Kalman-filter-informed reward weight adjustment.
+        Uses trend decomposition to identify whether metrics are structurally
+        improving or degrading, and regression coefficients to identify
+        which intermediary metrics (curvature, perp_v, brake_zone) drive outcomes."""
+        w={k:(float(v) if isinstance(v,(int,float)) else 0.1) for k,v in (base_weights.items() if isinstance(base_weights,dict) else [])}  # v34: coerce to float
+        cr=self.ema.get("crash_rate",0)
+        otr=self.ema.get("offtrack_rate",0)
+        spd=self.ema.get("avg_speed",2.0)
+        ccr=self.ema.get("corner_crash_rate",0)
+        s=self.strength
+        # Kalman BSTS trend adjustment (if available)
+        if hasattr(self, "kf_trends") and self.kf_trends:
+            for metric, trend_val in self.kf_trends.items():
+                if metric == "crash_rate" and trend_val > 0.01:  # crash trending up
+                    w["obstacle"] = w.get("obstacle", 0.1) + s * 0.3
+                    w["center"] = w.get("center", 0.1) + s * 0.2
+                elif metric == "off_track_rate" and trend_val > 0.01:
+                    w["center"] = w.get("center", 0.1) + s * 0.4
+                    w["heading"] = w.get("heading", 0.1) + s * 0.3
+        # Intermediary metric regression coefficients
+        if hasattr(self, "kf_betas") and self.kf_betas:
+            for metric, beta in self.kf_betas.items():
+                if "perp_velocity" in metric and abs(beta) > 0.1:
+                    w["speed_steering"] = w.get("speed_steering", 0.08) + s * abs(beta) * 0.2
+                if "brake_zone" in metric and abs(beta) > 0.1:
+                    w["progress"] = w.get("progress", 0.12) + s * abs(beta) * 0.15
+        if cr>0.3:
+            b=s*min(cr,1.0); w["obstacle"]=w.get("obstacle",0.1)+b*0.5; w["center"]=w.get("center",0.1)+b*0.3
+        if otr>0.2:
+            b=s*min(otr,1.0); w["center"]=w.get("center",0.1)+b*0.4; w["heading"]=w.get("heading",0.1)+b*0.3
+        if spd<1.5: w["curv_speed"]=w.get("curv_speed",0.15)+s*0.3
+        if ccr>0.2: w["corner"]=w.get("corner",0.1)+s*min(ccr,1.0)*0.5
+        ssr=self.ema.get("avg_safe_speed_ratio",1.0)
+        if ssr>1.2: w["safe_speed"]=w.get("safe_speed",0.06)+s*min(ssr-1.0,0.5)*0.3
+        ter=self.ema.get("avg_turn_entry_ratio",1.0)
+        if ter>1.1: w["safe_speed"]=w.get("safe_speed",0.06)+s*0.2
+        rle=self.ema.get("avg_racing_line_err",0)
+        if rle>0.4: w["racing_line"]=w.get("racing_line",0.04)+s*min(rle,1.0)*0.2
+        # --- v27 harmonized reinforcement: use new metric taxonomy when available ---
+        # All 12 metrics operationalized so UP==GOOD; if EMA trend is DOWN, boost weights.
+        def _ema(k, d=0.0):
+            return float(self.ema.get(k, d))
+        def _slope(k):
+            # Kalman trend for harmonized metric if tracked by bsts_seasonal, else 0.
+            try:
+                return float(self.kf_trends.get(k, 0.0)) if hasattr(self,'kf_trends') else 0.0
+            except Exception:
+                return 0.0
+        # Success metric regression (progress, avg_speed_centerline, race_line_gradient_compliance)
+        if _ema('race_line_gradient_compliance', 0.5) < 0.5 or _slope('race_line_gradient_compliance') < -0.005:
+            w['racing_line'] = w.get('racing_line', 0.04) + s * 0.25
+        if _ema('avg_speed_centerline', 0.0) > 0 and _slope('avg_speed_centerline') < -0.01:
+            w['progress'] = w.get('progress', 0.12) + s * 0.20
+        # Intermediary regression (jerk_rms up=good; corner entry/exit up=good)
+        if _slope('jerk_rms') < -0.01:
+            w['jerk'] = w.get('jerk', 0.03) + s * 0.15  # reinforce intentional dynamics
+        if _slope('late_corner_entry') < -0.01 or _slope('early_corner_exit') < -0.01:
+            w['corner'] = w.get('corner', 0.10) + s * 0.30
+        if _ema('brake_field_compliance', 0.5) < 0.4:
+            w['braking'] = w.get('braking', 0.08) + s * 0.25
+        if _slope('steer_speed_coordination') < -0.01:
+            w['speed_steering'] = w.get('speed_steering', 0.08) + s * 0.15
+        # Waypoint coverage (up=good). If coverage trend is down, progress reward up.
+        if _slope('waypoint_coverage') < -0.005:
+            w['progress'] = w.get('progress', 0.12) + s * 0.10
+        t=sum(w.values())
+        return {k:v/t for k,v in w.items()} if t>0 else w
+'''
 # REF: Almakhayita, S. K. et al. (2025). Reward design and hyperparameter tuning for generalizable deep RL agents. PLoS ONE, 20(6).
 class AnnealingScheduler:
     """Manages 3 annealing dimensions: reward_weights, hyperparams, architecture."""
@@ -575,7 +644,7 @@ def _apply_phase_env(args, phase, current_env=None):
 HTM_PILOT_EPISODES = 50   # collect 50 clean HTM completions
 MIN_PILOT_PROGRESS = 80.0  # only keep episodes that hit 80%+
 
-def harvest_htm_pilots(env, htm_agent, td3sac, n_episodes=12, min_progress=2.0):  # v1.1.4: default lowered from 5.0
+def harvest_htm_pilots(env, htm_agent, td3sac, n_episodes=12, min_progress=5.0):
     """
     Run deterministic pilot and seed replay for BC/TD3.
     v1.1.1 fixes:
@@ -607,18 +676,8 @@ def harvest_htm_pilots(env, htm_agent, td3sac, n_episodes=12, min_progress=2.0):
                 next_rp, _bc_progress_cache, _bc_progress_state)
             ep_prog = max(ep_prog, float(prog_pct))
             act_t = torch.tensor(np.asarray(action), dtype=torch.float32)
-            # v1.1.4: store RAW obs in replay — agent encoder expects obs_dim=38464 (raw flat array).
-            # v1.1.3 compact12 fix resolved NameError but introduced shape mismatch (256x12 vs 38464x128).
-            # compact12 is used only for lightweight reward-shaping signals, NOT for TD3/actor training.
-            # REF: AWS (2020) — DeepRacer obs_space is flat float32 of shape (38464,).
-            obs_t  = torch.tensor(obs_to_array(obs),      dtype=torch.float32)
+            obs_t = torch.tensor(obs_to_array(obs), dtype=torch.float32)
             nobs_t = torch.tensor(obs_to_array(next_obs), dtype=torch.float32)
-            # v1.1.0: normalize pixel obs before replay storage to prevent critic NaN
-            # Raw DeepRacer obs values are in [0,255]; must be [0,1] for stable critic training.
-            _obs_scale = obs_t.abs().max().item()
-            if _obs_scale > 2.0:
-                obs_t  = obs_t  / max(_obs_scale, 1.0)
-                nobs_t = nobs_t / max(nobs_t.abs().max().item(), 1.0)
             _bc_reward = float(max(-10.0, min(10.0, reward)))
             ep_buf.append((obs_t, act_t, _bc_reward, nobs_t, float(terminated or truncated)))
             obs, rp = next_obs, next_rp
@@ -638,27 +697,15 @@ def pretrain_td3_bc(td3sac, ppo_agent, bc_steps=2000):
     Supervised pre-training: minimize |Q(s,a_htm) - r + γ·min_Q(s')| on BC buffer.
     No policy noise — these are expert actions, not noisy TD3 rollouts.
     """
-    _nan_streak = 0
     for step in range(bc_steps):
         if len(td3sac.replay) < 256:
             break
-        # v1.1.0: policy_noise=0.05 — target policy smoothing essential for Q stability
-        # REF: Fujimoto et al. (2018) §4.2
-        result = td3sac.update_critics(ppo_agent, batch_size=256, policy_noise=0.05)
-        _cl = result.get('critic_loss', 0.0)
-        # v1.1.0: NaN streak bail-out — if obs are corrupted, abort early instead of 
-        # wasting 8 min of CPU. After 20 consecutive NaN batches, the replay is poisoned.
-        if not (isinstance(_cl, float) and _cl == _cl):  # float nan check
-            _nan_streak += 1
-            if _nan_streak >= 20:
-                logger.warning(f"[BC pretrain] NaN streak={_nan_streak} at step {step} — "
-                               f"aborting pretrain. Check obs normalization.")
-                break
-        else:
-            _nan_streak = 0
+        # v1.1.0: policy_noise=0.0 → exact same target action every pass → Q diverges → NaN
+        # REF: Fujimoto et al. (2018) §4.2 — target policy smoothing is essential for stability
+        result = td3sac.update_critics(ppo_agent, batch_size=256, policy_noise=0.05)  # no noise on BC
         if step % 200 == 0:
-            logger.info(f"BC pretrain step {step}: critic_loss={_cl:.4f}, "
-                        f"replay_size={result.get('replay_size',0)}, nan_streak={_nan_streak}")
+            logger.info(f"BC pretrain step {step}: critic_loss={result.get('critic_loss',0):.4f}, "
+                        f"replay_size={result.get('replay_size',0)}")
     logger.info("BC pre-training complete — TD3 critics bootstrapped on expert trajectories")
 
 def preflightgymbridge():
@@ -733,44 +780,33 @@ class BCPilot:
 
         # --- Heading recovery: if >45deg off track tangent, align first ---
         hdiff = self._heading_to_track(rp)
-        if abs(hdiff) > 15.0:
-            # v1.1.1: threshold 25deg->15deg; gain /45 (was /60); throttle 0.35->0.15
-            # ROOT CAUSE: car spawns at -77.7deg from track tangent. At throttle=0.35 + speed=4m/s,
-            # steer=1.0 cannot overcome lateral momentum -> car slides into barrier unrecovered.
-            # Fix: slow crawl during realignment so steering torque actually bites.
+        if abs(hdiff) > 45.0:
+            # Hard steer toward track direction; moderate throttle to keep moving
             steer_sign = -1.0 if hdiff > 0 else 1.0
-            steer_strength = min(1.0, abs(hdiff) / 45.0)  # v1.1.1: sharper corrective gain
-            return _np.array([steer_sign * steer_strength, 0.15], dtype=_np.float32)  # v1.1.1: slow crawl
+            steer_strength = min(1.0, abs(hdiff) / 90.0)
+            # v1.1.1: env space throttle [0,1]
+            return _np.array([steer_sign * steer_strength, 0.35], dtype=_np.float32)
 
         # --- Reversal recovery ---
         if is_reversed:
-            # v1.1.1: reversed + large hdiff -> compound error needs stronger steer + slow throttle.
-            # At reversed=-180deg AND spawn hdiff=-77.7deg, /90 gain was too gentle.
-            hdiff_rev = self._heading_to_track(rp)
-            steer_rev = _np.clip(-hdiff_rev / 60.0, -1.0, 1.0)   # v1.1.1: sharper gain /60 (was /90)
-            _rev_throttle = 0.20 if abs(hdiff_rev) > 30.0 else 0.35  # v1.1.1: slow when misaligned
-            return _np.array([steer_rev, _rev_throttle], dtype=_np.float32)
+            # Countersteer and brake gently to kill reverse momentum
+            return _np.array([0.0, 0.05], dtype=_np.float32)  # near-zero throttle, no steer
 
         # --- Normal racing line control ---
-        # v1.1.0: speed-adaptive lookahead — faster speed = look further ahead
-        # At 1.6m/s (slow): 8 wps; at 4m/s (max): 20 wps. Prevents late-braking.
-        _la_wps = max(8, min(20, int(speed * 5)))
         try:
             _, _, safe_speed, dist_to_corner = lookahead_curvature_scan(
-                waypoints, closest, max_lookahead=_la_wps
+                waypoints, closest, max_lookahead=15
             )
         except Exception:
             safe_speed, dist_to_corner = 2.5, 5.0
 
         try:
-            rl_offset = compute_racing_line_offset(waypoints, closest, tw, lookahead=max(6, _la_wps // 2))
+            rl_offset = compute_racing_line_offset(waypoints, closest, tw)
         except Exception:
             rl_offset = 0.0
 
         lat_err = (rl_offset * tw / 2.0) - dist_ctr * (1 if is_left else -1)
-        # v1.1.0: track-width-adaptive steering gain — prevents overcorrection on narrow tracks
-        _steer_gain = max(0.8, min(1.5, 0.6 / max(tw, 0.3)))
-        steering = float(_np.clip(lat_err / max(tw * 0.5, 0.01) * _steer_gain, -1.0, 1.0))
+        steering = float(_np.clip(lat_err / max(tw * 0.5, 0.01) * 1.5, -1.0, 1.0))
 
         # v1.1.1: throttle directly in env space [0,1] — NO process_action remapping
         # braker<0.4 → needs to brake → throttle=0.05 (near zero)
@@ -781,15 +817,12 @@ class BCPilot:
         except Exception:
             braker = 1.0 if speed < safe_speed * 0.95 else 0.5
 
-        # v1.1.0: multiplicative throttle — no subtractive penalties (freeze trap avoided)
-        # braker in [0,1]: 1=free (max speed), 0=hard-brake. Multiplicative attenuation:
-        #   throttle = base * (floor_frac + (1-floor_frac) * braker)
-        # floor_frac=0.40 → at braker=0: 0.55*0.40=0.22 (never stops); at braker=1: 0.55
-        # REF: Ng et al. (1999) reward shaping — avoid policies that exploit negative signals.
-        _throttle_base = 0.55 if speed < safe_speed * 0.85 else 0.42
-        _floor_frac = 0.40  # v1.1.0: raised from 0.33→0.40; floor is ~0.22, not 0.18
-        throttle = _throttle_base * (_floor_frac + (1.0 - _floor_frac) * float(braker))
-        throttle = max(0.22, throttle)  # hard floor — car must always creep forward
+        if braker < 0.4:
+            throttle = 0.05   # v1.1.1: was -0.5 (tanh space) → became 0.25 env (still throttling!)
+        elif speed < safe_speed * 0.85:
+            throttle = 0.80   # v1.1.1: was 0.8 tanh → (0.8+1)/2=0.9 env. Now direct 0.8.
+        else:
+            throttle = 0.45   # v1.1.1: was 0.4 tanh → (0.4+1)/2=0.7 env. Now direct 0.45.
 
         return _np.array([steering, throttle], dtype=_np.float32)
 
@@ -1393,10 +1426,9 @@ def run(hparams):
             track_width=float(_init_rp.get("track_width", 0.6)),
             track_variant=_track_variant,
         )
-        # v1.1.4: min_progress=2.0 — accept near-any motion; BCPilot tops out at 5-25%
         n_harvested = harvest_htm_pilots(env, htm_pilot, td3sac,
-                                         n_episodes=12, min_progress=2.0)
-        if n_harvested >= 5:  # v1.1.4: was 10 — BCPilot only hits 5-12 successful eps
+                                         n_episodes=12, min_progress=5.0)
+        if n_harvested >= 10:
             pretrain_td3_bc(td3sac, agent, bc_steps=2000)
     except ImportError:
         # BCPilot: internal fallback, no external dependency
@@ -1412,8 +1444,8 @@ def run(hparams):
                 track_variant=_track_variant,
             )
             n_harvested = harvest_htm_pilots(env, _bc_pilot, td3sac,
-                                             n_episodes=12, min_progress=2.0)  # v1.1.4: lowered from 5.0
-            if n_harvested >= 5:  # v1.1.4: was 10 — BCPilot only hits 5-12 successful eps
+                                             n_episodes=12, min_progress=5.0)
+            if n_harvested >= 10:
                 pretrain_td3_bc(td3sac, agent, bc_steps=2000)
         else:
             logger.warning("[BC] waypoints empty at init — skipping BC harvest")
@@ -1429,8 +1461,8 @@ def run(hparams):
                 track_variant=_track_variant,
             )
             n_harvested = harvest_htm_pilots(env, _bc_pilot, td3sac,
-                                             n_episodes=12, min_progress=2.0)  # v1.1.4: lowered from 5.0  # v1.1.0: was 50/80 — too strict, never seeds replay
-            if n_harvested >= 5:  # v1.1.4: was 10 — BCPilot only hits 5-12 successful eps
+                                             n_episodes=12, min_progress=5.0)  # v1.1.0: was 50/80 — too strict, never seeds replay
+            if n_harvested >= 10:
                 pretrain_td3_bc(td3sac, agent, bc_steps=2000)
         else:
             logger.warning("[BC] waypoints empty at init — skipping BC harvest")
@@ -2143,7 +2175,7 @@ def run(hparams):
                 elif ep_in_recovery and _dist_from_center < 0.2 * _tw: ep_in_recovery = False
                 if ep_in_recovery: ep_recovery_steps += 1
                 if len(ep_heading_diffs)>=2 and abs(ep_heading_diffs[-1])>5.0 and abs(ep_heading_diffs[-2])<=5.0: ep_turn_entry_speeds.append(_speed_ratio)
-            # Track corner speeds (high heading diff = corner)
+        # Track corner speeds (high heading diff = corner)
             if len(ep_heading_diffs) > 0 and abs(ep_heading_diffs[-1]) > 5.0:
                 ep_corner_speeds.append(_speed)
             # Track graze events (curb context but still on track)
@@ -2184,10 +2216,7 @@ def run(hparams):
                 step=global_step,
                 race_type_tag=_track_variant,
             )
-            if episode_count % 10 == 0:
-                print(f"[KALMAN_CHECK] n_kfs={len(bsts_feedback._kf_instances)}, "
-                    f"kf_trends={dict(list(bsts_feedback.kf_trends.items())[:3])}")
-                
+
             _rl_blend = min(1.0, _rl_blend + _rl_blend_rate)
             _step_speed_snap = _speed  # v1.1.1: update AFTER reward, ensures next step sees correct prev speed
             rewards[step] = tensor(np.array(reward))
@@ -2221,10 +2250,6 @@ def run(hparams):
                 # v1.1.0: removed duplicate update_episode (was using metres not pct) — single call above
                 lap_time_sec = time.time() - ep_start_time  # v24: wall-clock episode time
                 episode_count += 1
-                # v1.1.1: SAC alpha update — was never called, alpha stuck at 1.0
-                if hasattr(td3sac, 'update_alpha') and len(logprobs) > 0:
-                    _mean_logprob = float(logprobs[:ep_step_count].mean().item())
-                    td3sac.update_alpha(_mean_logprob)
                 # --- v6: episode stuck update ---
                 # v1.1.0: progressive escaped threshold — starts at 5% (early training), grows to 20%
                 _t_frac_ep = global_step / max(total_timesteps, 1)
@@ -2461,16 +2486,8 @@ def run(hparams):
                             'smoothness_jerk_rms':  float(_hm_out.get('smoothness_jerk_rms', 0.0)),
                         })
                     bsts_feedback.update(bsts_metrics)
-                    if episode_count % 10 == 0:
-                        print(f"[KALMAN_CHECK] n_kfs={len(bsts_feedback._kf_instances)}, "
-                            f"kf_trends={dict(list(bsts_feedback.kf_trends.items())[:3])}")
                 # --- Compute BSTS-adjusted reward weights ---
-                # v1.1.1: skip BSTS weight adjustment during bootstrap.
-                # BSTS was overwriting bootstrap progress weights -> rw_adj:prog collapsed 0.127->0.026.
-                if _bootstrap_active:
-                    _adjusted_rw = rw  # bootstrap weights unchanged during bootstrap phase
-                else:
-                    _adjusted_rw = bsts_feedback.adjust_weights(rw)
+                _adjusted_rw = bsts_feedback.adjust_weights(rw)
                 # --- Rich BSTS console log every episode ---
                 _bsts_ctx = f"ctx=clear:{bsts_metrics.get('ctx_clear_ratio',0):.2f}/curb:{bsts_metrics.get('ctx_curb_ratio',0):.2f}/obs:{bsts_metrics.get('ctx_obstacle_ratio',0):.2f}"
                 print(
@@ -2528,9 +2545,8 @@ def run(hparams):
                     summary['crash_rate'] = 1.0 if term_reason == 'crashed' else 0.0
                     _kf_episode_buffer.append(summary)
                     if hasattr(bsts_feedback, "_all_summaries"): bsts_feedback._all_summaries.append(summary)
-                    # v1.1.1: flush Kalman every episode (was 10). Eps are 14-29 steps each;
-                    # at batch=10, Kalman was dead (all zeros) for 200+ episodes.
-                    if len(_kf_episode_buffer) >= 1:
+                    # Run Kalman filter update every 10 episodes
+                    if len(_kf_episode_buffer) >= 10:
                         # import numpy as np  # use global
                         reg_names = [f'{m}_mean' for m in INTERMEDIARY_METRICS]
                         n = len(_kf_episode_buffer)
@@ -2592,11 +2608,9 @@ def run(hparams):
                                 logger.info(f"[RaceLine] perp_v={_rl_score.get(chr(39)+chr(97)+chr(118)+chr(103)+chr(95)+chr(112)+chr(101)+chr(114)+chr(112)+chr(95)+chr(118)+chr(39), 0):.4f}")
                             except Exception as _re:
                                 logger.debug(f"Race line analysis skip: {_re}")
-                        logger.info(f"[BSTS-Kalman] trends={bsts_feedback.kf_trends} betas_top={dict(list(bsts_feedback.kf_betas.items())[:3])}")
+                        print(f"[BSTS-Kalman] trends={bsts_feedback.kf_trends}")
                 except Exception as e:
-                    # v1.1.0: was bare `pass` — silent death of ALL Kalman signal.
-                    # Now logs at DEBUG so we can see what's failing without spamming console.
-                    logger.debug(f"[BSTS-Kalman] update failed ep={episode_count}: {type(e).__name__}: {e}")
+                    pass  # BSTS update failure is non-fatal
 
                                 # TensorBoard context/crash/barrier scalars — only when we have context data
                 if ep_context_preds:
@@ -2838,19 +2852,7 @@ def run(hparams):
                     _alpha_optim.zero_grad(); _alpha_loss.backward(); _alpha_optim.step()
                     hp['ent_coef'] = float(_log_alpha.exp().detach().clamp(0.01, 1.0))
                 ctx_loss = torch.nn.functional.cross_entropy(new_ctx_logits, b_context_labels[mb_inds])
-                # v1.1.1: add intermed_loss so the intermediary head actually learns
-                # REF: Hettiarachchi et al. (2024) U-Transformer auxiliary losses.
-                _intermed_targets_mb = compute_intermed_targets(
-                    {}, race_line_engine=race_line_eng if 'race_line_eng' in dir() else None
-                ).to(device).unsqueeze(0).expand(len(mb_inds), -1)
-                _intermed_loss = torch.nn.functional.mse_loss(
-                    _new_intermed, _intermed_targets_mb.detach()
-                )
-                loss = (0.3 * pg_loss
-                        - hp['ent_coef'] * entropy_loss
-                        + vf_coef * v_loss
-                        + 0.1 * ctx_loss
-                        + 0.05 * _intermed_loss)
+                loss = 0.3 * pg_loss - hp['ent_coef'] * entropy_loss + vf_coef * v_loss + 0.1 * ctx_loss
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -2869,23 +2871,14 @@ def run(hparams):
                 # --- v20: TD3 actor update (PRIMARY policy optimizer) ---
                 if global_step % (_td3sac_update_freq * 2) == 0:
                     _td3_actor = td3sac.update_actor(agent, batch_size=256)
-                    print(f"[TD3_ACTOR] obs_max={obs_b.abs().max():.2f}, "
-                        f"bc_loss={bc_loss.item():.4f}, finite={torch.isfinite(bc_loss)}")
-                    # v1.1.1: use td3_ready flag; blend bc_loss into PPO loss
-                    # rather than running a separate optimizer step (avoids
-                    # double-stepping the optimizer and corrupting GAE returns).
-                    # REF: Fujimoto et al. (2021) TD3+BC §3 — lambda * BC term.
-                    if _td3_actor.get("td3_ready") and _td3_actor.get("td3_bc_loss") is not None:
-                        _td3_bc = _td3_actor["td3_bc_loss"]
-                        if torch.isfinite(_td3_bc):
-                            # Blend into current minibatch loss (loss was already .backward()'d
-                            # above — we need a fresh backward for the bc term only)
-                            optimizer.zero_grad()
-                            (0.05 * _td3_bc).backward()
-                            torch.nn.utils.clip_grad_norm_(agent.parameters(), 0.5)
-                            optimizer.step()
-                            writer.add_scalar("td3sac/actor_bc_loss", _td3_actor["td3_bc_loss_val"], global_step)
-                            writer.add_scalar("td3sac/q1_mean_actor", _td3_actor["td3_q1_mean"], global_step)
+                    if isinstance(_td3_actor.get("td3_actor_loss"), torch.Tensor):
+                        td3_actor_loss_t = _td3_actor["td3_actor_loss"]
+                        optimizer.zero_grad()
+                        (0.7 * td3_actor_loss_t).backward()
+                        torch.nn.utils.clip_grad_norm_(agent.parameters(), 0.5)
+                        optimizer.step()
+                        writer.add_scalar("td3sac/actor_loss", _td3_actor["td3_actor_loss_val"], global_step)
+                        writer.add_scalar("td3sac/q1_mean", _td3_actor["td3_q1_mean"], global_step)
 
             if target_kl is not None and approx_kl > target_kl:
                 break

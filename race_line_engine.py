@@ -279,10 +279,9 @@ class MultiRaceLineEngine:
     # ------------------------------------------------------------------
     # Dynamic line updates
     # ------------------------------------------------------------------
-    def update_obstacle_line(self, wp_idx: int, lidar_min: float,
-                              barrier_prox: float, nearest_obj: float,
-                              context: int,
-                              car_x: float = 0.0, car_y: float = 0.0):
+    def update_obstacle_line(self, wp_idx, lidar_min, barrier_prox,
+                             nearest_obj, context, car_x=0.0, car_y=0.0,
+                             swin_clearance=None):   # v1.1.0
         """Shift obstacle-avoidance line using:
           - Object type -> known half-width -> minimum safe clearance
           - Object-permanence angle -> scale shift magnitude
@@ -311,7 +310,16 @@ class MultiRaceLineEngine:
             if car_x != 0.0 or car_y != 0.0:
                 vis = closest_obs.visible_angle_from(car_x, car_y)
                 raw_shift *= min(2.0, 1.0 + vis / math.pi)
-            new_off = -tt_off + raw_shift * np.sign(-tt_off + 1e-6)
+            # v1.1.0: use Swin left/right clearance to pick avoidance direction
+            if (swin_clearance is not None and len(swin_clearance) >= 3
+                    and closest_obs is not None):
+                left_c  = float(swin_clearance[1])
+                right_c = float(swin_clearance[2])
+                # steer toward clearer side
+                _avoid_sign = 1.0 if left_c >= right_c else -1.0
+            else:
+                _avoid_sign = np.sign(-tt_off + 1e-6)
+            new_off = tt_off + raw_shift * _avoid_sign 
             new_off = float(np.clip(new_off, -max_off, max_off))
         elif context == 1 and lidar_min < 0.4:
             # Curb: pull toward center proportionally
@@ -389,6 +397,7 @@ class MultiRaceLineEngine:
         own_progress: float = 0.0,
         car_x: float = 0.0,
         car_y: float = 0.0,
+        swin_clearance: np.ndarray = None,   # v1.1.0: [front,left,right,rear]
     ) -> Tuple[float, Dict]:
         if not self._initialized or not self._lines:
             return 0.0, {}
@@ -413,10 +422,19 @@ class MultiRaceLineEngine:
                 total_r += wt * r
         # Proximity penalty
         _lidar_s  = float(np.clip(lidar_min, 0.0, 1.0))
-        _obj_s    = min(1.0, nearest_obj / 1.5) if nearest_obj > 0 else 0.0
-        _prox     = 0.5 + 0.5 * min(_lidar_s, _obj_s)
+        _obj_s    = min(1.0, nearest_obj/1.5) if nearest_obj > 0 else 1.0
+        _prox_raw = 0.5 + 0.5 * min(_lidar_s, _obj_s)
+        # v1.1.0: Swin clearance gate — multiplicative, no freeze trap
+        if swin_clearance is not None and len(swin_clearance) >= 3:
+            front_c = float(np.clip(swin_clearance[0], 0.0, 1.0))
+            lat_c   = float(np.clip(min(swin_clearance[1],swin_clearance[2]), 0.0, 1.0))
+            swin_gate = (0.4 + 0.6*front_c) * (0.7 + 0.3*lat_c)
+        else:
+            swin_gate = 1.0
+        _prox = float(np.clip(_prox_raw * swin_gate, 0.05, 1.0))
         total_r  *= _prox
         line_rewards['proximity'] = _prox
+        line_rewards['swin_gate'] = swin_gate
         return float(total_r), line_rewards
 
     def get_target_speed(self, wp_idx: int, context: int) -> float:
@@ -430,3 +448,92 @@ class MultiRaceLineEngine:
         self._initialized = False
         self._lines       = {}
         self._objects     = []
+
+
+# ============================================================
+# v1.2.0: BC Pilot interface additions
+# ============================================================
+
+def get_active_line_for_bc_pilot(
+    engine,
+    wp_idx: int,
+    car_x: float,
+    car_y: float,
+    car_speed: float,
+    car_heading_rad: float,
+    context: int = 0,
+    bot_progress: float = 0.0,
+    own_progress: float = 0.0,
+) -> dict:
+    """v1.2.0: single query point for BCPilot.act() to get active race line data.
+
+    context: 0=clear, 1=curb, 2=obstacle, 3=bot-nearby
+
+    Returns dict with:
+      target_offset  : signed lateral offset from centreline (m)
+      target_speed   : optimal speed at this WP (m/s)
+      target_heading : track tangent (rad)
+      active_line    : which line is dominant
+      brake_zone     : bool — upcoming WPs need lower speed (pre-braking cue)
+
+    REF: Heilmeier et al. (2020) Race-line speed targets as natural braking cues.
+    REF: Betz et al. (2022) Autonomous racing survey. arXiv:2202.07008.
+    """
+    import numpy as _np
+    if not getattr(engine, '_initialized', False) or not getattr(engine, '_lines', {}):
+        return dict(target_offset=0.0, target_speed=2.0, target_heading=0.0,
+                    active_line='time_trial', brake_zone=False)
+
+    LINE_TT  = 'time_trial'
+    LINE_OBS = 'obstacle_avoid'
+    LINE_BOT = 'bot_overtake'
+
+    if context == 2 and LINE_OBS in engine._lines:
+        active_name = LINE_OBS
+    elif context == 3 and LINE_BOT in engine._lines and abs(own_progress - bot_progress) < 15.0:
+        active_name = LINE_BOT
+    else:
+        active_name = LINE_TT
+
+    if active_name not in engine._lines:
+        active_name = LINE_TT
+    if active_name not in engine._lines:
+        return dict(target_offset=0.0, target_speed=2.0, target_heading=0.0,
+                    active_line='time_trial', brake_zone=False)
+
+    line = engine._lines[active_name]
+    n    = engine.n
+    idx  = wp_idx % n
+    target_offset  = float(line.offsets[idx])
+    target_speed   = float(line.speeds[idx])
+    target_heading = float(line.headings[idx])
+
+    # Brake-zone lookahead: speed-adaptive
+    brake_zone = False
+    la = max(6, min(24, int(car_speed * 6)))
+    for j in range(1, la + 1):
+        nidx = (idx + j) % n
+        if line.speeds[nidx] < car_speed * 0.85:
+            brake_zone = True
+            break
+
+    return dict(
+        target_offset=target_offset,
+        target_speed=target_speed,
+        target_heading=target_heading,
+        active_line=active_name,
+        brake_zone=brake_zone,
+    )
+
+
+def get_speed_targets_array(engine) -> "np.ndarray | None":
+    """v1.2.0: export time_trial speed targets for BrakeField.set_waypoints().
+    Returns np.ndarray(N,) or None if engine not initialized.
+    """
+    import numpy as _np
+    if not getattr(engine, '_initialized', False):
+        return None
+    LINE_TT = 'time_trial'
+    if LINE_TT not in getattr(engine, '_lines', {}):
+        return None
+    return engine._lines[LINE_TT].speeds.copy()
