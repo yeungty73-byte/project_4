@@ -177,8 +177,11 @@ class BSTSKalmanFilter:
         P_pred  = self.F @ self.P @ self.F.T + self.Q
 
         # --- Innovation ---
-        z_pred = float(self.H @ x_pred)
-        innov  = z - z_pred
+        # H is shape (1,2), x_pred is shape (2,) → H@x_pred is shape (1,)
+        # float() requires a 0-d array, NOT a 1-d array of length 1.
+        # Fix: index [0] to extract the scalar element first.
+        z_pred = float((self.H @ x_pred)[0])
+        innov = z - z_pred
         self._residuals.append(innov)
 
         # --- Kalman gain ---
