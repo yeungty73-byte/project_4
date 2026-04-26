@@ -329,7 +329,10 @@ class BSTSFeedback:
             w["heading"] = w.get("heading", 0.1) + b * 0.3
         if spd < 1.5:
             w["curv_speed"] = w.get("curv_speed", 0.15) + s * 0.3
-        if ccr > 0.2:
+        # v1.1.1: only boost corner weight if car has reached corners (>10% avg progress).
+        # Prior bug: corner_crash_rate fired on lateral barrier hits at WP 0-1, not actual corners.
+        _ep_prog_for_corner = float(self.ema.get("avg_progress", 0.0))
+        if ccr > 0.2 and _ep_prog_for_corner > 10.0:
             w["corner"] = w.get("corner", 0.1) + s * min(ccr, 1.0) * 0.5
 
         ssr = self.ema.get("avg_safe_speed_ratio", 1.0)
@@ -387,6 +390,12 @@ class BSTSFeedback:
             w["steering"]       = w.get("steering",       0.02) * 2.0
             w["speed_steering"] = w.get("speed_steering", 0.08) * 1.3
             w["corner"]         = w.get("corner",         0.10) * 1.2
+
+        # v1.1.1: hard-floor progress weight at 0.08 — prevents adaptive BSTS from
+        # crowding out the forward-progress signal during bootstrap.
+        _prog_floor = 0.08
+        if w.get("progress", 0.0) < _prog_floor:
+            w["progress"] = _prog_floor
 
         # ---- Final normalisation — always sums to 1.0 ----
         total = sum(w.values())
