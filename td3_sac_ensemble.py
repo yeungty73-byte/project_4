@@ -99,7 +99,7 @@ class TD3SACEnsemble(nn.Module):
         # SAC log-alpha (auto-tuned entropy)
         self.log_alpha = nn.Parameter(torch.zeros(1, device=device))
         # v1.1.1: was -act_dim → alpha explosion to ~7.4 within 100 steps.
-        # Use -0.5 * act_dim (Haarnoja et al. 2018 §5 standard heuristic).
+        # REF: Haarnoja et al. (2018). SAC §5. arXiv:1812.05905.
         self.target_entropy = target_entropy if target_entropy is not None else -0.5 * act_dim
 
         # Optimizers
@@ -378,7 +378,7 @@ class TD3SACEnsemble(nn.Module):
         with torch.no_grad():
             self.log_alpha.clamp_(-3.0, 1.0)
         return self.alpha
-    
+
     def _soft_update(self, source, target):
         for sp, tp in zip(source.parameters(), target.parameters()):
             tp.data.copy_(self.tau * sp.data + (1.0 - self.tau) * tp.data)

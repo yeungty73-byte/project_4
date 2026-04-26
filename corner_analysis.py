@@ -84,8 +84,11 @@ def compute_turn_alignment_reward(heading, waypoints, closest, lookahead=5):
     dy = target_wp[1] - current_wp[1]
     target_heading = math.atan2(dy, dx)
     heading_rad = math.radians(heading)
-    angle_diff = abs(heading_rad - target_heading)
-    angle_diff = min(angle_diff, 2*math.pi - angle_diff)
+    angle_diff = abs(math.atan2(
+        math.sin(heading_rad - target_heading),
+        math.cos(heading_rad - target_heading)
+    ))
+    # REF: circular mean — atan2(sin,cos) is the canonical angle-difference wrap.
     # Curvature at current point
     p0 = waypoints[(idx - 2) % n]
     p1 = waypoints[idx % n]

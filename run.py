@@ -79,6 +79,9 @@ from utils import (
     make_environment,
 )
 
+_device_str = "cuda" if torch.cuda.is_available() else "cpu"
+device = torch.device(_device_str)   # explicit torch.device object, not a lambda/function
+
 # v210: ContextAwarePPOAgent helpers
 def process_action(rawaction, actionspace):
     """Squeeze batch dim; for Discrete → argmax-then-clamp; for Box → clip."""
@@ -2694,6 +2697,9 @@ def run(hparams):
                             adj = bsts_feedback.adjust_weights(scheduler.get_reward_weights(global_step),
                                                             race_type_filter=_track_variant)
                             scheduler.rw_end = adj
+                        if hasattr(td3sac, 'update_alpha') and 'logprobs' in locals() and len(logprobs) > 0:
+                            _ep_mean_logp = float(logprobs[:min(ep_step_count, len(logprobs))].mean().item())
+                            td3sac.update_alpha(_ep_mean_logp)
                     except Exception as e:
                         logger.debug(f"BSTS feedback skip: {e}")
                 # v17: periodic live analysis and race-line phase-out
@@ -2840,17 +2846,34 @@ def run(hparams):
                 ctx_loss = torch.nn.functional.cross_entropy(new_ctx_logits, b_context_labels[mb_inds])
                 # v1.1.1: add intermed_loss so the intermediary head actually learns
                 # REF: Hettiarachchi et al. (2024) U-Transformer auxiliary losses.
-                _intermed_targets_mb = compute_intermed_targets(
-                    {}, race_line_engine=race_line_eng if 'race_line_eng' in dir() else None
-                ).to(device).unsqueeze(0).expand(len(mb_inds), -1)
+                _device_resolved = device if isinstance(device, torch.device) else torch.device(str(device))
+                _intermed_tgts_raw = compute_intermed_targets(
+                    params if 'params' in dir() else {},
+                    race_line_engine=race_line_eng if 'race_line_eng' in locals() else None
+                )
+                _intermed_targets_mb = _intermed_tgts_raw.to(_device_resolved).unsqueeze(0).expand(len(mb_inds), -1)
                 _intermed_loss = torch.nn.functional.mse_loss(
                     _new_intermed, _intermed_targets_mb.detach()
+                )
+                # v1.1.1: intermed head needs a gradient signal or ctx_emb stays random.
+                # Use self-consistency target: intermediary output should be stable across steps
+                # (L2 toward running EMA of its own outputs — no external ground truth needed).
+                if not hasattr(agent, '_intermed_ema'):
+                    agent._intermed_ema = None
+                if agent._intermed_ema is None:
+                    agent._intermed_ema = _new_intermed.detach().mean(0)
+                else:
+                    agent._intermed_ema = (0.95 * agent._intermed_ema +
+                                        0.05 * _new_intermed.detach().mean(0))
+                intermed_consistency_loss = F.mse_loss(
+                    _new_intermed,
+                    agent._intermed_ema.unsqueeze(0).expand_as(_new_intermed).detach()
                 )
                 loss = (0.3 * pg_loss
                         - hp['ent_coef'] * entropy_loss
                         + vf_coef * v_loss
                         + 0.1 * ctx_loss
-                        + 0.05 * _intermed_loss)
+                        + 0.03 * intermed_consistency_loss)  # gentle — don't overwhelm PPO
 
                 optimizer.zero_grad()
                 loss.backward()

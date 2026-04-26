@@ -183,18 +183,22 @@ class RaceLine:
             p2 = self.wpts[(i+1) % n]
             self.headings[i] = math.atan2(p2[1]-p0[1], p2[0]-p0[0])
 
-    def reward(self, wp_idx, car_lat_pos, car_speed, car_heading, track_width) -> float:
-        """Reward for following this race line at wp_idx.
-        car_lat_pos: signed fraction of half-width (left positive).
+    def reward(self, wp_idx, car_lat_pos, car_speed, car_heading, _) -> float: # muted track_width; car_lat_pos normalized 0.15 width
+        """
+        car_lat_pos: signed fraction of half-width (left positive). Range ~ [-1, 1].
+        target_offset: also signed fraction of half-width (set by apex_offset_car_aware).
+        Both are in the SAME unit — fraction space. Sigma = 1.0 (full half-width = 1 std dev).
+        REF: Heilmeier et al. (2020) min-curvature QP; Gaussian shaping in fraction space.
         """
         target_offset  = self.offsets[wp_idx % self.n]
         target_speed   = self.speeds[wp_idx % self.n]
         target_heading = self.headings[wp_idx % self.n]
-        half_w = track_width / 2.0
-        lat_r  = math.exp(-0.5 * ((car_lat_pos - target_offset) / max(half_w, 0.1))**2)
+        # v1.1.1: sigma=1.0 in fraction space — both car_lat_pos and target_offset
+        # are already fractions of half-width. Dividing by half_w was double-normalizing.
+        lat_r  = math.exp(-0.5 * ((car_lat_pos - target_offset) / 1.0)**2)
         spd_r  = math.exp(-0.5 * ((car_speed   - target_speed)  / 0.6)**2)
         hdg_diff = abs(math.atan2(math.sin(car_heading - target_heading),
-                                   math.cos(car_heading - target_heading)))
+                                math.cos(car_heading - target_heading)))
         hdg_r  = math.exp(-0.5 * (hdg_diff / 0.3)**2)
         return 0.45*lat_r + 0.35*spd_r + 0.20*hdg_r
 
