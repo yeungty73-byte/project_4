@@ -205,6 +205,21 @@ def obs_to_array(obs):
     return np.array(obs)
 
 
+def obs_to_2d_img(obs, H=120, W=160):
+    """v1.1.0: Restore DeepRacer camera obs back to 2D spatial tensor (H,W).
+    DeepRacer camera: 120x160 grayscale = 19200 floats (first slice of flat obs).
+    Gemini (2026-04-25) confirmed: spatial structure required for Swin-style attention.
+    The SelfAttention1D in utransformer.py operates on 1D sequences, but shifted-window
+    attention needs 2D grid topology. This function gives a safe reshape entry point.
+    Returns: np.ndarray (H, W) float32, or None if obs too short.
+    """
+    flat = obs_to_array(obs)
+    n = H * W  # 19200
+    if flat.size < n:
+        return None
+    return flat[:n].reshape(H, W).astype(np.float32)
+
+
 
 # ============================================================
 # Meta-Annealing Scheduler (3 dimensions)
@@ -821,12 +836,12 @@ class BCPilot:
         except Exception:
             braker = 1.0 if speed < safe_speed * 0.95 else 0.5
 
-        if braker < 0.4:
-            throttle = 0.05   # v1.1.1: was -0.5 (tanh space) → became 0.25 env (still throttling!)
-        elif speed < safe_speed * 0.85:
-            throttle = 0.80   # v1.1.1: was 0.8 tanh → (0.8+1)/2=0.9 env. Now direct 0.8.
-        else:
-            throttle = 0.45   # v1.1.1: was 0.4 tanh → (0.4+1)/2=0.7 env. Now direct 0.45.
+        # v1.1.0: smooth throttle ramp — never drop below 0.18 (avoids freeze-stop)
+        # braker in [0,1]: 1=free, 0=hard-brake. Use multiplicative attenuation.
+        _throttle_base = 0.55 if speed < safe_speed * 0.85 else 0.40
+        # Multiplicative: at braker=0 → *0.33 → ~0.18 floor. At braker=1 → full.
+        # This avoids the subtractive penalty trap (agent learns freeze to avoid neg reward).
+        throttle = max(0.18, _throttle_base * (0.33 + 0.67 * float(braker)))
 
         return _np.array([steering, throttle], dtype=_np.float32)
 
@@ -2613,9 +2628,11 @@ def run(hparams):
                                 logger.info(f"[RaceLine] perp_v={_rl_score.get(chr(39)+chr(97)+chr(118)+chr(103)+chr(95)+chr(112)+chr(101)+chr(114)+chr(112)+chr(95)+chr(118)+chr(39), 0):.4f}")
                             except Exception as _re:
                                 logger.debug(f"Race line analysis skip: {_re}")
-                        print(f"[BSTS-Kalman] trends={bsts_feedback.kf_trends}")
+                        logger.info(f"[BSTS-Kalman] trends={bsts_feedback.kf_trends} betas_top={dict(list(bsts_feedback.kf_betas.items())[:3])}")
                 except Exception as e:
-                    pass  # BSTS update failure is non-fatal
+                    # v1.1.0: was bare `pass` — silent death of ALL Kalman signal.
+                    # Now logs at DEBUG so we can see what's failing without spamming console.
+                    logger.debug(f"[BSTS-Kalman] update failed ep={episode_count}: {type(e).__name__}: {e}")
 
                                 # TensorBoard context/crash/barrier scalars — only when we have context data
                 if ep_context_preds:

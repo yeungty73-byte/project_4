@@ -18,6 +18,13 @@ Design choices:
   Self-attention at bottleneck only: captures front-left/front-right correlations.
   Cross-attention in skip connections: decoder queries encoder with waypoint embedding.
   Full model < 50k parameters; forward pass < 1ms on CPU; safe for real-time use.
+
+v1.1.0 NOTE (Gemini 2026-04-25 + Tim's feedback):
+  DeepRacer camera = 120x160 grayscale (19200 floats), NOT a purely 1D signal.
+  ObstacleSegmenter operates on the full 38464-dim flat obs (camera + other sensor data).
+  For shifted-window (Swin-style) attention, spatial 2D structure MUST be preserved.
+  Added: reshape_obs_to_2d() + CameraEncoder2D for any future Swin/2D-attention path.
+  The existing 1D pipeline remains valid for LIDAR range data only.
 """
 
 import torch
@@ -26,6 +33,68 @@ import torch.nn.functional as F
 import numpy as np
 import math
 
+
+
+
+# ===========================================================================
+# v1.1.0: 2D image reshaping utilities (Gemini 2026-04-25 / Tim feedback)
+# DeepRacer camera: 120x160 grayscale = 19200 floats = obs_flat[:19200]
+# For any Swin/shifted-window attention, MUST restore 2D grid topology.
+# ===========================================================================
+
+DEEPRACER_CAM_H = 120
+DEEPRACER_CAM_W = 160
+DEEPRACER_CAM_N = DEEPRACER_CAM_H * DEEPRACER_CAM_W  # 19200
+
+
+def reshape_obs_to_2d(obs_flat: np.ndarray, H: int = DEEPRACER_CAM_H, W: int = DEEPRACER_CAM_W) -> np.ndarray:
+    """Restore flattened DeepRacer camera obs to (H, W) 2D spatial array.
+    Gemini confirmed: shifted-window attention requires 2D grid topology.
+    Returns None if obs_flat is too short (e.g., non-camera obs).
+    """
+    n = H * W
+    flat = np.asarray(obs_flat).flatten()
+    if flat.size < n:
+        return None
+    return flat[:n].reshape(H, W).astype(np.float32)
+
+
+class CameraEncoder2D(nn.Module):
+    """v1.1.0: Lightweight 2D conv encoder for DeepRacer (120x160) grayscale camera.
+    Preserves spatial structure that ObstacleSegmenter (1D) cannot.
+    Output: (B, out_dim) feature vector for concatenation with LoS / compact obs.
+    Architecture: 3-layer strided conv → flatten → linear projection.
+    Parameters: ~18k (fast, CPU-safe).
+    Use this when you need spatially-aware camera features in the RL state.
+    """
+    def __init__(self, H: int = DEEPRACER_CAM_H, W: int = DEEPRACER_CAM_W, out_dim: int = 16):
+        super().__init__()
+        self.H, self.W = H, W
+        self.encoder = nn.Sequential(
+            nn.Conv2d(1, 8,  kernel_size=5, stride=4, padding=2),  # → (B,8,30,40)
+            nn.GELU(),
+            nn.Conv2d(8, 16, kernel_size=3, stride=2, padding=1),  # → (B,16,15,20)
+            nn.GELU(),
+            nn.Conv2d(16, 16, kernel_size=3, stride=2, padding=1), # → (B,16,8,10)
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d((4, 4)),                           # → (B,16,4,4)
+            nn.Flatten(),                                           # → (B,256)
+        )
+        self.proj = nn.Linear(256, out_dim)
+
+    def forward(self, obs_flat: torch.Tensor) -> torch.Tensor:
+        """obs_flat: (B, >=19200) — extracts first H*W elements and reshapes to (B,1,H,W)."""
+        n = self.H * self.W
+        img = obs_flat[:, :n].reshape(-1, 1, self.H, self.W)
+        return self.proj(self.encoder(img))
+
+    @staticmethod
+    def preprocess_np(obs_flat: np.ndarray, H: int = DEEPRACER_CAM_H, W: int = DEEPRACER_CAM_W) -> torch.Tensor:
+        """Numpy convenience: flat obs → (1,1,H,W) tensor ready for forward()."""
+        img2d = reshape_obs_to_2d(obs_flat, H, W)
+        if img2d is None:
+            return torch.zeros(1, 1, H, W, dtype=torch.float32)
+        return torch.tensor(img2d, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
 
 class SelfAttention1D(nn.Module):
     """Single-head self-attention over 1-D sequence. Input: (B,C,L) -> (B,C,L)"""
