@@ -676,8 +676,10 @@ def harvest_htm_pilots(env, htm_agent, td3sac, n_episodes=12, min_progress=5.0):
                 next_rp, _bc_progress_cache, _bc_progress_state)
             ep_prog = max(ep_prog, float(prog_pct))
             act_t = torch.tensor(np.asarray(action), dtype=torch.float32)
-            obs_t = torch.tensor(obs_to_array(obs), dtype=torch.float32)
-            nobs_t = torch.tensor(obs_to_array(next_obs), dtype=torch.float32)
+            _rp_bc = info.get('reward_params', {}) if isinstance(info, dict) else {}  # v1.1.2
+            obs_t = torch.tensor(_compact_obs(obs_to_array(obs), _rp_bc, obs_dim_raw=obs_dim_raw), dtype=torch.float32)  # v1.1.2
+            _nrp_bc = next_info.get('reward_params', {}) if isinstance(next_info, dict) else {}  # v1.1.2
+            nobs_t = torch.tensor(_compact_obs(obs_to_array(next_obs), _nrp_bc, obs_dim_raw=obs_dim_raw), dtype=torch.float32)  # v1.1.2
             _bc_reward = float(max(-10.0, min(10.0, reward)))
             ep_buf.append((obs_t, act_t, _bc_reward, nobs_t, float(terminated or truncated)))
             obs, rp = next_obs, next_rp
