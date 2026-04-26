@@ -697,6 +697,12 @@ def harvest_htm_pilots(env, htm_agent, td3sac, n_episodes=12, min_progress=2.0):
             # REF: AWS (2020) — DeepRacer obs_space is flat float32 of shape (38464,).
             obs_t  = torch.tensor(obs_to_array(obs),      dtype=torch.float32)
             nobs_t = torch.tensor(obs_to_array(next_obs), dtype=torch.float32)
+            # v1.1.0: normalize pixel obs before replay storage to prevent critic NaN
+            # Raw DeepRacer obs values are in [0,255]; must be [0,1] for stable critic training.
+            _obs_scale = obs_t.abs().max().item()
+            if _obs_scale > 2.0:
+                obs_t  = obs_t  / max(_obs_scale, 1.0)
+                nobs_t = nobs_t / max(nobs_t.abs().max().item(), 1.0)
             _bc_reward = float(max(-10.0, min(10.0, reward)))
             ep_buf.append((obs_t, act_t, _bc_reward, nobs_t, float(terminated or truncated)))
             obs, rp = next_obs, next_rp
@@ -716,15 +722,27 @@ def pretrain_td3_bc(td3sac, ppo_agent, bc_steps=2000):
     Supervised pre-training: minimize |Q(s,a_htm) - r + γ·min_Q(s')| on BC buffer.
     No policy noise — these are expert actions, not noisy TD3 rollouts.
     """
+    _nan_streak = 0
     for step in range(bc_steps):
         if len(td3sac.replay) < 256:
             break
-        # v1.1.0: policy_noise=0.0 → exact same target action every pass → Q diverges → NaN
-        # REF: Fujimoto et al. (2018) §4.2 — target policy smoothing is essential for stability
-        result = td3sac.update_critics(ppo_agent, batch_size=256, policy_noise=0.05)  # no noise on BC
+        # v1.1.0: policy_noise=0.05 — target policy smoothing essential for Q stability
+        # REF: Fujimoto et al. (2018) §4.2
+        result = td3sac.update_critics(ppo_agent, batch_size=256, policy_noise=0.05)
+        _cl = result.get('critic_loss', 0.0)
+        # v1.1.0: NaN streak bail-out — if obs are corrupted, abort early instead of 
+        # wasting 8 min of CPU. After 20 consecutive NaN batches, the replay is poisoned.
+        if not (isinstance(_cl, float) and _cl == _cl):  # float nan check
+            _nan_streak += 1
+            if _nan_streak >= 20:
+                logger.warning(f"[BC pretrain] NaN streak={_nan_streak} at step {step} — "
+                               f"aborting pretrain. Check obs normalization.")
+                break
+        else:
+            _nan_streak = 0
         if step % 200 == 0:
-            logger.info(f"BC pretrain step {step}: critic_loss={result.get('critic_loss',0):.4f}, "
-                        f"replay_size={result.get('replay_size',0)}")
+            logger.info(f"BC pretrain step {step}: critic_loss={_cl:.4f}, "
+                        f"replay_size={result.get('replay_size',0)}, nan_streak={_nan_streak}")
     logger.info("BC pre-training complete — TD3 critics bootstrapped on expert trajectories")
 
 def preflightgymbridge():
@@ -799,33 +817,42 @@ class BCPilot:
 
         # --- Heading recovery: if >45deg off track tangent, align first ---
         hdiff = self._heading_to_track(rp)
-        if abs(hdiff) > 45.0:
-            # Hard steer toward track direction; moderate throttle to keep moving
+        if abs(hdiff) > 25.0:
+            # v1.1.0: lowered threshold 45°→25° — car spawns 20-40° off tangent on reInvent2019_wide
+            # At 45° threshold, early-spawn misalignment goes unrecovered → immediate offtrack.
             steer_sign = -1.0 if hdiff > 0 else 1.0
-            steer_strength = min(1.0, abs(hdiff) / 90.0)
-            # v1.1.1: env space throttle [0,1]
+            steer_strength = min(1.0, abs(hdiff) / 60.0)  # v1.1.0: softer gain (was /90) — less overcorrect
             return _np.array([steer_sign * steer_strength, 0.35], dtype=_np.float32)
 
         # --- Reversal recovery ---
         if is_reversed:
-            # Countersteer and brake gently to kill reverse momentum
-            return _np.array([0.0, 0.05], dtype=_np.float32)  # near-zero throttle, no steer
+            # v1.1.0: was [0.0, 0.05] — near-zero throttle made reversed eps 14 steps,
+            # ep_prog < 2% → not stored in replay → wasted pilot slot.
+            # Fix: mild forward throttle 0.30 + gentle countersteer to realign.
+            hdiff_rev = self._heading_to_track(rp)
+            steer_rev = _np.clip(-hdiff_rev / 90.0, -0.5, 0.5)
+            return _np.array([steer_rev, 0.30], dtype=_np.float32)
 
         # --- Normal racing line control ---
+        # v1.1.0: speed-adaptive lookahead — faster speed = look further ahead
+        # At 1.6m/s (slow): 8 wps; at 4m/s (max): 20 wps. Prevents late-braking.
+        _la_wps = max(8, min(20, int(speed * 5)))
         try:
             _, _, safe_speed, dist_to_corner = lookahead_curvature_scan(
-                waypoints, closest, max_lookahead=15
+                waypoints, closest, max_lookahead=_la_wps
             )
         except Exception:
             safe_speed, dist_to_corner = 2.5, 5.0
 
         try:
-            rl_offset = compute_racing_line_offset(waypoints, closest, tw)
+            rl_offset = compute_racing_line_offset(waypoints, closest, tw, lookahead=max(6, _la_wps // 2))
         except Exception:
             rl_offset = 0.0
 
         lat_err = (rl_offset * tw / 2.0) - dist_ctr * (1 if is_left else -1)
-        steering = float(_np.clip(lat_err / max(tw * 0.5, 0.01) * 1.5, -1.0, 1.0))
+        # v1.1.0: track-width-adaptive steering gain — prevents overcorrection on narrow tracks
+        _steer_gain = max(0.8, min(1.5, 0.6 / max(tw, 0.3)))
+        steering = float(_np.clip(lat_err / max(tw * 0.5, 0.01) * _steer_gain, -1.0, 1.0))
 
         # v1.1.1: throttle directly in env space [0,1] — NO process_action remapping
         # braker<0.4 → needs to brake → throttle=0.05 (near zero)
@@ -836,12 +863,15 @@ class BCPilot:
         except Exception:
             braker = 1.0 if speed < safe_speed * 0.95 else 0.5
 
-        # v1.1.0: smooth throttle ramp — never drop below 0.18 (avoids freeze-stop)
-        # braker in [0,1]: 1=free, 0=hard-brake. Use multiplicative attenuation.
-        _throttle_base = 0.55 if speed < safe_speed * 0.85 else 0.40
-        # Multiplicative: at braker=0 → *0.33 → ~0.18 floor. At braker=1 → full.
-        # This avoids the subtractive penalty trap (agent learns freeze to avoid neg reward).
-        throttle = max(0.18, _throttle_base * (0.33 + 0.67 * float(braker)))
+        # v1.1.0: multiplicative throttle — no subtractive penalties (freeze trap avoided)
+        # braker in [0,1]: 1=free (max speed), 0=hard-brake. Multiplicative attenuation:
+        #   throttle = base * (floor_frac + (1-floor_frac) * braker)
+        # floor_frac=0.40 → at braker=0: 0.55*0.40=0.22 (never stops); at braker=1: 0.55
+        # REF: Ng et al. (1999) reward shaping — avoid policies that exploit negative signals.
+        _throttle_base = 0.55 if speed < safe_speed * 0.85 else 0.42
+        _floor_frac = 0.40  # v1.1.0: raised from 0.33→0.40; floor is ~0.22, not 0.18
+        throttle = _throttle_base * (_floor_frac + (1.0 - _floor_frac) * float(braker))
+        throttle = max(0.22, throttle)  # hard floor — car must always creep forward
 
         return _np.array([steering, throttle], dtype=_np.float32)
 

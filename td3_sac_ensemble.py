@@ -150,6 +150,18 @@ class TD3SACEnsemble(nn.Module):
         nobs = torch.as_tensor(nobs, dtype=torch.float32).to(self.device)
         rew  = torch.as_tensor(rew,  dtype=torch.float32).to(self.device)
         done = torch.as_tensor(done, dtype=torch.float32).to(self.device)
+        # v1.1.0: normalize raw pixel obs [0,255]→[0,1] to prevent overflow in Linear layer
+        # DeepRacer obs is a flat float32 of camera+lidar data with values in [0,255].
+        # Without normalization: W(256×38466) × obs(38464, val≈100) → activations ≈ 1e6 → NaN.
+        # REF: LeCun et al. (1998) — input normalization is prerequisite for stable gradient flow.
+        _obs_max = obs.abs().max().item()
+        if _obs_max > 2.0:  # heuristic: if values > 2.0, likely unnormalized pixels
+            obs  = obs  / max(_obs_max, 1.0)
+            nobs = nobs / max(nobs.abs().max().item(), 1.0)
+        # v1.1.0: finite guard — skip batch if obs/reward contain NaN or Inf
+        if not (torch.isfinite(obs).all() and torch.isfinite(nobs).all() and torch.isfinite(rew).all()):
+            return {'critic_loss': float('nan'), 'alpha': self.alpha,
+                    'q1_mean': 0.0, 'q2_mean': 0.0, 'replay_size': len(self.replay)}
 
         # act from replay: shape (batch, ?) — normalize to (batch, act_dim)
         act = torch.as_tensor(act, dtype=torch.float32).to(self.device)
