@@ -719,3 +719,49 @@
                Basis for braking\_distance() in brake\_field.py.
                v1.1.0 adds jerk-onset buffer on top (Balaban 2018).}
 }
+
+@mastersthesis{liu2025deepracer,
+  title   = {Machine Learning for Optimal Racelines: From {Amazon Web Services DeepRacer} to {Formula One-Tenth}},
+  author  = {Liu, Hengyuan},
+  school  = {University of California, Los Angeles},
+  year    = {2025},
+  note    = {Compares CNN, U-Net, Transformer, and U-Net Transformer for raceline prediction.
+             U-Net Transformer achieves best MSE (0.0122) and mean Euclidean distance (0.1246)
+             on AWS DeepRacer tracks; also best generalisation on F1Tenth (MSE 0.1624).
+             Front camera is 2-D RGB 120x160; obs delivered as flat float32 vector.
+             Cited in utransformer.py (SwinUNetPlusPlus1D) and htm\_reference.py.}
+}
+
+@article{cao2021swinunet,
+  title   = {Swin-Unet: Unet-like Pure Transformer for Medical Image Segmentation},
+  author  = {Cao, Hu and Wang, Yueyue and Chen, Joy and Jiang, Dongsheng and Zhang, Xiaopeng and Tian, Qi and Wang, Manning},
+  journal = {arXiv preprint arXiv:2105.05537},
+  year    = {2021},
+  note    = {First transformer-based U-shaped architecture with Swin encoder, bottleneck,
+             decoder, and skip connections. Windowed shifted self-attention (W-MSA + SW-MSA).
+             Adapted to 1-D LIDAR/sensor arrays in utransformer.py SwinUNetPlusPlus1D.}
+}
+
+@article{wu2021swinunetpp,
+  title   = {{Swin--UNet}++: A Nested {Swin Transformer} Architecture for Location Identification
+             and Morphology Segmentation},
+  author  = {Wu, Huantao and others},
+  journal = {Computational Intelligence and Neuroscience},
+  year    = {2021},
+  doi     = {10.1155/2024/8972980},
+  note    = {Extends Swin-Unet with UNet++ nested dense skip connections and a vice-path
+             to preserve shallow semantic features. Architecture adopted in 1-D form in
+             utransformer.py (SwinUNetPlusPlus1D) for DeepRacer perception.
+             PMC: https://pmc.ncbi.nlm.nih.gov/articles/PMC8703304/}
+}
+
+@inproceedings{liu2021swin,
+  title     = {Swin Transformer: Hierarchical Vision Transformer using Shifted Windows},
+  author    = {Liu, Ze and Lin, Yutong and Cao, Yue and Hu, Han and Wei, Yixiang and Zhang, Zheng and Lin, Stephen and Guo, Baining},
+  booktitle = {Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV)},
+  year      = {2021},
+  note      = {Foundational Swin Transformer. Windowed multi-head self-attention (W-MSA)
+               reduces O(n^2) global attention to O(n) per-window complexity.
+               Shifted windows (SW-MSA) restore cross-window connectivity.
+               Basis for SwinBlock1D in utransformer.py.}
+}

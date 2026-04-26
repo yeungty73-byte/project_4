@@ -478,10 +478,12 @@ class HTMOracle:
             else:
                 offsets[i] = -sign * max_lat_frac
 
-        # Smooth with 5-pt wrap kernel
+        # Smooth with 5-pt wrap kernel (v1.1.3 OOB fix: use hw=kernel//2 for exact-n output)
+        # REF: Liu 2025 (UCLA thesis) §3.5 — smooth lateral offsets prevent jerk in racing line
         kernel  = np.array([0.1, 0.2, 0.4, 0.2, 0.1])
-        padded  = np.concatenate([offsets[-2:], offsets, offsets[:2]])
-        offsets = np.convolve(padded, kernel, mode='valid')[2:-2]
+        _hw     = len(kernel) // 2  # = 2; gives convolve output len == n exactly
+        padded  = np.concatenate([offsets[-_hw:], offsets, offsets[:_hw]])
+        offsets = np.convolve(padded, kernel, mode='valid')  # v1.1.3: no [2:-2] slice
 
         # --- 6. Headings ---
         headings = np.array([
