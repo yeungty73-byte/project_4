@@ -1,6 +1,5 @@
 ---
 # default hyper-parameters for your experiments.
-# these are just dummy variables as an example.
 seed:               42
 cpu_only:           false
 environment:        deepracer-v0
@@ -8,3 +7,17 @@ experiment_name:    time_trial
 learning_rate:    3e-4
 total_timesteps:    100000
 gamma:              0.99
+
+# ── v1.1.2 forward-only driving constraints ──────────────────────────────────
+# process_action now hard-clips throttle channel to [0.0, 1.0].
+# Any negative throttle (backward drive) the policy might emit is floored to 0.
+# This is enforced in code; these keys document the intended behaviour.
+throttle_min:       0.0      # hard floor — no reverse driving ever
+throttle_max:       1.0      # max throttle in env-space
+reverse_reward_mul: 0.40     # reward multiplier when is_reversed=True (was 0.80)
+                             # 60% cut makes reversing strictly worse than any forward motion
+
+# ── v1.1.2 jerk fix ──────────────────────────────────────────────────────────
+# ep_jerk_abs now appended every step (not only in hard-truncation block).
+# jerk_dt:  simulated timestep for da/dt computation (seconds)
+jerk_dt:            0.1
