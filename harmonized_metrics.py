@@ -15,18 +15,22 @@ SUCCESS_METRICS  — response variables (VIF<5, non-collinear).
   track_progress       : arc-length fraction covered [0,1]
 
 INTERMEDIARY_METRICS — covariates for BSTS regression.
-  race_line_adherence      [0,1]   1 - mean(d_rl / half_w)
-  brake_compliance         [0,1]   fraction braking events inside brake field
-  corner_speed_error       [0,1]   1 - mean(|v-v_tgt|/v_tgt) in corners
-  heading_alignment_mean   [0,1]   (mean cos(heading_err)+1)/2
-  smoothness_steering_rate [0,1]   1 / (1 + RMS(Δsteer_action)) — sigmoid-mapped
-  waypoint_lookahead       [0,1]   mean look-ahead horizon / n_wp
-  gg_ellipse_utilisation   [0,1]   mean friction-ellipse fraction used
-  velocity_profile_compliance[0,1] mean per-step vprofile score
-  curvature_anticipation   [0,1]   mean anticipation score
-  htm_composite            [0,1]   mean HTM oracle compliance
-  phase_id                 int     current AnnealingScheduler phase (−1,0,1,2)
-  bc_seeded                int     1 if BC pretraining ran this episode
+  race_line_adherence        [0,1]   1 - mean(d_rl / half_w)
+  brake_compliance           [0,1]   fraction braking events inside brake field
+  corner_speed_error         [0,1]   1 - mean(|v-v_tgt|/v_tgt) in corners
+  heading_alignment_mean     [0,1]   (mean cos(heading_err)+1)/2
+  smoothness_steering_rate   [0,1]   1 / (1 + RMS(Δsteer_action))
+                                     — renamed from smoothness_jerk_rms (v1.1.2)
+                                     — "jerk" means d²x/dt³ (acceleration rate)
+                                     — this measures steering INPUT rate, not chassis jerk
+                                     — logs show as [STEER_SMOOTH] to avoid confusion
+  waypoint_lookahead         [0,1]   mean look-ahead horizon / n_wp
+  gg_ellipse_utilisation     [0,1]   mean friction-ellipse fraction used
+  velocity_profile_compliance[0,1]   mean per-step vprofile score
+  curvature_anticipation     [0,1]   mean anticipation score
+  htm_composite              [0,1]   mean HTM oracle compliance
+  phase_id                   int     current AnnealingScheduler phase (−1,0,1,2)
+  bc_seeded                  int     1 if BC pretraining ran this episode
 
 STEP_KEYS that run.py writes into ep_step_log rows
 ----------------------------------------------------
@@ -37,17 +41,20 @@ STEP_KEYS that run.py writes into ep_step_log rows
   gg_utilisation, vel_profile_compliance, curv_anticipation,
   htm_composite, is_offtrack, progress
 
-v1.1.2 fixes (confirmed against run_20260426_212811.log):
-  - smoothness_jerk_rms renamed → smoothness_steering_rate.
-    Old name implied da/dt (jerk = d²x/dt³) which is physically wrong — we are
-    measuring Δsteer_action/step, i.e. steering INPUT rate, not chassis jerk.
-    Source key changed: 'steering' (never written) → 'steering_angle' (action[0],
-    always written).  RMS mapped via sigmoid 1/(1+rms) so it can never hard-clip
-    to 0.0 due to scale differences between normalised and degree-space values.
-  - brake_compliance: 'is_braking' bool was False for ~80% of steps because
-    '_braking_intent' was evaluated AFTER the ep_step_log.append() block in the
-    hard-truncation branch.  Fix: check 'braking' (int, written from same variable
-    at same site) as authoritative fallback alongside 'is_braking'.
+v1.1.2 fixes (this file):
+  - smoothness_steering_rate: ALL s.get() calls now wrapped in _safe().
+    Old code used bare float(s.get("steering_angle", 0.0)) — if run.py
+    wrote a None or NaN, that blew the entire metric to default=0.0 via
+    the outer except, masking the real RMS with a silent 0.0.
+  - _race_line_adherence: dist_to_raceline path uses _safe() — bare
+    float() on None caused same silent failure.
+  - Renamed smoothness_jerk_rms → smoothness_steering_rate everywhere.
+    "jerk" = d²v/dt = da/dt in physics; this metric is Δsteer/step.
+    Conflating them with the acceleration-jerk in ep_jerk_abs is wrong.
+    Log tag: [STEER_SMOOTH] (not [JERK]).
+  - Legacy alias _smoothness_jerk kept for any external callers.
+  - backward-compat key "smoothness_jerk_rms" still written in compute_all()
+    output so old JSONL logs / analyze_logs.py don't KeyError.
 
 REF: Leung (2026) this project; Heilmeier et al. (2020) arc-length;
      Ferraresi (2021) arXiv:2103.10098; Kapania (2015) speed profile.
@@ -168,7 +175,15 @@ def _track_progress(steps: List[dict], waypoints=None,
 # ------------------------------------------------------------------
 
 def _race_line_adherence(steps: List[dict], track_width: float) -> float:
+    """
+    Fraction of lap spent on the racing line.
+    [RACE_LINE] in logs.
+
+    v1.1.2: _safe() on dist_to_raceline — bare float() blew up on None
+    when BrakeField hadn't yet computed _racing_line_err at step 0.
+    """
     half_w = max(track_width / 2.0, 0.01)
+    # v1.1.2: _safe() wraps every get — prevents None/NaN crash
     dists  = [_safe(s.get("dist_to_raceline", half_w)) for s in steps]
     if not dists:
         return 0.0
@@ -178,6 +193,7 @@ def _race_line_adherence(steps: List[dict], track_width: float) -> float:
 def _brake_compliance(steps: List[dict]) -> float:
     """
     Fraction of braking events that occur inside the brake field.
+    [BRAKE_COMPLIANCE] in logs.
 
     v1.1.2 fix: run.py writes BOTH:
       'braking':    int(_braking_intent)  — always set (primary)
@@ -225,12 +241,17 @@ def _heading_alignment(steps: List[dict]) -> float:
 def _smoothness_steering_rate(steps: List[dict]) -> float:
     """
     Steering INPUT rate smoothness.  [0, 1] — higher = smoother.
+    Logged as [STEER_SMOOTH] — NOT jerk (d²v/dt) which is in ep_jerk_abs.
 
     v1.1.2:
       Source key: 'steering_angle' (action[0], written by run.py as
                   float(action[0]) in every ep_step_log row).
       Old key 'steering' was NEVER written → always 0.0 → RMS=0 → value=1.0
       constantly → BSTS Kalman trend = 0.0 (flat line).
+
+      ALL s.get() values now wrapped in _safe() — bare float() on a None
+      from ep_step_log (step 0 before rp populated) caused silent zeroing
+      of the entire metric via the outer except clause.
 
       Mapping: sigmoid  1 / (1 + RMS)  instead of hard clip(1 - RMS).
       Rationale: RMS scale depends on action normalisation ([-1,1] vs [-30,30]).
@@ -241,7 +262,7 @@ def _smoothness_steering_rate(steps: List[dict]) -> float:
     """
     if len(steps) < 2:
         return 1.0
-    # Primary: actor output steering_angle (normalised, ≈ [-1, 1])
+    # v1.1.2: _safe() on every element — no bare float()
     steers = np.array([_safe(s.get("steering_angle", 0.0)) for s in steps])
     if np.all(steers == 0.0):
         # Fallback: steer_rate already computed in ante_buf and stored
@@ -255,7 +276,10 @@ def _smoothness_steering_rate(steps: List[dict]) -> float:
 
 
 # Legacy name — identical implementation, kept for backward compat
+# NOTE: This is steering INPUT rate, NOT chassis jerk (d²v/dt).
+#       ep_jerk_abs in run.py tracks true acceleration jerk separately.
 def _smoothness_jerk(steps: List[dict]) -> float:
+    """Deprecated alias for _smoothness_steering_rate. Do not use for new code."""
     return _smoothness_steering_rate(steps)
 
 

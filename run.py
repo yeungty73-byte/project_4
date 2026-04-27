@@ -274,7 +274,7 @@ class AnnealingScheduler:
             "obstacle":       0.00,
             "steering":       0.00,
         }
-        # PHASE 1: Positioning+Speed coupling (30–65%)
+        # PHASE 1: Positioning+Speed coupling (30â€“65%)
         # Racing line compliance gates speed reward via speed_steering
         self.rw_phase1 = {
             "center":       0.14,
@@ -283,7 +283,7 @@ class AnnealingScheduler:
             "braking":      0.10,
             "progress":     0.16,
             "corner":       0.07,
-            "speed_steering": 0.10, # rising — speed only rewarded when steering is clean
+            "speed_steering": 0.10, # rising â€” speed only rewarded when steering is clean
             "curv_speed":   0.08,   # curvature-aware speed, still modest
             "min_speed":    0.06,
             "completion":   0.05,
@@ -291,7 +291,7 @@ class AnnealingScheduler:
             "obstacle":     0.03,
             "steering":     0.02,
         }
-        # PHASE 2: Speed-optimized (65–100%)
+        # PHASE 2: Speed-optimized (65â€“100%)
         # Full speed rewards, position/heading fade, completion bonus peaks
         self.rw_phase2 = {
             "center":       0.07,
@@ -1623,10 +1623,9 @@ def run(hparams):
                 update_episode_centerline_progress(_rp_now, _track_progress_cache, _episode_progress_state)
             ep_progress = ep_centerline_progress_m
             # logger.info(f"[TRUNCATE] ep_step={ep_step_count} >= 500, forcing truncation")
-            # v1.1.2 FIX: tighten REWARDDIAG gate — was global_step<600 (fired every ep for 30+ eps)
-            # Now: only first 50 sim steps total (first 2-3 episodes).
-            if ep_step_count == 1 and global_step < 50:
-                logger.info(f"[REWARD_DIAG] rp keys={list(rp.keys())}, rp={rp}")
+            # Debug: log reward_params for first 3 steps
+            if global_step <= 3:
+                logger.info(f"[DEBUG] step={global_step} rp={info.get('reward_params', {})} ep_status={info.get('episode_status', None)}")
             if global_step < 10 or global_step % 100 == 0: logger.info(f"step={global_step} reward={reward:.4f} terminated={terminated} truncated={truncated} info_keys={list(info.keys()) if info else None}")
             # --- research: Line-of-Sight reward (Garlick & Middleditch, 2022) ---
             _is_rev = False
@@ -1676,6 +1675,9 @@ def run(hparams):
             _center_r = 0.0; _speed_r = 0.0; _steer_r = 0.0
             _prog_r = 0.0; _eff_r = 0.0; _head_r = 0.0; _comp_r = 0.0
             rp = info.get("reward_params", {})
+            # v23: diagnostic
+            if ep_step_count == 1 and global_step < 600:
+                logger.info(f"[REWARD_DIAG] rp keys={list(rp.keys())}, rp={rp}")
             # v23: base progress reward
             _prog_raw = float(rp.get("progress", 0.0) or 0.0)
             _center_m, _total_m, _center_pct, _center_delta_m, _episode_progress_state = \
@@ -1701,6 +1703,10 @@ def run(hparams):
                 if ep_step_count <= 8 and "_head_r" in dir() and _head_r > 0.5:
                     reward += 0.20 * _head_r  # strong initial heading alignment incentive
             _prev_prog_tracker = _prog
+            # v23: alive bonus
+            # if not _offtrack and not _is_stuck:  # MUTED v25
+            # reward += 0.01  # MUTED v25
+            # v25: MUTED rigid speed incentive, replaced by racing-line-only
             # v39: Re-enabled speed reward (was MUTED v25), now v_perp-aware
             if _speed > 0.1: reward += min(_speed, 4.0) * 0.05  # v39: halved from 0.1
             ep_step_count += 1  # v28: FIX missing increment
@@ -1969,14 +1975,9 @@ def run(hparams):
                     _vperp_val = float(_v_perp_barrier) if "_v_perp_barrier" in dir() else 1.0
                     _offtrack_attn = 1.0 / (1.0 + max(0.0, _vperp_val) * 0.40)
                     reward = reward * _offtrack_attn  # never subtracts; just scales earned reward down
-                # v1.1.2 FIX: _is_rev alone must NOT trigger stuck-early-termination.
-                # Car spawns reversed (heading~158 vs track~0); BCPilot recovery takes 5-10 steps.
-                # If we terminate immediately on is_reversed=True, the agent never sees recovery succeed.
-                # Gate: reversed is only a stuck signal if ALSO going slow AND past first 5 steps.
-                _is_rev_stuck = bool(_is_rev) and (float(_speed) < 0.5) and (ep_step_count > 5)
-                _is_stuck = (_speed < 0.3) or _offtrack_stuck or _is_rev_stuck
+                _is_stuck = (_speed < 0.3) or _offtrack_stuck or _is_rev  # v39: uses grace
                 if anneal['reward_boost'] > 1.0:
-#                     # reward += (anneal['reward_boost'] - 1.0) * 0.2 * _prog_r  # MUTED v25
+    #                     # reward += (anneal['reward_boost'] - 1.0) * 0.2 * _prog_r  # MUTED v25
                     pass  # v25 muted
                 stuck_tracker.step_update(
                     wp_idx=_cur_wp, is_stuck=_is_stuck,
@@ -2059,10 +2060,14 @@ def run(hparams):
                         'all_wheels_on_track':  bool(_rp_log.get('all_wheels_on_track', True)),
                         'distance_from_center': float(_dist_from_center) if '_dist_from_center' in dir() else float(_rp_log.get('distance_from_center', 0.0)),
                         'closest_waypoint':     int(_closest[0]) if isinstance(_closest, (list, tuple)) and len(_closest) > 0 else -1,  # v1.1.0: fix: was 'closest_wp_idx'[1]; hm needs 'closest_waypoint'[0]
-                        'dist_to_raceline':   float(_racing_line_err) if '_racing_line_err' in dir() else 0.0,  # v1.1.0: was missing → race_line_adherence=0
+                        'dist_to_raceline':   _hm._safe(_racing_line_err) if '_racing_line_err' in dir() else 0.0,
                         # v1.1.0: fields _translate_step() / extract_intermediary_metrics() need
                         'braking':              int(_braking_intent) if '_braking_intent' in dir() else 0,
-                        'is_braking':           bool(_braking_intent) if '_braking_intent' in dir() else False,  # v1.1.2
+                        'is_braking':           bool(
+                                                    (_in_brake_field if '_in_brake_field' in dir() else False)
+                                                    or (_accel < -0.5 if '_accel' in dir() else False)
+                                                ),
+                        'corner_speed_target':  float(_safe_speed_ahead) if '_safe_speed_ahead' in dir() else 1.0,
                         'is_offtrack':          bool(_offtrack),
                         'progress':             float(_prog),
                         'heading_diff':         float(ep_heading_diffs[-1]) if ep_heading_diffs else 0.0,
@@ -2164,7 +2169,7 @@ def run(hparams):
             sampler.record_step({
                     'x': rp.get('x', 0.0), 'y': rp.get('y', 0.0),
                     'heading': rp.get('heading', 0), 'speed': _speed,
-                    'steering_angle': _steer, 'progress': _prog,
+                    'steering_angle': _steer, 'steering': _steer, 'progress': _prog,
                     'closest_waypoints': _closest,
                     'is_offtrack': _offtrack, 'is_crashed': rp.get('is_crashed', False),
                     'is_reversed': rp.get('is_reversed', False),
@@ -2193,10 +2198,13 @@ def run(hparams):
                 step=global_step,
                 race_type_tag=_track_variant,
             )
-            # v1.1.2: KALMANCHECK moved to episode-end only (every 20 eps).
-            # Printing every step (~400 lines/ep) drowned useful signal in the log.
+            print(f"[KALMAN_CHECK] n_kfs={len(bsts_feedback._kf_instances)}, "
+                f"kf_trends={dict(list(bsts_feedback.kf_trends.items())[:3])}")
                 
-            # v1.1.2: per-step jerk accumulation fix
+            #     # v1.1.2: per-step ACCELERATION jerk accumulation (da/dt, m/s³)
+            # NOTE: this is chassis jerk (d²v/dt²), NOT steering input rate.
+            # Steering input rate smoothness is tracked separately as
+             # smoothness_steering_rate in harmonized_metrics.py [STEER_SMOOTH].
             try:
                 _accel_jrk = (_speed - _step_speed_snap) / 0.1
                 if ep_prev_accel is not None:
@@ -2234,4 +2242,798 @@ def run(hparams):
                 ep_progress_pct = max(ep_progress_pct, float(raw_prog))   # take sim pct as floor for lap gate
                 lap_completed = 1.0 if ep_progress_pct >= 100.0 and not _bad_end else 0.0
                 bootstrap_rewards.update_episode(ep_progress_pct, lap_completed > 0.0)
-                # v1.1.0: removed duplicate update_episode (was using
+                # v1.1.0: removed duplicate update_episode (was using metres not pct) — single call above
+                lap_time_sec = time.time() - ep_start_time  # v24: wall-clock episode time
+                episode_count += 1
+                # v1.1.1: SAC alpha update — was never called, alpha stuck at 1.0
+                if hasattr(td3sac, 'update_alpha') and len(logprobs) > 0:
+                    _mean_logprob = float(logprobs[:ep_step_count].mean().item())
+                    td3sac.update_alpha(_mean_logprob)
+                # --- v6: episode stuck update ---
+                # v1.1.0: progressive escaped threshold — starts at 5% (early training), grows to 20%
+                _t_frac_ep = global_step / max(total_timesteps, 1)
+                _escaped_thresh = 5.0 + 15.0 * min(_t_frac_ep / 0.30, 1.0)  # 5% @ t=0 → 20% @ t=30%
+                _escaped = ep_progress_pct > _escaped_thresh  # v1.1.0
+                if stuck_tracker._cur_stuck_cluster is not None:
+                    _escaped = ep_progress_pct> (stuck_tracker._cur_stuck_cluster / 120.0 * 100.0 + 15.0)
+                stuck_tracker.episode_update(
+                    entry_wp=_closest[0] if len(_closest) > 0 else 0,
+                    ep_return=ep_return, ep_progress=ep_progress,
+                    escaped_stuck=_escaped)
+                if episode_count % 50 == 0:
+                    try:
+                        stuck_tracker.print_report()
+                    except Exception as e:
+                        logger.warning(f"print_report failed: {e}")
+
+                    # v7: Save BSTS data
+                    if hasattr(stuck_tracker, 'save_to_json'):
+                        try:
+                            stuck_tracker.save_to_json("results")
+                        except Exception as e:
+                            logger.warning(f"save_to_json failed: {e}")
+                
+                            # v4: End episode for failure analysis
+                term_reason = "crashed" if info.get("reward_params",{}).get("is_crashed",False) else ("offtrack" if info.get("reward_params",{}).get("is_offtrack",False) else ("completed" if ep_progress>=95 else "stuck")); sampler.end_episode(ep_progress, ep_return, ep_length, terminated_reason=term_reason)
+
+                # === BSTS AWS (2020)TheRayG (2020) ===
+                if _bsts is not None:
+                    _bsts.record(ep_step_count*0.1, ep_return, term_reason)
+                if _bsts_log is not None:
+                    _bsts_log.record(ep_step_count*0.1, ep_return, term_reason)
+                # EpisodeMetricsAccumulator: produce braking/speed summary
+                _ep_summary = ep_metrics.end_episode(
+                    ep_progress, ep_return, ep_step_count,
+                    terminated_reason=term_reason
+                )
+                if global_step % 200 == 0: print(f"[BSTS] ep={episode_count} {_bsts.summary()}")
+                # v4-bsts: crash-site diagnostics
+                if term_reason == "crashed" or term_reason == "offtrack":
+                    ep_crash_ctx = ep_context_preds[-1] if ep_context_preds else -1
+                    ep_crash_speed = ep_speeds[-1] if ep_speeds else 0.0
+                    ep_crash_heading = ep_headings[-1] if ep_headings else 0.0  # v26
+                    ep_crash_closest_wp = ep_closest_wps[-1] if ep_closest_wps else [0,1]  # v26
+                    ep_crash_lidar_min = ep_lidar_mins[-1] if ep_lidar_mins else 1.0
+                    # v29: CRASH FORENSICS - dump antecedent kinematics
+                    _ante_n = len(ep_ante_buf)
+                    _ante_brakes = sum(1 for r in ep_ante_buf if r.get('braking',0))
+                    _ante_mean_accel = sum(r.get('accel',0) for r in ep_ante_buf)/max(_ante_n,1)
+                    _ante_mean_vperp = sum(r.get('v_perp',0) for r in ep_ante_buf)/max(_ante_n,1)
+                    _ante_max_vperp = max((r.get('v_perp',0) for r in ep_ante_buf), default=0)
+                    _ante_min_dist = min((r.get('dist_barrier',9) for r in ep_ante_buf), default=9)
+                    _ante_final_vperp = ep_ante_buf[-1].get('v_perp',0) if ep_ante_buf else 0
+                    _ante_final_stopdist = ep_ante_buf[-1].get('stop_dist',0) if ep_ante_buf else 0
+                    logger.warning(
+                        f'[CRASH_FORENSICS] ep={episode_count} step={global_step} wp={ep_crash_closest_wp} spd={ep_crash_speed:.2f} hdg={ep_crash_heading:.1f} '
+                        f'ante_window={_ante_n} brake_steps={_ante_brakes}/{_ante_n} '
+                        f'mean_accel={_ante_mean_accel:.2f} mean_v_perp={_ante_mean_vperp:.3f} '
+                        f'max_v_perp={_ante_max_vperp:.3f} final_v_perp={_ante_final_vperp:.3f} '
+                        f'min_dist_barrier={_ante_min_dist:.3f} final_stop_dist={_ante_final_stopdist:.3f} '
+                        f'crash_speed={ep_crash_speed:.2f}')
+                    # Dump full antecedent buffer for detailed analysis
+                    for _ai, _ar in enumerate(ep_ante_buf):
+                        logger.info(f'  [ANTE t-{_ante_n-_ai}] {_ar}')
+                # --- v4: Log stuck position ---
+                if ep_progress_pct< 100.0 or term_reason in ('offtrack', 'crashed'):
+                    _rp = info.get('reward_params', {})
+                    logger.warning(
+                        f'[STUCK] step={global_step}, '
+                        f'progress={ep_progress:.1f}%%, '
+                        f'pos=({_rp.get("x", 0):.2f}, {_rp.get("y", 0):.2f}), '
+                        f'heading={_rp.get("heading", 0):.1f}, '
+                        f'closest_wp={_rp.get("closest_waypoints", [0,1])}, '
+                        f'speed={_rp.get("speed", 0):.2f}, '
+                        f'offtrack={_rp.get("is_offtrack", False)}, '
+                        f'crashed={_rp.get("is_crashed", False)}, '
+                        f'reversed={_rp.get("is_reversed", False)}'
+                    )
+
+                et = time.time() - start_time
+                et = str(datetime.timedelta(seconds=round(et)))
+                logger.info(
+                    f'step={global_step}, '
+                    f'episodic_return={ep_return}, '
+                    f'episodic_length={ep_length}, '
+                    f'time_elapsed={et}, '
+                    f'progress={ep_progress:.1f}%, '
+                f'lap_time={lap_time_sec:.1f}s, track={_track_name}({_track_variant}), term={term_reason}, '
+                )
+
+                writer.add_scalar('charts/track_progress', ep_progress, global_step)
+                writer.add_scalar('charts/track_progress_pct',   ep_progress_pct,   global_step)
+                writer.add_scalar('charts/track_progress_m', ep_centerline_progress_m, global_step)
+                writer.add_scalar('charts/track_length_m', ep_track_length_m, global_step)
+                writer.add_scalar('charts/lap_completed', lap_completed, global_step)
+                writer.add_scalar('charts/episodic_return', ep_return, global_step)
+                writer.add_scalar('charts/episodic_length', ep_length, global_step)
+                
+
+                # --- v5: BSTS JSONL metrics (per episode) ---
+                # v1.1.2 ── every episode: build bsts_metrics ─────────────────────────
+                _crashed = 1 if rp.get('is_crashed', False) else 0
+                _min_dist = min(ep_dist_from_center) if ep_dist_from_center else 0.0
+                _graze = 1 if (_min_dist < 0.15 * _tw and not _crashed) else 0
+                # curvature*speed: mean(|heading_diff|)*mean(speed)
+                _mean_hdiff = sum(abs(h) for h in ep_heading_diffs)/max(len(ep_heading_diffs),1)
+                _mean_speed = sum(ep_speeds)/max(len(ep_speeds),1)
+                _curv_x_spd = _mean_hdiff * _mean_speed
+                # early-entry-late-exit: track apex timing via progress rate
+                _prog_diffs = [ep_progress_hist[i+1]-ep_progress_hist[i] for i in range(len(ep_progress_hist)-1)] if len(ep_progress_hist)>1 else [0]
+                _eele = max(_prog_diffs) - min(_prog_diffs) if _prog_diffs else 0.0
+                    # --- v27 harmonized metrics (success + intermediary; all up==good) ---
+                try:
+                    _hm_track_width = float(rp.get('track_width', 1.0)) if rp else 1.0
+                    _hm_n_wp = len(rp.get('waypoints', [])) if rp else None
+                    _hm_metrics = _hm.compute_all(
+                        _ep_step_log,
+                        final_progress=ep_track_progress_pct / 100.0,
+                        n_waypoints=len(_waypoints) if _waypoints else 120,
+                        track_width=float(_tw) if _tw else 0.6,
+                        waypoints=_waypoints if _waypoints else None,
+                        track_length_m=ep_track_length_m,
+                        phase_id=_current_phase_idx - 1,
+                        bc_seeded=int(n_harvested >= 5) if 'n_harvested' in dir() else 0,
+                    )
+                    # v1.1.2: explicit compliance scalars → TensorBoard + logger
+                    _rl_adh  = float(_hm_metrics.get("race_line_adherence", 0.0))
+                    _brk_cmp = float(_hm_metrics.get("brake_compliance",    0.0))
+                    _str_smt = float(_hm_metrics.get("smoothness_steering_rate", 0.0))
+                    writer.add_scalar("compliance/race_line_adherence",      _rl_adh,  global_step)
+                    writer.add_scalar("compliance/brake_compliance",         _brk_cmp, global_step)
+                    writer.add_scalar("compliance/smoothness_steering_rate", _str_smt, global_step)
+                    logger.info(
+                        f"[RACE_LINE]      ep={episode_count}  adherence={_rl_adh:.3f}  "
+                        f"(1=on-line, 0=off-line)"
+                    )
+                    logger.info(
+                        f"[BRAKE_COMPLIANCE] ep={episode_count}  compliance={_brk_cmp:.3f}  "
+                        f"(1=all brake events in field, 0=none)"
+                    )
+                    logger.info(
+                        f"[STEER_SMOOTH]   ep={episode_count}  rate={_str_smt:.3f}  "
+                        f"(1=silky, 0=oscillating)  NOTE: steering INPUT rate, not chassis jerk"
+                    )
+                except Exception as _e_hm:
+                    logger.warning(f"[HM] compute_all failed: {e_hm}")
+                    _hm_out = {k: 0.0 for k in _hm.SUCCESS_METRICS + _hm.INTERMEDIARY_METRICS} 
+                # v213: race-type tag for plot/CSV differentiation
+                _race_type_tag = {
+                    'time_trial': 'tt',
+                    'obstacle':   'oa',
+                    'h2h':        'h2h',
+                }.get(_track_variant, _track_variant)
+                bsts_row = {
+                    'episode': episode_count,
+                    'global_step': global_step,
+                    "variant": _track_variant,
+                    "track": _track_name, 
+                    'crash': _crashed,
+                    'graze': _graze,
+                    'curvature_x_speed': round(_curv_x_spd, 4),
+                    'early_entry_late_exit': round(_eele, 4),
+                    'progress': round(ep_progress, 2),
+                    'ep_return': round(ep_return, 4),
+                    'ep_brake_frac': round(_ep_summary.get('brake_fraction',0.0),4) if _ep_summary else 0.0,
+                    'ep_speed_mean': round(_ep_summary.get('mean_speed',0.0),4) if _ep_summary else 0.0,
+                    'ep_speed_std':  round(_ep_summary.get('speed_var',0.0)**0.5,4) if _ep_summary else 0.0,
+                                    'lap_time_sec': round(lap_time_sec,2),
+                    # v213: race-type / arc-length telemetry
+                    'race_type':             _race_type_tag,
+                    'track_arc_m':           round(ep_track_length_m, 2),
+                    'track_progress_pct':    round(ep_progress_pct, 2),
+                    'track_progress_arc_m':  round(ep_centerline_progress_m, 2),
+            'term_reason': term_reason,
+            'track_name': _track_name,
+            'track_variant': _track_variant,
+                # v29 crash antecedent forensics
+                'ante_brake_steps': sum(1 for r in ep_ante_buf if r.get('braking',0)),
+                'ante_mean_accel': round(sum(r.get('accel',0) for r in ep_ante_buf)/max(len(ep_ante_buf),1),3),
+                'ante_mean_vperp': round(sum(r.get('v_perp',0) for r in ep_ante_buf)/max(len(ep_ante_buf),1),3),
+                'ante_final_vperp': round(ep_ante_buf[-1].get('v_perp',0),3) if ep_ante_buf else 0,
+                'ante_final_stopdist': round(ep_ante_buf[-1].get('stop_dist',0),3) if ep_ante_buf else 0,
+                    'rl_blend':      round(_rl_blend,4),
+                    'env_signal':    round(_env_signal if '_env_signal' in dir() else 0.0,4),
+                    'avg_speed': round(_mean_speed, 4),
+                    'min_dist_from_center': round(_min_dist, 4),
+                    'offtrack_rate': round(ep_offtrack_count/max(ep_step_count,1), 4),
+                    'reversed_count': ep_reversed_count,
+                    'zero_speed_count': ep_zero_speed_count,
+                'avg_safe_speed_ratio': round(sum(ep_safe_speed_ratios)/max(len(ep_safe_speed_ratios),1), 4),
+                'avg_racing_line_err': round(sum(ep_racing_line_errors)/max(len(ep_racing_line_errors),1), 4),
+                'avg_decel_penalty': round(sum(ep_decel_penalties)/max(len(ep_decel_penalties),1), 4),
+                    'recovery_steps': ep_recovery_steps,
+                'avg_turn_entry_ratio': round(sum(ep_turn_entry_speeds)/max(len(ep_turn_entry_speeds),1), 4) if ep_turn_entry_speeds else 0.0,
+                }
+                bsts_row.update(_hm_out)
+
+
+
+                # --- v4: Log sub-reward breadcrumbs ---
+                if ep_step_count > 0:
+                    for comp_name, comp_vals in ep_rewards_components.items():
+                        if comp_vals:
+                            avg_val = sum(comp_vals) / len(comp_vals)
+                            writer.add_scalar(f"rewards/{comp_name}", avg_val, global_step)
+                    if ep_speeds:
+                        writer.add_scalar("behavior/avg_speed", sum(ep_speeds)/len(ep_speeds), global_step)
+                    if ep_dist_from_center:
+                        writer.add_scalar("behavior/avg_dist_from_center", sum(ep_dist_from_center)/len(ep_dist_from_center), global_step)
+                    writer.add_scalar("behavior/offtrack_rate", ep_offtrack_count / ep_step_count, global_step)
+                    writer.add_scalar("behavior/ep_steps", ep_step_count, global_step)
+                # v4: context-aware tensorboard logging
+                    # v4-bsts: compute metrics BEFORE reset
+                bsts_metrics = {
+                    'crash_rate': float(terminated),
+                    'offtrack_rate': float(ep_offtrack_count / max(ep_step_count, 1)),
+                    'avg_speed': sum(ep_speeds)/max(len(ep_speeds),1) if ep_speeds else 2.0,
+                    'corner_crash_rate': float(terminated and ep_step_count < 50),
+                'avg_safe_speed_ratio': round(sum(ep_safe_speed_ratios) / max(len(ep_safe_speed_ratios), 1), 4),
+                'avg_racing_line_err':  round(sum(ep_racing_line_errors) / max(len(ep_racing_line_errors), 1), 4),
+                'ctx_obstacle_ratio': sum(1 for h in ep_context_preds if h == 2) / max(len(ep_context_preds), 1),
+                'ctx_curb_ratio': sum(1 for h in ep_context_preds if h == 1) / max(len(ep_context_preds), 1),
+                'ctx_clear_ratio': sum(1 for h in ep_context_preds if h == 0) / max(len(ep_context_preds), 1),
+                'avg_corner_speed': sum(ep_corner_speeds) / max(len(ep_corner_speeds), 1) if ep_corner_speeds else 0.0,
+                'graze_count': ep_graze_count,
+                'crash_ctx': ep_crash_ctx if ep_crash_ctx is not None else -1,
+                'crash_speed': ep_crash_speed if ep_crash_speed is not None else 0.0,
+                'crash_lidar_min': ep_crash_lidar_min if ep_crash_lidar_min is not None else 1.0,
+
+                # v26: barrier-relative velocity at crash
+                'crash_v_perp_barrier': _compute_crash_v_perp(ep_crash_speed, ep_crash_heading, ep_crash_closest_wp, _waypoints) if ep_crash_speed is not None else 0.0,
+                'crash_v_tang_barrier': _compute_crash_v_tang(ep_crash_speed, ep_crash_heading, ep_crash_closest_wp, _waypoints) if ep_crash_speed is not None else 0.0,
+                'avg_lidar_min': sum(ep_lidar_mins)/max(len(ep_lidar_mins),1) if ep_lidar_mins else 1.0,
+                'avg_barrier_proximity': sum(ep_barrier_proximities)/max(len(ep_barrier_proximities),1) if ep_barrier_proximities else 0.0,
+                'avg_nearest_object': sum(ep_nearest_objects)/max(len(ep_nearest_objects),1) if ep_nearest_objects else 999.0,
+                # v29 crash antecedent metrics
+                'crash_ante_brake_steps': sum(1 for r in ep_ante_buf if r.get('braking',0)) if ep_ante_buf else 0,
+                'crash_ante_mean_accel': sum(r.get('accel',0) for r in ep_ante_buf)/max(len(ep_ante_buf),1),
+                'crash_ante_mean_vperp': sum(r.get('v_perp',0) for r in ep_ante_buf)/max(len(ep_ante_buf),1),
+                'crash_ante_final_vperp': ep_ante_buf[-1].get('v_perp',0) if ep_ante_buf else 0,
+                'crash_ante_final_stopdist': ep_ante_buf[-1].get('stop_dist',0) if ep_ante_buf else 0,
+                    'avg_ang_vel_centerline': (sum(ep_ang_vel_centerline)/len(ep_ang_vel_centerline)) if ('ep_ang_vel_centerline' in dir() and ep_ang_vel_centerline) else 0.0,  # v37
+                    'avg_jerk': (sum(ep_jerk_abs)/len(ep_jerk_abs)) if ('ep_jerk_abs' in dir() and ep_jerk_abs) else 0.0,  # v37
+                    'max_jerk': (max(ep_jerk_abs) if ('ep_jerk_abs' in dir() and ep_jerk_abs) else 0.0),  # v37
+                    'brake_line_compliance': (sum(ep_brake_before_barrier)/len(ep_brake_before_barrier)) if ('ep_brake_before_barrier' in dir() and ep_brake_before_barrier) else 0.0,  # v37
+                    'position_in_lap': float(ep_progress),  # v1.0.14 centerline pct
+                    'completion_pct': float(ep_progress),
+                    'track_progress_m': float(ep_centerline_progress_m),
+                    'track_length_m': float(ep_track_length_m),
+                    'lap_completed': float(lap_completed),  # v1.0.14 strict completion gate
+                }
+                # v1.1.0: merge harmonized_metrics output into bsts_metrics
+                # so avg_speed_centerline, track_progress, race_line_adherence reach BSTS EMA
+                if _hm_out:
+                    bsts_metrics.update({
+                        'avg_speed_centerline': float(_hm_out.get('avg_speed_centerline', 0.0)),
+                        'track_progress':       float(_hm_out.get('track_progress', 0.0)),
+                        'race_line_adherence':  float(_hm_out.get('race_line_adherence', 0.0)),
+                        'brake_compliance':     float(_hm_out.get('brake_compliance', 0.0)),
+                        'smoothness_steering_rms':  float(_hm_out.get('smoothness_steering_rms', 0.0)),
+                    })
+                if {k: v for k, v in bsts_metrics.items()
+                 if isinstance(v, (int, float)) and v != 0.0}: # v1.1.2: only pass metrics that have actual signal:
+                    bsts_feedback.update(bsts_metrics)
+                # v4: Periodic save of failure analysis 
+                # v1.1.2 moved the chunk above out of episode_count % 25 ==0
+                if episode_count % 20 == 0:
+                    sampler.save()
+                    jsonl_file.write(json.dumps(bsts_row) + '\n')
+                    jsonl_file.flush()
+                    print(f"[KALMAN_CHECK] n_kfs={len(bsts_feedback._kf_instances)}, "
+                        f"kf_trends={dict(list(bsts_feedback.kf_trends.items())[:3])}")
+                # --- Compute BSTS-adjusted reward weights ---
+                # v1.1.1: skip BSTS weight adjustment during bootstrap.
+                # BSTS was overwriting bootstrap progress weights -> rw_adj:prog collapsed 0.127->0.026.
+                if _bootstrap_active:
+                    _adjusted_rw = rw  # bootstrap weights unchanged during bootstrap phase
+                else:
+                    _adjusted_rw = bsts_feedback.adjust_weights(rw)
+                # --- Rich BSTS console log every episode ---
+                _bsts_ctx = f"ctx=clear:{bsts_metrics.get('ctx_clear_ratio',0):.2f}/curb:{bsts_metrics.get('ctx_curb_ratio',0):.2f}/obs:{bsts_metrics.get('ctx_obstacle_ratio',0):.2f}"
+                print(
+                    f'[BSTS ep={episode_count:5d} step={global_step:7d} Track={_track_name}({_track_variant})] '
+                    f'ret={ep_return:8.2f} prog={ep_progress:5.1f}% spd={bsts_metrics.get("avg_speed",0):.2f} '
+                    f'crash={bsts_metrics.get("crash_rate",0):.2f} otr={bsts_metrics.get("offtrack_rate",0):.2f} '
+                    f'ssr={bsts_metrics.get("avg_safe_speed_ratio",1):.2f} rle={bsts_metrics.get("avg_racing_line_err",0):.2f} '
+                    f'term={term_reason} lap_t={lap_time_sec:.1f}s {_bsts_ctx} '
+                    f'rw_adj=center:{_adjusted_rw.get("center",0):.3f}/prog:{_adjusted_rw.get("progress",0):.3f}/corner:{_adjusted_rw.get("corner",0):.3f}',
+                    flush=True
+                )
+                # Log to BSTS CSV
+                try:
+                    _bsts_csv_writer.writerow({
+                        'episode': episode_count, 'global_step': global_step,
+                        'race_type':            _race_type_tag,
+                        'track_name':           _track_name,
+                        'track_variant':        _track_variant,
+                        'track_arc_m':          round(ep_track_length_m, 2),
+                        'track_progress_pct':   round(ep_progress_pct, 2),
+                        'track_progress_arc_m': round(ep_centerline_progress_m, 2),
+                        'crash_rate': bsts_metrics.get('crash_rate',0),
+                        'offtrack_rate': bsts_metrics.get('offtrack_rate',0),
+                        'avg_speed': bsts_metrics.get('avg_speed',0),
+                        'corner_crash_rate': bsts_metrics.get('corner_crash_rate',0),
+                        'avg_safe_speed_ratio': bsts_metrics.get('avg_safe_speed_ratio',1),
+                        'avg_racing_line_err': bsts_metrics.get('avg_racing_line_err',0),
+                        **{f'rw_{k}': _adjusted_rw.get(k,0) for k in ['center','heading','curv_speed','progress','completion','corner','braking','min_speed','racing_line']}
+                    })
+                    _bsts_csv_f.flush()
+                    # v28: Periodic console summary from live_dashboard
+                    if live_summary is not None and episode_count % 500 == 0:
+                        try:
+                            live_summary(bsts_feedback, global_step, episode_count)
+                        except Exception:
+                            pass  # non-critical
+                except Exception as _ce:
+                    pass
+                # Use BSTS-adjusted weights for next episode reward shaping
+                rw = _adjusted_rw
+            # === Online Kalman BSTS update ===
+                try:
+                    ep_data = {'steps': _ep_step_log, 'completion_pct': bsts_metrics.get('completion_pct', 0),
+                               'termination_reason': term_reason}
+                    # Wire: extract real intermediary metrics from episode step log
+                    try:
+                        intermediary = extract_intermediary_metrics({'steps': _ep_step_log})
+                    except Exception:
+                        intermediary = {m: [0] for m in INTERMEDIARY_METRICS}  # fallback
+                    summary = episode_summary_metrics(ep_data, intermediary)
+                    # Override with actual bsts_metrics values
+                    summary['lap_completion_pct'] = bsts_metrics.get('completion_pct', 0)
+                    summary['reward_per_step'] = bsts_metrics.get('avg_reward', 0)
+                    summary['off_track_rate'] = bsts_metrics.get('offtrack_rate', 0)
+                    summary['crash_rate'] = 1.0 if term_reason == 'crashed' else 0.0
+                    _kf_episode_buffer.append(summary)
+                    if hasattr(bsts_feedback, "_all_summaries"): bsts_feedback._all_summaries.append(summary)
+                    # v1.1.1: flush Kalman every episode (was 10). Eps are 14-29 steps each;
+                    # at batch=10, Kalman was dead (all zeros) for 200+ episodes.
+                    if len(_kf_episode_buffer) >= 1:
+                        # import numpy as np  # use global
+                        reg_names = [f'{m}_mean' for m in INTERMEDIARY_METRICS]
+                        n = len(_kf_episode_buffer)
+                        X = np.zeros((n, len(reg_names)))
+                        for t in range(n):
+                            for j, rn in enumerate(reg_names):
+                                X[t, j] = _kf_episode_buffer[t].get(rn, 0.0)
+                        X_std = X.std(axis=0) + 1e-8
+                        X_norm = (X - X.mean(axis=0)) / X_std
+                        for sm in SUCCESS_METRICS:
+                            y = np.array([_kf_episode_buffer[t].get(sm, 0) for t in range(n)])
+                            result = _kf_bsts[sm].filter_series(y, X_norm)
+                            bsts_feedback.kf_trends[sm] = float(result['trends'][-1])
+                            if result.get('betas') is not None:
+                                for j, rn in enumerate(reg_names):
+                                    bsts_feedback.kf_betas[rn] = float(result['betas'][-1][j])
+                        _kf_episode_buffer.clear()
+
+                        # === BSTS Compliance Report (every 50 episodes) ===
+                        if episode_count > 0 and episode_count % 50 == 0:
+                            try:
+                                _bsts_matrix = list(_kf_episode_buffer) if _kf_episode_buffer else []
+                                # Use accumulated summaries from all prior episodes
+                                if hasattr(bsts_feedback, '_all_summaries'):
+                                    _bsts_matrix = bsts_feedback._all_summaries
+                                if len(_bsts_matrix) >= 10:
+                                    _bsts_rpt = bsts_compliance_report(_bsts_matrix)
+                                    _anneal_recs = compute_anneal_recommendations(_bsts_rpt, _bsts_matrix)
+                                    logger.info(f"[BSTS-Report] trend={_bsts_rpt.get('trend','?')} "
+                                                f"seasonal={_bsts_rpt.get('seasonal_period','?')} "
+                                                f"LR_rec={_anneal_recs.get('learning_rate','?')} "
+                                                f"residual_std={_anneal_recs.get('residual_std',0):.4f}")
+                                    for sm, trend in _bsts_rpt.get('per_metric_trends', {}).items():
+                                        logger.info(f"  {sm}: {trend}")
+                                    for rec in _bsts_rpt.get('recommendations', []):
+                                        logger.info(f"  [REC] {rec.get('action','')}")
+                                    # Apply anneal recommendations to reward weights
+                                    for k, v in _anneal_recs.get('reward_weight_adjustments', {}).items():
+                                        logger.info(f"  [ANNEAL] {k}: {v}")
+                            except Exception as _be:
+                                logger.debug(f"BSTS report skip: {_be}")
+
+                        # === Race Line Analysis (every 100 episodes) ===
+                        if episode_count > 0 and episode_count % 100 == 0:
+                            try:
+                                _wps = []
+                                if hasattr(bsts_feedback, '_all_summaries'):
+                                    for _ep in bsts_feedback._all_summaries[-20:]:
+                                        if _ep.get('lap_completion_pct', 0) > 80:
+                                            _wps = [(s.get('x',0), s.get('y',0)) for s in _ep.get('_steps', [])]
+                                            break
+                                if not _wps and hasattr(env, 'waypoints'):
+                                    _wps = [(w[0], w[1]) for w in env.waypoints]
+                                if _wps and len(_wps) >= 4:
+                                    _rl = compute_optimal_race_line(_wps)
+                                    logger.info(f"[RaceLine] brake_integral={_rl.get('brake_zone_integral',0):.3f} ")
+                                _rl_eps = [{"steps": e.get("_steps", []), "completion_pct": e.get("lap_completion_pct", 0)} for e in bsts_feedback._all_summaries[-20:]]
+                                _rl_score = score_race_line_compliance(_rl_eps, _rl)
+                                logger.info(f"[RaceLine] perp_v={_rl_score.get(chr(39)+chr(97)+chr(118)+chr(103)+chr(95)+chr(112)+chr(101)+chr(114)+chr(112)+chr(95)+chr(118)+chr(39), 0):.4f}")
+                            except Exception as _re:
+                                logger.debug(f"Race line analysis skip: {_re}")
+                        logger.info(f"[BSTS-Kalman] trends={bsts_feedback.kf_trends} betas_top={dict(list(bsts_feedback.kf_betas.items())[:3])}")
+                except Exception as e:
+                    # v1.1.0: was bare `pass` — silent death of ALL Kalman signal.
+                    # Now logs at DEBUG so we can see what's failing without spamming console.
+                    logger.debug(f"[BSTS-Kalman] update failed ep={episode_count}: {type(e).__name__}: {e}")
+
+                                # TensorBoard context/crash/barrier scalars — only when we have context data
+                if ep_context_preds:
+                    writer.add_scalar('context/obstacle_ratio',  bsts_metrics.get('ctx_obstacle_ratio', 0),  global_step)
+                    writer.add_scalar('context/curb_ratio',      bsts_metrics.get('ctx_curb_ratio', 0),      global_step)
+                    writer.add_scalar('context/avg_corner_speed',bsts_metrics.get('avg_corner_speed', 0),    global_step)
+                    writer.add_scalar('context/graze_count',     bsts_metrics.get('graze_count', 0),         global_step)
+                    writer.add_scalar('crash/ctx_at_crash',      bsts_metrics.get('crash_ctx', -1),          global_step)
+                    writer.add_scalar('crash/speed_at_crash',    bsts_metrics.get('crash_speed', 0),         global_step)
+                    writer.add_scalar('crash/lidar_min_at_crash',bsts_metrics.get('crash_lidar_min', 1),     global_step)
+                    writer.add_scalar('barrier/avg_lidar_min',   bsts_metrics.get('avg_lidar_min', 1),       global_step)
+                    writer.add_scalar('barrier/avg_proximity',   bsts_metrics.get('avg_barrier_proximity', 0),global_step)
+                    writer.add_scalar('barrier/avg_nearest_obj', bsts_metrics.get('avg_nearest_object', 999),global_step)
+
+                # Reset accumulators — ALWAYS, not gated on ep_context_preds
+                _brake_field.reset()
+                ep_rewards_components  = {k: [] for k in ep_rewards_components}
+                ep_speeds              = []
+                ep_headings            = []
+                ep_closest_wps         = []
+                ep_dist_from_center    = []
+                ep_offtrack_count      = 0
+                ep_offtrack_steps      = 0
+                ep_step_count          = 0
+                cumulative_ep_reward   = 0.0
+                _prev_prog_tracker     = 0.0
+                ep_progress            = 0.0
+                ep_progress_pct        = 0.0
+                ep_centerline_progress_m = 0.0
+                ep_track_length_m      = 100.0
+                ep_track_progress_pct  = 0.0
+                ep_context_preds       = []
+                ep_lidar_mins          = []
+                ep_barrier_proximities = []
+                ep_nearest_objects     = []
+                ep_crash_ctx           = None
+                ep_crash_speed         = None
+                ep_crash_heading       = None
+                ep_crash_closest_wp    = None
+                ep_crash_lidar_min     = None
+                ep_corner_speeds       = []
+                ep_graze_count         = 0
+                ep_heading_diffs = []
+                ep_ang_vel_centerline = []  # v37
+                _trunc_rp = info.get("reward_params", {}) if isinstance(info, dict) else {}
+                ep_prev_speed = float(_trunc_rp.get("speed", 0.0))        
+                _step_speed_snap = ep_prev_speed
+                ep_jerk_abs = []  # v37
+                ep_brake_before_barrier = []  # v37
+                ep_steerings_raw = []
+                ep_decel_penalties = []
+                ep_safe_speed_ratios = []
+                ep_racing_line_errors = []
+                # v1.1.0: flush BSTSSeasonal episode buffer before resetting
+                if bsts_season is not None and hasattr(bsts_season, '_flush_episode'):
+                    try:
+                        bsts_season._flush_episode(lap_completed > 0.5)
+                        # periodic Kalman fit from step buffer (every 20 episodes)
+                        if episode_count % 20 == 0 and len(getattr(bsts_season, '_ep_buf', [])) >= getattr(bsts_season, 'STEP_BUFFER_MIN_EPISODES', 20):
+                            bsts_season._fit_from_step_buffer()
+                            _bsts_trend = bsts_season.get_trend() if hasattr(bsts_season, 'get_trend') else {}
+                            logger.info(f"[BSTS-Kalman] ep={episode_count} trend={_bsts_trend}")
+                    except Exception as _fe:
+                        logger.debug(f"BSTS flush error: {_fe}")
+                _ep_step_log = []
+                ep_recovery_steps = 0
+                ep_in_recovery = False
+                ep_turn_entry_speeds = []
+                ep_positions = []
+                ep_first_offtrack_step = None
+                ep_progress_hist = []
+                ep_reversed_count = 0
+                ep_zero_speed_count = 0
+                ep_offtrack_steps = 0 
+                ep_start_time = time.time()  # v24: reset lap timer
+                # v17-bsts feedback: wire analysis -> annealing
+                if bsts_season is not None:
+                    try:
+                        # get_trend_vector returns {metric: 5-step linear slope}
+                        _tv   = bsts_feedback.get_trend_vector(race_type_filter=_track_variant)
+                        trend = float(_tv.get('reward', 0.0))     # use reward trend as proxy for return trend
+                        # seasonal component is internal to the Kalman RLS inside BSTSFeedback.model()
+                        # — not separately extractable; set to 0.0 here
+                        seasonal = 0.0
+                        m = {
+                            'ep_return':    ep_return,
+                            'trend':        trend,
+                            'seasonal':     seasonal,
+                            'episode':      episode_count,
+                            'crash_rate':   ep_offtrack_count / max(ep_step_count, 1),
+                            'avg_speed':    float(np.mean(ep_speeds)) if ep_speeds else 0.0,
+                        }
+                        bsts_feedback.update(m, step=global_step, race_type_tag=_track_variant)
+                        if hasattr(bsts_feedback, 'adjust_weights'):
+                            adj = bsts_feedback.adjust_weights(scheduler.get_reward_weights(global_step),
+                                                            race_type_filter=_track_variant)
+                            scheduler.rw_end = adj
+                        if hasattr(td3sac, 'update_alpha') and 'logprobs' in locals() and len(logprobs) > 0:
+                            _ep_mean_logp = float(logprobs[:min(ep_step_count, len(logprobs))].mean().item())
+                            td3sac.update_alpha(_ep_mean_logp)
+                    except Exception as e:
+                        logger.debug(f"BSTS feedback skip: {e}")
+                # v17: periodic live analysis and race-line phase-out
+                if episode_count % 50 == 0 and episode_count > 0:
+                    try:
+                        import os as _os
+                        _lp = _os.path.join("results", "metrics.jsonl")
+                        if _os.path.exists(_lp) and _ANALYSIS_MODULES:
+                            _a = live_analyze(_lp)
+                            logger.info(f"Live analysis ep{episode_count}: {_a}")
+                    except Exception as _e:
+                        logger.debug(f"Live analysis skip: {_e}")
+
+                for _rtry in range(3):
+                    try:
+                        observation, info = env.reset()
+                        # v1.0.14: init arc-progress state for NEW episode spawn position
+                        _new_rp = info.get("reward_params", {}) if isinstance(info, dict) else {}
+                        _episode_progress_state = reset_episode_centerline_progress(
+                            _new_rp, _track_progress_cache
+                        )
+                        break
+                    except Exception as e:
+                        logger.warning(f"mid-training reset attempt {_rtry+1}/3 failed: {e}")
+                        if _rtry < 2:
+                            # Simple retry first — ZMQ may just need a moment
+                            time.sleep(5)
+                        else:
+                            # All 3 simple retries exhausted — full ZMQ rebuild
+                            logger.warning("mid-training: all retries failed, rebuilding env with ZMQ teardown")
+                            try:
+                                env.close()
+                            except Exception:
+                                pass
+                            time.sleep(10)  # let OS release the socket before rebind
+                            env = _apply_phase_env(args, _phase)
+                            # Brief preflight to confirm port 8888 is back up before handing off
+                            for _wait in range(6):
+                                if preflightgymbridge():
+                                    break
+                                time.sleep(5)
+                else:
+                    raise RuntimeError("mid-training env.reset unrecoverable after 3 retries")
+                next_obs = tensor(obs_to_array(observation))
+                next_done = torch.zeros(1, device=DEVICE)
+            if ep_progress_pct> 10 and ep_return > best_return:  # v41: must have >10% progress to be best
+                    best_return = ep_return
+                    torch.save({
+                        'state_dict': agent.state_dict(),
+                        'class': agent.__class__.__name__,
+                        '_obs_dim': _obs_dim,
+                        'actdim': _act_dim_agent,
+                    }, f"{agent.name}best.torch")
+
+                    # LOAD (line ~684)
+
+                    pool.add_checkpoint(agent, ep_return, episode_count)  # v8
+                    logger.info(f'New best model saved: return={best_return}')
+
+
+        # ---- compute GAE ----
+
+        with torch.no_grad():
+            next_value = agent.get_value(next_obs.unsqueeze(0))
+
+        advantages = zeros((num_steps,))
+        lastgaelam = 0
+        for t in reversed(range(num_steps)):
+            if t == num_steps - 1:
+                nextnonterminal = 1.0 - next_done
+                nextvalues = next_value
+            else:
+                nextnonterminal = 1.0 - dones[t + 1]
+                nextvalues = values[t + 1]
+            delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
+            advantages[t] = lastgaelam = delta + args.gamma * hp['gae_lambda'] * nextnonterminal * lastgaelam
+        returns = advantages + values
+
+        # ---- PPO update ----
+        b_obs = obs.reshape((-1,) + obs_shape)
+        b_logprobs = logprobs.reshape(-1)
+        b_actions = actions.reshape(-1).long() if _is_discrete else actions  # V33: keep 2D for continuous; V211
+        b_advantages = advantages.reshape(-1)
+        b_returns = returns.reshape(-1)
+        b_values = values.reshape(-1)
+        b_context_labels = context_labels.reshape(-1).long()
+
+        b_inds = np.arange(batch_size)
+        clipfracs = []
+        for epoch in range(update_epochs):
+            np.random.shuffle(b_inds)
+            for start in range(0, batch_size, minibatch_size):
+                end = start + minibatch_size
+                mb_inds = b_inds[start:end]
+
+                _, newlogprob, entropy, newvalue, new_ctx_logits, _new_intermed = agent.get_action_and_value(
+                    b_obs[mb_inds], b_actions[mb_inds]
+                )
+                logratio = newlogprob - b_logprobs[mb_inds]
+                ratio = logratio.exp()
+
+                with torch.no_grad():
+                    approx_kl = ((ratio - 1) - logratio).mean()
+                    clipfracs.append(
+                        ((ratio - 1.0).abs() > hp['clip_coef']).float().mean().item()
+                    )
+
+                mb_advantages = b_advantages[mb_inds]
+                if norm_adv:
+                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (
+                        mb_advantages.std() + 1e-8
+                    )
+
+                # policy loss
+                pg_loss1 = -mb_advantages * ratio
+                pg_loss2 = -mb_advantages * torch.clamp(
+                    ratio, 1 - hp['clip_coef'], 1 + hp['clip_coef']
+                )
+                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+                # value loss
+                if clip_vloss:
+                    # REF: Fujimoto et al. (2018) target policy smoothing: clipped noise on value targets
+                    _smooth_noise = torch.randn_like(b_returns[mb_inds]).clamp(-0.5, 0.5) * 0.1
+                    _smoothed_returns = (b_returns[mb_inds] + _smooth_noise).detach()
+                    v_loss_unclipped = (newvalue - _smoothed_returns) ** 2
+                    v_clipped = b_values[mb_inds] + torch.clamp(
+                        newvalue - b_values[mb_inds],
+                        -hp['clip_coef'], hp['clip_coef'],
+                    )
+                    v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
+                    v_loss = 0.5 * torch.max(
+                        v_loss_unclipped, v_loss_clipped
+                    ).mean()
+                else:
+                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
+
+                entropy_loss = entropy.mean()
+                # REF: Haarnoja et al. (2018) update adaptive temperature
+                if _RESEARCH_MODULES and '_log_alpha' in dir():
+                    _alpha_loss = -(_log_alpha * (entropy_loss.detach() + _target_entropy))
+                    _alpha_optim.zero_grad(); _alpha_loss.backward(); _alpha_optim.step()
+                    hp['ent_coef'] = float(_log_alpha.exp().detach().clamp(0.01, 1.0))
+                ctx_loss = torch.nn.functional.cross_entropy(new_ctx_logits, b_context_labels[mb_inds])
+                # v1.1.1: add intermed_loss so the intermediary head actually learns
+                # REF: Hettiarachchi et al. (2024) U-Transformer auxiliary losses.
+                _device_resolved = device if isinstance(device, torch.device) else torch.device(str(device))
+                _intermed_tgts_raw = compute_intermed_targets(
+                    params if 'params' in dir() else {},
+                    race_line_engine=race_line_eng if 'race_line_eng' in locals() else None
+                )
+                _intermed_targets_mb = _intermed_tgts_raw.to(_device_resolved).unsqueeze(0).expand(len(mb_inds), -1)
+                _intermed_loss = torch.nn.functional.mse_loss(
+                    _new_intermed, _intermed_targets_mb.detach()
+                )
+                # v1.1.1: intermed head needs a gradient signal or ctx_emb stays random.
+                # Use self-consistency target: intermediary output should be stable across steps
+                # (L2 toward running EMA of its own outputs — no external ground truth needed).
+                if not hasattr(agent, '_intermed_ema'):
+                    agent._intermed_ema = None
+                if agent._intermed_ema is None:
+                    agent._intermed_ema = _new_intermed.detach().mean(0)
+                else:
+                    agent._intermed_ema = (0.95 * agent._intermed_ema +
+                                        0.05 * _new_intermed.detach().mean(0))
+                intermed_consistency_loss = F.mse_loss(
+                    _new_intermed,
+                    agent._intermed_ema.unsqueeze(0).expand_as(_new_intermed).detach()
+                )
+                loss = (0.3 * pg_loss
+                        - hp['ent_coef'] * entropy_loss
+                        + vf_coef * v_loss
+                        + 0.1 * ctx_loss
+                        + 0.03 * intermed_consistency_loss)  # gentle — don't overwhelm PPO
+
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    agent.parameters(), max_grad_norm
+                )
+                optimizer.step()
+                # --- v19: TD3+SAC critic update ---
+                if global_step % _td3sac_update_freq == 0 and len(td3sac.replay) >= 256:
+                    _em = td3sac.update_critics(agent, batch_size=256)
+                    if _em["critic_loss"] > 0:
+                        writer.add_scalar("td3sac/critic_loss", _em["critic_loss"], global_step)
+                        writer.add_scalar("td3sac/alpha", _em["alpha"], global_step)
+                        writer.add_scalar("td3sac/q1_mean", _em["q1_mean"], global_step)
+                        writer.add_scalar("td3sac/replay_size", _em["replay_size"], global_step)
+                # --- v20: TD3 actor update (PRIMARY policy optimizer) ---
+                if global_step % (_td3sac_update_freq * 2) == 0:
+                    _td3_actor = td3sac.update_actor(agent, batch_size=256)
+                    _td3_bc_val_log = _td3_actor.get("td3_bc_loss_val", 0.0) or 0.0
+                    _obs_b_for_log = b_obs[mb_inds]
+                    print(f"[TD3_ACTOR] obs_max={_obs_b_for_log.abs().max():.2f}, "
+                        f"bc_loss={_td3_bc_val_log:.4f}, ready={_td3_actor.get(chr(39)+chr(116)+chr(100)+chr(51)+chr(95)+chr(114)+chr(101)+chr(97)+chr(100)+chr(121)+chr(39), False)}")
+                    # v1.1.1: use td3_ready flag; blend bc_loss into PPO loss
+                    # rather than running a separate optimizer step (avoids
+                    # double-stepping the optimizer and corrupting GAE returns).
+                    # REF: Fujimoto et al. (2021) TD3+BC §3 — lambda * BC term.
+                    if _td3_actor.get("td3_ready") and _td3_actor.get("td3_bc_loss") is not None:
+                        _td3_bc = _td3_actor["td3_bc_loss"]
+                        if torch.isfinite(_td3_bc):
+                            # Blend into current minibatch loss (loss was already .backward()'d
+                            # above — we need a fresh backward for the bc term only)
+                            optimizer.zero_grad()
+                            (0.05 * _td3_bc).backward()
+                            torch.nn.utils.clip_grad_norm_(agent.parameters(), 0.5)
+                            optimizer.step()
+                            writer.add_scalar("td3sac/actor_bc_loss", _td3_actor["td3_bc_loss_val"], global_step)
+                            writer.add_scalar("td3sac/q1_mean_actor", _td3_actor["td3_q1_mean"], global_step)
+
+            if target_kl is not None and approx_kl > target_kl:
+                break
+
+        # logging
+        writer.add_scalar('losses/policy_loss', pg_loss.item(), global_step)
+        writer.add_scalar('losses/value_loss', v_loss.item(), global_step)
+        writer.add_scalar('losses/entropy', entropy_loss.item(), global_step)
+        writer.add_scalar('losses/approx_kl', approx_kl.item(), global_step)
+        writer.add_scalar('losses/clipfrac', np.mean(clipfracs), global_step)
+        writer.add_scalar('losses/context_loss', ctx_loss.item(), global_step)
+        writer.add_scalar(
+            'charts/SPS',
+            int(global_step / (time.time() - start_time)),
+            global_step,
+        )
+
+        # periodic save
+        if update % 10 == 0:
+            torch.save({
+                'state_dict': agent.state_dict(),
+                'class': agent.__class__.__name__,
+                '_obs_dim': _obs_dim,
+                'actdim': _act_dim_agent,
+            }, f"{agent.name}best.torch")
+            logger.info(
+                f'Update {update}/{num_updates}, '
+                f'step={global_step}, '
+                f'policy_loss={pg_loss.item():.4f}, '
+                f'value_loss={v_loss.item():.4f}'
+            )
+
+    pool.save_manifest()  # v8: persist pool
+    # final save
+    torch.save({
+            'state_dict': agent.state_dict(),
+            'class': agent.__class__.__name__,
+            '_obs_dim': _obs_dim,
+            'actdim': _act_dim_agent,
+        }, f"{agent.name}best.torch")
+    sampler.save()  # v4: Final save of failure analysis
+    # --- v201 guard: detect silent empty-episode / no-sim failure ---
+    try:
+        jsonl_file.flush()
+        import os as _os
+        _sz = _os.path.getsize(jsonl_path)
+        if _sz == 0:
+            logger.error(f'[GUARD] JSONL is EMPTY ({jsonl_path}): no episodes terminated. '
+                         f'Likely the DeepRacer sim (docker) is not running on this node. '
+                         f'Run start_deepracer.sh on a docker-capable PACE session.')
+        else:
+            logger.info(f'[GUARD] JSONL size={_sz} bytes -> episodes were recorded.')
+    except Exception as _ge:
+        logger.warning(f'[GUARD] size check failed: {_ge}')
+    jsonl_file.close()
+    logger.info(f'Model {agent.name} saved. Training complete.')
+    logger.info(f'JSONL metrics saved to {jsonl_path}')
+    env.close()
+    writer.close()
+    # Shutdown dashboard
+    try:
+        if '_dash_proc' in dir() and _dash_proc:
+            _dash_proc.terminate()
+            logger.info('[DASHBOARD] Terminated dashboard process')
+    except: pass
+    try:
+        _bsts_csv_f.close()
+    except: pass
+
+
+if __name__ == "__main__":
+    run({})
