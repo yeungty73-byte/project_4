@@ -3197,14 +3197,16 @@ def run(hparams):
                         'termination_reason': term_reason,
                         # v1.6.0 FIX-L: pass tw + n_wp so extract_intermediary_metrics
                         # and episode_summary_metrics use real values, not 0.6 / 100 defaults.
-                        'track_width':    float(_tw) if '_tw' in dir() and _tw else 0.6,
-                        'n_waypoints':    len(_waypoints) if '_waypoints' in dir() and _waypoints else 120,
-                        # v1.1.5c FIX-I: forward ep_track_length_m so episode_summary_metrics →
-                        # compute_all → _track_progress() receives real arc length, not None.
-                        # Without this key, _track_progress falls back to progress/100
-                        # → track_progress=0.0 in Kalman X-matrix.
-                        # FIX-O ensures ep_track_length_m=16.6 not 100.0 (which failed <99.0 guard).
-                        'track_length_m': float(ep_track_length_m) if 'ep_track_length_m' in dir() and ep_track_length_m > 1.0 else 16.6,
+                        'track_width':  float(_tw) if '_tw' in dir() and _tw else 0.6,
+                        'n_waypoints':  len(_waypoints) if '_waypoints' in dir() and _waypoints else 120,
+                        # v1.1.5e FIX-I: forward real arc length so _track_progress() guard
+                        # (< 99.0) passes. rp['tracklength'] = 16.635 confirmed in every step.
+                        # ep_track_length_m=16.6 after FIX-O; both are < 99.0, guard passes.
+                        # Without this key, episode_summary_metrics uses ep.get('track_length_m', 16.6)
+                        # correctly, BUT compute_all() receives it; the issue is the key was absent.
+                        'track_length_m': float(ep_track_length_m) if (
+                            'ep_track_length_m' in dir() and ep_track_length_m > 1.0 and ep_track_length_m < 99.0
+                        ) else 16.6,
                     }
                     # Wire: extract real intermediary metrics from episode step log
                     try:
@@ -3260,6 +3262,37 @@ def run(hparams):
                             summary[_ck]           = float(_cv)
                             summary[f'{_ck}_mean'] = float(_cv)   # mirror for X-matrix reg_names
                     # _hm_out override: richer per-step computation if available
+                    # v1.1.5e FIX-L: Coherent 3-tier priority merge into summary.
+                    # Priority: bsts_metrics (neutral floor) < _hm_out (rich, can be {})
+                    #           < bsts_row (post-L3049-update, most authoritative).
+                    # bsts_row.update(_hm_out) at L3049 STAYS — this block reads bsts_row
+                    # AFTER that update, so it inherits _hm_out values when available.
+                    # REF: Ng et al. (1999) — all per-step signals must reach gradient path.
+                    _COMPLIANCE_KEYS_NEUTRALS = {
+                        'race_line_adherence':              0.5,
+                        'brake_compliance':                 1.0,
+                        'brake_field_compliance_gradient':  1.0,
+                        'race_line_compliance_gradient':    0.5,
+                        'smoothness_steering_rate':         1.0,
+                        'track_progress':                   0.0,
+                        'avg_speed_centerline':             0.0,
+                    }
+                    # Tier 1: neutral floor from bsts_metrics (always populated)
+                    for _ck, _cn in _COMPLIANCE_KEYS_NEUTRALS.items():
+                        _cv = bsts_metrics.get(_ck)
+                        if _cv is not None:
+                            try:
+                                _cvf = float(_cv)
+                                if math.isfinite(_cvf):
+                                    summary[_ck]           = _cvf
+                                    summary[f'{_ck}_mean'] = _cvf
+                            except (TypeError, ValueError):
+                                pass
+                        else:
+                            # Write neutral so X-matrix never gets key-error 0.0
+                            summary.setdefault(_ck,           _cn)
+                            summary.setdefault(f'{_ck}_mean', _cn)
+                    # Tier 2: _hm_out override (richer per-step, if compute_all() succeeded)
                     if '_hm_out' in dir() and isinstance(_hm_out, dict) and _hm_out:
                         for _hm_k, _hm_v in _hm_out.items():
                             try:
@@ -3269,15 +3302,19 @@ def run(hparams):
                                     summary[f'{_hm_k}_mean'] = _hfv
                             except (TypeError, ValueError):
                                 pass
-                    # bsts_row safety net (post-hmout merge; most authoritative for compliance)
+                    # Tier 3: bsts_row — already has _hm_out merged in (L3049), most authoritative
+                    # COHERENT with bsts_row.update(_hm_out) at L3049 — do NOT change L3049.
                     if 'bsts_row' in dir() and isinstance(bsts_row, dict) and bsts_row:
-                        for _bk in ('race_line_adherence', 'brake_compliance',
-                                    'brake_field_compliance_gradient',
-                                    'race_line_compliance_gradient'):
+                        for _bk, _bn in _COMPLIANCE_KEYS_NEUTRALS.items():
                             _bv = bsts_row.get(_bk)
-                            if _bv is not None and math.isfinite(float(_bv)):
-                                summary[_bk]           = float(_bv)
-                                summary[f'{_bk}_mean'] = float(_bv)
+                            if _bv is not None:
+                                try:
+                                    _bvf = float(_bv)
+                                    if math.isfinite(_bvf):
+                                        summary[_bk]           = _bvf
+                                        summary[f'{_bk}_mean'] = _bvf
+                                except (TypeError, ValueError):
+                                    pass
                     _kf_episode_buffer.append(summary)
                     if hasattr(bsts_feedback, "_all_summaries"): bsts_feedback._all_summaries.append(summary)
                     # v1.1.1: flush Kalman every episode (was 10). Eps are 14-29 steps each;
