@@ -133,7 +133,19 @@ def episode_summary_metrics(ep: dict, intermediary: dict) -> dict:
     n_wp = int(ep.get('n_waypoints', 120))           # FIX-I: was 100
     track_width = float(ep.get('track_width', 0.6))
     track_length_m = float(ep.get('track_length_m', 16.6))  # FIX-I: forward from ep_data
-    succ = compute_success(steps_for_success, n_waypoints=n_wp, track_width=track_width) if steps_for_success else {}
+    # v1.1.5c FIX-I-compute: compute_success is a lambda that DROPS track_length_m before
+    # calling compute_all → _track_progress() receives track_length_m=None → falls back to
+    # progress/100 → track_progress=0.0 in every Kalman line.
+    # FIX: call compute_all directly with track_length_m forwarded.
+    # REF: heilmeier2020minCurv — track arc length normalization for progress metric.
+    from harmonized_metrics import compute_all as _compute_all_full
+    _succ_full = _compute_all_full(
+        steps_for_success,
+        n_waypoints=n_wp,
+        track_width=track_width,
+        track_length_m=track_length_m,
+    ) if steps_for_success else {}
+    succ = {k: _succ_full.get(k, 0.0) for k in SUCCESS_METRICS}
     summary = {k: float(succ.get(k, 0.0)) for k in SUCCESS_METRICS}
     # Keep legacy scalars available for audit / back-compat dashboards
     summary['_legacy_lap_completion_pct'] = float(completion)

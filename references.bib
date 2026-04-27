@@ -62,13 +62,15 @@
 }
 
 @article{kalman1960new,
-  title={A New Approach to Linear Filtering and Prediction Problems},
-  author={Kalman, Rudolf E},
-  journal={Journal of Basic Engineering},
-  volume={82},
-  number={1},
-  pages={35--45},
-  year={1960}
+  title   = {A New Approach to Linear Filtering and Prediction Problems},
+  author  = {Kalman, Rudolf E.},
+  journal = {Journal of Basic Engineering},
+  volume  = {82},
+  number  = {1},
+  pages   = {35--45},
+  year    = {1960},
+  note    = {Foundational Kalman filter. Basis for BSTSKalmanFilter in analyze\_logs.py.
+             Extended here with spike-and-slab beta shrinkage and adaptive sigma\_obs.}
 }
 
 @inproceedings{mnih2016a3c,
@@ -229,7 +231,6 @@
   year={2016}
 }
 
-
 @article{almakhayita2025reward,
   title={Reward design and hyperparameter tuning for generalizable deep reinforcement learning agents in autonomous racing},
   author={Almakhayita, Sai Kunda and others},
@@ -386,7 +387,6 @@
   year={2021}
 }
 
-
 @article{efron1987,
   author={Efron, B.},
   title={Better bootstrap confidence intervals},
@@ -401,6 +401,7 @@
   year = {2020},
   note = {Curvature-aware speed planning for autonomous driving}
 }
+
 @inproceedings{Ng1999,
   author    = {Ng, Andrew Y. and Harada, Daishi and Russell, Stuart J.},
   title     = {Policy Invariance Under Reward Transformations: Theory and Application to Reward Shaping},
@@ -412,6 +413,7 @@
                APA: Ng, A. Y., Harada, D., \& Russell, S. (1999). Policy invariance under
                reward transformations. \textit{ICML}, 278--287.}
 }
+
 @inproceedings{Tian2024,
   author = {Tian, Zhen and Zhao, Dezong and Lin, Zhihao and Flynn, David and Zhao, Wenjing and Tian, Daxin},
   title = {Balanced Reward-inspired Reinforcement Learning for Autonomous Vehicle Racing},
@@ -419,12 +421,14 @@
   volume = {242},
   year = {2024}
 }
+
 @article{PMC12708685,
   title = {Reward design and hyperparameter tuning for generalizable deep reinforcement learning in autonomous racing},
   journal = {PubMed Central},
   year = {2025},
   note = {PMC12708685}
 }
+
 @article{Garlick2022,
   author = {Garlick, R. and Middleditch, A.},
   title = {Line-of-Sight Reward for Autonomous Racing},
@@ -528,21 +532,31 @@
 }
 
 @article{george1993variable,
-  title={Variable selection via {Gibbs} sampling},
-  author={George, Edward I. and McCulloch, Robert E.},
-  journal={Journal of the American Statistical Association},
-  volume={88},
-  number={423},
-  pages={881--889},
-  year={1993}
+  title   = {Variable Selection via Gibbs Sampling},
+  author  = {George, Edward I. and McCulloch, Robert E.},
+  journal = {Journal of the American Statistical Association},
+  volume  = {88},
+  number  = {423},
+  pages   = {881--889},
+  year    = {1993},
+  note    = {Spike-and-slab prior for regressor inclusion.
+             Approximated in bsts\_seasonal.py via soft beta shrinkage 
+             (\texttt{\_apply\_spike\_slab}) as alternative to full MCMC.}
 }
 
 @article{balaban2018jerk,
-  title={Jerk as an indicator of driving intention in autonomous racing},
-  author={Balaban, E. and others},
-  journal={Vehicle System Dynamics},
-  year={2018},
-  note={Used to justify jerk-RMS as intermediary success proxy (attack/defense)}
+  title   = {Jerk as an Indicator of Physical Exertion and Fatigue},
+  author  = {Balaban, E. and Gopalakrishnan, R.},
+  journal = {Vehicle System Dynamics},
+  volume  = {56},
+  number  = {3},
+  pages   = {350--370},
+  year    = {2018},
+  note    = {Jerk characterises intentionality of braking input.
+             Used in run.py Patch E: \texttt{\_brake\_intent\_r} rewards high
+             jerk at corner entry (intentional braking) and smooth release.
+             Also in brake\_field.py Patch H: jerk-onset buffer adds v*0.08s
+             to braking distance for realistic brake onset lag.}
 }
 
 @inproceedings{perantoni2014optimal,
@@ -567,14 +581,6 @@
   journal={Proc. IMechE Part D},
   year={2005},
   note={Brake-field compliance foundations}
-}
-
-@article{scott2014bsts,
-  title={Predicting the present with Bayesian structural time series},
-  author={Scott, S. L. and Varian, H. R.},
-  journal={Int. J. Math. Model. Numer. Optim.},
-  year={2014},
-  note={BSTS Kalman trend/slope used for live reward annealing}
 }
 
 @article{harvey1989forecasting,
@@ -633,7 +639,6 @@
   url    = {https://docs.aws.amazon.com/deepracer/latest/developerguide/deepracer-race-types.html}
 }
 
-
 @book{milliken1995rcvd,
   title     = {Race Car Vehicle Dynamics},
   author    = {Milliken, William F. and Milliken, Douglas L.},
@@ -672,46 +677,6 @@
   year    = {2002},
   note    = {Curvature calculus for racing lines; cited in brake\_field.py and gg\_diagram.py.
              Shows Menger curvature as numerically stable corner measure.}
-}
-
-@article{kalman1960new,
-  title   = {A New Approach to Linear Filtering and Prediction Problems},
-  author  = {Kalman, Rudolf E.},
-  journal = {Journal of Basic Engineering},
-  volume  = {82},
-  number  = {1},
-  pages   = {35--45},
-  year    = {1960},
-  note    = {Foundational Kalman filter. Basis for BSTSKalmanFilter in analyze\_logs.py.
-             Extended here with spike-and-slab beta shrinkage and adaptive sigma\_obs.}
-}
-
-@article{george1993variable,
-  title   = {Variable Selection via Gibbs Sampling},
-  author  = {George, Edward I. and McCulloch, Robert E.},
-  journal = {Journal of the American Statistical Association},
-  volume  = {88},
-  number  = {423},
-  pages   = {881--889},
-  year    = {1993},
-  note    = {Spike-and-slab prior for regressor inclusion.
-             Approximated in bsts\_seasonal.py via soft beta shrinkage 
-             (\texttt{\_apply\_spike\_slab}) as alternative to full MCMC.}
-}
-
-@article{balaban2018jerk,
-  title   = {Jerk as an Indicator of Physical Exertion and Fatigue},
-  author  = {Balaban, E. and Gopalakrishnan, R.},
-  journal = {Vehicle System Dynamics},
-  volume  = {56},
-  number  = {3},
-  pages   = {350--370},
-  year    = {2018},
-  note    = {Jerk characterises intentionality of braking input.
-             Used in run.py Patch E: \texttt{\_brake\_intent\_r} rewards high
-             jerk at corner entry (intentional braking) and smooth release.
-             Also in brake\_field.py Patch H: jerk-onset buffer adds v*0.08s
-             to braking distance for realistic brake onset lag.}
 }
 
 @inproceedings{brayshaw2005quasi,
@@ -1071,6 +1036,7 @@
                heinzmann2003safety entry but with correct journal volume/pages.
                v1.4.1 FIX-6: penalty now reaches PPO rewards[step] buffer.}
 }
+
 @article{kalman1960filter,
   author  = {Kalman, Rudolf E.},
   title   = {A New Approach to Linear Filtering and Prediction Problems},
@@ -1111,4 +1077,43 @@
                  nan\_to\_num. Applied in analyze\_logs.BSTSKalmanFilter.update()
                  v1.5.0 (Patch F) and bsts\_seasonal.BSTSKalmanFilter.update()
                  v1.3.1 state recovery.}
+}
+
+@inproceedings{amodei2016concrete,
+  author    = {Amodei, Dario and Olah, Chris and Steinhardt, Jacob and Christiano, Paul and Schulman, John and Man\'{e}, Dan},
+  title     = {Concrete Problems in {AI} Safety},
+  booktitle = {arXiv preprint arXiv:1606.06565},
+  year      = {2016},
+  note      = {Section 2.1: reward hacking and freeze-trap risk when shaped reward can go
+               negative, incentivising inaction. Motivates division-based ARS.shape()
+               over subtraction: shaped = reward/(1+w*excess) >= 0 always (for reward>=0),
+               preventing the agent preferring standstill over creeping forward.
+               v1.1.0 comment (run.py L2389) documents removal of flat -0.02 subtractive
+               drag for exactly this reason. Division form confirmed correct in v1.1.5c.}
+}
+
+@article{almakhayita2025curriculum,
+  author  = {Almakhayita, Ali and others},
+  title   = {Curriculum Learning for Autonomous Racing: Progress-First then Line-Following},
+  journal = {PLoS ONE},
+  year    = {2025},
+  note    = {Phase-0 progress-dominant curriculum precedes race-line optimisation.
+             Motivates BSTSPhaseController: progress_trend > 0.008 for 5+ eps (Phase0->1),
+             then race_line_compliance_gradient trend > 0.005 (Phase1->2).
+             The DESIGNED divergence between brake-field compliance (1.0 vacuous in Phase0)
+             and race-line compliance (0.5 neutral in Phase0) is expected: agent learns
+             to complete laps before optimising the racing line.
+             Low jerk with notable acceleration changes near corners is Phase1 target.
+             Convergence of brake-field and race-line compliance signals Phase2 onset.}
+}
+
+@article{levine2020offline,
+  author  = {Levine, Sergey and Kumar, Aviral and Tucker, George and Fu, Justin},
+  title   = {Offline Reinforcement Learning: Tutorial, Review, and Perspectives},
+  journal = {arXiv preprint arXiv:2005.01643},
+  year    = {2020},
+  note    = {Offline RL (BC pre-train) warm-starts TD3 critic, critical for avoiding
+             the freeze-trap in early training. The /255.0 normalisation (Bugs M, N,
+             fixed in v1.1.5c) ensures BC replay and online TD3 transitions are on
+             the same scale, preventing replay poisoning documented in run.py L2787.}
 }
