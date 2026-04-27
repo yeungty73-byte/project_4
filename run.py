@@ -2194,9 +2194,8 @@ def run(hparams):
                 step=global_step,
                 race_type_tag=_track_variant,
             )
-            if episode_count % 10 == 0:
-                print(f"[KALMAN_CHECK] n_kfs={len(bsts_feedback._kf_instances)}, "
-                    f"kf_trends={dict(list(bsts_feedback.kf_trends.items())[:3])}")
+            print(f"[KALMAN_CHECK] n_kfs={len(bsts_feedback._kf_instances)}, "
+                f"kf_trends={dict(list(bsts_feedback.kf_trends.items())[:3])}")
                 
             # v1.1.2: per-step jerk accumulation fix
             try:
@@ -2475,7 +2474,9 @@ def run(hparams):
                         'brake_compliance':     float(_hm_out.get('brake_compliance', 0.0)),
                         'smoothness_jerk_rms':  float(_hm_out.get('smoothness_jerk_rms', 0.0)),
                     })
-                bsts_feedback.update(bsts_metrics)
+                if {k: v for k, v in bsts_metrics.items()
+                 if isinstance(v, (int, float)) and v != 0.0}: # v1.1.2: only pass metrics that have actual signal:
+                    bsts_feedback.update(bsts_metrics)
                 # v4: Periodic save of failure analysis 
                 # v1.1.2 moved the chunk above out of episode_count % 25 ==0
                 if episode_count % 20 == 0:

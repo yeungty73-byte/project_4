@@ -481,7 +481,7 @@ class BSTSFeedback:
         _prog_floor = 0.08
         # v1.1.1: PROGRESS FLOOR — never starve forward motion
         # REF: Ng, Harada & Russell (1999) reward shaping.
-        w['progress'] = min(w.get('progress', 0.0), _prog_floor)
+        w['progress'] = max(w.get('progress', 0.0), _prog_floor)
         total = sum(w.values())
         if total > 0:
             return {k: v / total for k, v in w.items()}
