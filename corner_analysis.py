@@ -38,7 +38,9 @@ def lookahead_curvature_scan(waypoints, closest, max_lookahead=15, step=2):
             max_curv = curv
             max_curv_idx = wi
             dist_to_max = cum_dist
-    safe_speed = min(4.0, max(1.0, 0.8 * (1.0 / (max_curv + 1e-6))**0.5))
+    # Heilmeier et al. (2020) Eq. 10: v_safe = sqrt(mu*g / curv)
+    # mu=0.85 (Brayshaw & Harrison, 2005), g=9.81, clamped to [0.5, 4.0]
+    safe_speed = float(np.clip((0.85 * 9.81 / (max_curv + 1e-6)) ** 0.5, 0.5, 4.0))
     return max_curv, max_curv_idx, safe_speed, dist_to_max
 
 
@@ -108,7 +110,21 @@ def compute_turn_alignment_reward(heading, waypoints, closest, lookahead=5):
     return alignment * curv_weight
 
 
-def compute_racing_line_reward(current_speed, heading, waypoints, closest):
+def compute_racing_line_reward(current_speed, heading, waypoints, closest,
+                               brake_field_safe_speed: float = None):
+    """Combined corner reward: braking + alignment + apex speed.
+
+    brake_field_safe_speed: if provided by CombinedBrakeField.race_line_safe_speed(),
+      clamps safe_speed so the race-line reward harmonises with the brake-field
+      vector field constraint (Heilmeier et al. 2020 §4; Heinzmann & Zelinsky 2003 §4).
+
+    REF:
+      Tian, M. et al. (2024). Balanced reward-inspired RL for autonomous racing.
+      Ng, A., Harada, D., & Russell, S. (1999). Policy invariance under reward
+        transformations. ICML.
+      Heinzmann, J. & Zelinsky, A. (2003). Quantitative safety guarantees.
+        IJRR, 22(7-8), 479-504. doi:10.1177/02783649030227004
+    """
     """Combined corner reward: braking + alignment + apex speed.
     REF: Tian et al. (2024) "Balanced reward-inspired RL for autonomous racing"
     REF: Ng, Harada & Russell (1999) "Policy invariance under reward transformations"
@@ -118,6 +134,9 @@ def compute_racing_line_reward(current_speed, heading, waypoints, closest):
     """
     max_curv, max_curv_idx, safe_speed, dist_to_max = lookahead_curvature_scan(
         waypoints, closest)
+    # Harmonise with brake-field: clamp to CombinedBrakeField.race_line_safe_speed()
+    if brake_field_safe_speed is not None:
+        safe_speed = min(safe_speed, float(brake_field_safe_speed))
     braking_r = compute_braking_reward(current_speed, safe_speed, dist_to_max)
     align_r = compute_turn_alignment_reward(heading, waypoints, closest)
     # Apex speed bonus: reward carrying max safe speed through corners
@@ -175,10 +194,6 @@ def curvature_radius(waypoints, current_wp, lookahead=3):
     return (d1 * d2 * d3) / (4.0 * area)
 
 
-def optimal_speed(radius, C=9.81):
-    """Compute optimal speed from radius using Gonzalez (2020): v = sqrt(C * r)."""
-    import math
-    return math.sqrt(C * max(radius, 0.01))
 
     
 # =============================================================================
@@ -253,10 +268,21 @@ class OvertakeAnalyzer:
             + (-1.0 if lidar_min < self.safe else 0.0)
         )
 
-def optimal_speed(radius, C=1.5):
+def optimal_speed(radius, mu=0.85, g=9.81, vmin=0.5, vmax=4.0):
+    """Compute optimal speed from radius: v = sqrt(mu * g * r).
+
+    Heilmeier et al. (2020) Eq. 10; Brayshaw & Harrison (2005) QSS model.
+    mu=0.85: standard road-course rubber (Brayshaw & Harrison, 2005 Table 2).
+
+    REF:
+      Heilmeier, A. et al. (2020). Minimum curvature trajectory planning.
+        Vehicle System Dynamics, 58(10), 1497-1527.
+      Brayshaw, D. L. & Harrison, M. F. T. (2005). A quasi steady state
+        approach to race car lap simulation. Proc. IMechE Part D, 219(5).
+    """
     if radius == float('inf') or radius > 1000:
-        return 4.0  # max speed on straight
-    return min(4.0, math.sqrt(C * max(radius, 0.1)))
+        return float(vmax)
+    return float(np.clip((mu * g * max(radius, 0.01)) ** 0.5, vmin, vmax))
 
 
 # ============================================================

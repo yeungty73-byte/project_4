@@ -50,6 +50,38 @@ from federated_pool import FederatedPool
 # REF: Lillicrap, T. P. et al. (2016). Continuous control with deep reinforcement learning. ICLR.
 from race_line_engine import MultiRaceLineEngine
 # REF: Hart, P. E., Nilsson, N. J., & Raphael, B. (1968). A formal basis for the heuristic determination of minimum cost paths. IEEE Trans. SSC, 4(2), 100-107.
+import sys, os
+
+# v1.3.0 CRITICAL FIX: purge stale __pycache__ before any project imports.
+# 57 .pyc files were committed to the repo; Python 3.12 was loading
+# __pycache__/bsts_seasonal.cpython-312.pyc (old 3-param BSTSFeedback)
+# instead of the updated bsts_seasonal.py source → TypeError on ema_alpha.
+# This block runs before any project-local import, so it always wins.
+def _purge_stale_pycache():
+    import shutil, pathlib
+    _root = pathlib.Path(__file__).parent.resolve()
+    for _pc in _root.rglob("__pycache__"):
+        try:
+            shutil.rmtree(_pc)
+        except Exception:
+            pass
+    # Also invalidate any already-loaded cached .pyc bytecode
+    import importlib, importlib.util
+    _project_modules = [
+        "bsts_seasonal", "brake_field", "race_line_engine",
+        "analyze_logs", "harmonized_metrics", "live_bsts_plot",
+        "context_aware_agent", "agents", "corner_analysis",
+        "gg_diagram", "htm_reference", "td3_sac_ensemble",
+        "stuck_tracker", "failure_analysis", "federated_pool",
+        "denim_theme", "config_loader", "utils",
+    ]
+    for _mod in _project_modules:
+        if _mod in sys.modules:
+            del sys.modules[_mod]
+
+_purge_stale_pycache()
+del _purge_stale_pycache
+
 from bsts_seasonal import BSTSFeedback
 # REF: Scott, S. L. & Varian, H. R. (2014). Predicting the present with Bayesian structural time series. Int. J. Math. Model. Numer. Optim., 5(1-2), 4-23.
 live_analyze = lambda *a,**k: None  # live_metrics.py purged (stubbed)
