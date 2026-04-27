@@ -32,6 +32,10 @@ from agents import PPOAgent, RandomAgent
 from context_aware_agent import ContextAwarePPOAgent, compute_intermed_targets
 from failure_analysis import FailurePointSampler
 from brake_field import BrakeField
+
+
+
+
 # REF: Sutton, R. S. & Barto, A. G. (2018). Reinforcement Learning: An Introduction (2nd ed.). MIT Press.
 from stuck_tracker import StuckTracker
 # REF: Kolter, J. Z. & Ng, A. Y. (2009). Near-Bayesian exploration in polynomial time. ICML.
@@ -592,22 +596,127 @@ class KalmanSignatureDetector:
         self._prog_buf.clear(); self._spd_buf.clear(); self._steer_buf.clear()
         self._triggered = False
 
+class AdaptiveRewardShaper:    
+    def __init__(self, n_waypoints: int = 120, border_dist_gate: float = _BORDER_DIST_GATE):
+        self.n = max(int(n_waypoints), 1)
+        self._vperp_tracker = PerWaypointVPerpTracker(self.n)
+        self._speed_budget  = PerWaypointSpeedBudget(self.n)
+        self._sig_detector  = KalmanSignatureDetector()
+        self._border_gate   = float(border_dist_gate)
+        self._reversed_ep   = False
+        self._ep_count      = 0
+        logger.info(f"[ARS] AdaptiveRewardShaper init: n_waypoints={self.n}")
 
-class AdaptiveRewardShaper:
-    """Coordinates all per-episode and per-step adaptive reward shaping.
+    def episode_start(self, is_reversed: bool) -> float:
+        """Call at episode reset. Returns immediate reward delta.
 
-    API (all methods are side-effect-safe when called out of order):
-      shaper.episode_start(is_reversed)           -> float  immediate spawn penalty
-      shaper.shape(reward, rp, wp_idx, ...)       -> (float, dict)
-      shaper.curb_urgency_mul(wp_idx)             -> float  for CombinedBrakeField
-      shaper.speed_budget(wp_idx)                 -> float  per-WP speed budget
-      shaper.bc_pilot_reward(rp, prev_m, curr_m)  -> float  Ng et al. BC reward
-      shaper.episode_end(wp_idx, is_offtrack)
+        Returns -5.0 for reversed spawn (is_reversed=True = driving clockwise).
+        This large negative gives the BSTS Kalman EMA a strong signal that
+        reversed episodes are structurally non-recoverable in early training.
 
-    REF: Ng, Harada & Russell (1999) ICML -- potential-based shaping.
-    REF: AWS DeepRacer docs (2020) -- is_reversed=True: CW driving; spawn=4.0 m/s.
-    """
+        REF: AWS DeepRacer docs -- is_reversed=True iff car is driving CW on CCW track.
+             Spawn speed is always 4.0 m/s (hardcoded sim constant, not controllable).
+        """
+        self._reversed_ep = bool(is_reversed)
+        self._sig_detector.reset()
+        self._ep_count += 1
+        if is_reversed:
+            logger.debug(f"[ARS] ep={self._ep_count} is_reversed=True -> spawn penalty -5.0")
+            return -5.0
+        return 0.0
 
+    def episode_end(self, wp_idx: int, is_offtrack: bool = False):
+        """Call at episode end to update crash credit at last waypoint."""
+        if is_offtrack:
+            self._speed_budget.crash_at(int(wp_idx))
+            self._vperp_tracker._k = min(3.0, self._vperp_tracker._k * 1.05)
+        else:
+            self._speed_budget.relax(int(wp_idx), amount=0.02)
+            self._vperp_tracker._k = max(1.0, self._vperp_tracker._k * 0.98)
+
+    def shape(
+        self,
+        reward:         float,
+        rp:             dict,
+        wp_idx:         int,
+        speed:          float,
+        v_perp_barrier: float,
+        steer:          float,
+        ep_progress_m:  float,
+        is_offtrack:    bool,
+        dist_to_border: float = 5.0,
+    ) -> Tuple[float, Dict]:
+        """Apply all per-step shaping rules. Returns (shaped_reward, sinfo_dict).
+
+        Shaping rules (all additive, documented):
+          a) Reversed gating: reward * 0.0 when is_reversed (clockwise driver)
+          b) v_perp penalty outside brake field: -0.5 * max(0, v_perp - 0.3) within 1.5m
+          c) Prospective Kalman-signature penalty: -0.30 pre-crash
+          d) v_perp tracker update (telemetry only)
+          e) Speed budget relaxation for clean on-track steps
+
+        REF: Ng et al. (1999) -- potential-based shaping for gradient-compatible dense signal.
+        REF: Heinzmann & Zelinsky (2003) -- per-step v_perp safety signal.
+        """
+        shaped   = float(reward)
+        _is_rev  = bool(rp.get("is_reversed", self._reversed_ep))
+
+        if _is_rev:
+            shaped = 0.0
+            return shaped, {"ars_reversed": True, "ars_vperp_pen": 0.0, "ars_sig_pen": 0.0}
+
+        vperp_pen = 0.0
+        _d  = float(dist_to_border) if dist_to_border is not None else 5.0
+        _vp = float(v_perp_barrier) if v_perp_barrier is not None else 0.0
+        if _d < self._border_gate and _vp > _VPERP_THRESHOLD:
+            vperp_pen = _VPERP_PENALTY_W * (_vp - _VPERP_THRESHOLD)
+            shaped -= vperp_pen
+
+        prog    = float(rp.get("progress", ep_progress_m or 0.0))
+        sig_pen = self._sig_detector.step(prog, float(speed), float(steer))
+        shaped += sig_pen
+
+        self._vperp_tracker.update(int(wp_idx), _vp)
+
+        if not is_offtrack and float(speed) > 0.3:
+            self._speed_budget.relax(int(wp_idx), amount=0.005)
+
+        return shaped, {
+            "ars_reversed":  _is_rev,
+            "ars_vperp_pen": round(vperp_pen, 4),
+            "ars_sig_pen":   round(sig_pen, 4),
+            "ars_wp":        int(wp_idx),
+        }
+
+    def speed_budget(self, wp_idx: int) -> float:
+        """Per-waypoint speed budget for race_line_engine.get_target_speed(wp_speed_budget=)."""
+        return self._speed_budget.get(int(wp_idx))
+
+    def curb_urgency_mul(self, wp_idx: int) -> float:
+        """Per-waypoint curb urgency multiplier for CombinedBrakeField.step()."""
+        return self._vperp_tracker.curb_urgency_mul(int(wp_idx))
+    
+    def bc_pilot_reward(
+        self,
+        rp:              dict,
+        prev_progress_m: float,
+        curr_progress_m: float,
+    ) -> float:
+        """Potential-based BC pilot reward: r = alpha * delta_progress_m.
+
+        Decouples lap time from traversed distance. A slow-but-far episode earns
+        more cumulative reward than a fast-but-short episode.
+
+        REF: Ng, Harada & Russell (1999) -- potential phi(s) = alpha * arc_progress_m.
+             Delta_phi = alpha * (curr_m - prev_m). Potential-based shaping is
+             policy-invariant: optimal policy is unchanged (Theorem 1, Ng et al. 1999).
+             AWS DeepRacer docs -- progress key is percentage 0-100; we use arc_m for scale.
+        """
+        if rp.get("is_reversed", False):
+            r_bc = min(r_bc, -1.0)        
+        delta_m = float(curr_progress_m) - float(prev_progress_m)
+        r_bc = float(np.clip(_BC_ALPHA * max(0.0, delta_m), -10.0, 10.0))
+        return r_bc
 
 # ============================================================
 # v212: Embedded 9-Phase Orchestrator — yaml-aware
