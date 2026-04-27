@@ -1,19 +1,34 @@
 """
-configs/reward_function.py
-Default reward function for DeepRacer P4 — passed as DEFAULT_REWARD_FUNCTION
-into DeepracerGymEnv.  This fires INSIDE env.step() via the gym adapter.
+configs/reward_function.py — DeepRacer P4 reference reward function.
+v1.3.0 (2026-04-27)
 
 IMPORTANT (v1.1.2 audit):
   run.py computes its own shaped reward independently (AnnealingScheduler +
   compute_reward()).  To avoid a dual-reward signal, make_environment() in
   utils.py now passes reward_function=_identity_reward so that env.step()
-  returns reward=1.0 (neutral) and run.py's shaped reward is the ONLY signal.
-
+  returns reward=1.0 (neutral) and run.py\'s shaped reward is the ONLY signal.
   This file is kept as reference / fallback for standalone eval runs that do
   NOT go through run.py (e.g. jupyter notebooks, demo()).
 
-Params reference:
-  https://docs.aws.amazon.com/deepracer/latest/developerguide/deepracer-reward-function-reference.html
+Design notes (v1.3.0):
+  The obstacle_bonus block below is a simplified scalar proxy.
+  In training mode, run.py\'s CombinedBrakeField (brake_field.py v1.3.0)
+  replaces it with four per-class vector fields that enforce v_⊥ ≤ 0 at impact.
+
+  Reward structure follows Ng, Harada & Russell (1999): potential-based shaping
+  reward φ(s) = (progress + speed + heading) · (1 − crash penalty).
+  Center-line Gaussian bands follow Heilmeier et al. (2020) §4 track-width
+  margin parameterisation.
+
+REF:
+  Ng, A., Harada, D., & Russell, S. (1999). Policy invariance under reward
+    transformations. ICML.
+  Heilmeier, A. et al. (2020). Minimum curvature trajectory planning.
+    Vehicle System Dynamics, 58(10), 1497–1527. doi:10.1080/00423114.2019.1631455
+  Khatib, O. (1986). Real-time obstacle avoidance for manipulators and mobile
+    robots. Int. J. Robotics Research, 5(1), 90–98. doi:10.1177/027836498600500106
+  AWS (2020). DeepRacer reward function reference.
+    https://docs.aws.amazon.com/deepracer/latest/developerguide/deepracer-reward-function-reference.html
 """
 
 

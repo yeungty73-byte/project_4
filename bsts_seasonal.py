@@ -258,8 +258,28 @@ class BSTSKalmanFilter:
 class BSTSFeedback:
     """EMA-smoothed, Kalman-informed reward-weight adjuster.
 
+    v1.3.0 (2026-04-27): Per-class compliance signals integrated.
+      Recognises brake_field_compliance_gradient and race_line_compliance_gradient
+      from CombinedBrakeField (brake_field.py v1.3.0) and wires them directly
+      through EMA + Kalman trends → adjust_weights() reward shaping.
+
+      Object classes tracked (from SwinUNetPP.classify_sectors_for_brake_field()):
+        0 center_line | 1 curb | 2 obstacle | 3 bot
+      Their per-sector mask probabilities are accepted as update() kwargs:
+        swin_curb_prob, swin_obs_prob, swin_bot_prob
+
     v1.1.1: self._kf lazily spawns BSTSKalmanFilter per metric.
     update() calls _run_kalmans() so kf_trends/kf_betas are always populated.
+
+    REF:
+      Scott, S. L. & Varian, H. R. (2014). Predicting the present with Bayesian
+        structural time series. Int. J. Math. Model. Numer. Optim., 5(1-2), 4-23.
+      Brodersen, K. H. et al. (2015). Inferring causal impact using Bayesian
+        structural time-series models. Ann. Appl. Stat., 9(1), 247-274.
+      Durbin, J. & Koopman, S. J. (2012). Time Series Analysis by State Space
+        Methods (2nd ed.). Oxford University Press.
+      Kalman, R. E. (1960). A new approach to linear filtering and prediction
+        problems. J. Basic Eng., 82(1), 35-45.
     """
 
     def __init__(

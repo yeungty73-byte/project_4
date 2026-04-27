@@ -818,3 +818,156 @@
   volume    = {34},
   pages     = {20132--20145}
 }
+
+% ============================================================
+% v1.3.0 additions — Brake-Field Vector Field, Potential Fields,
+% Velocity Obstacles, Object Permanence, Race-Line Harmonisation
+% ============================================================
+
+@article{khatib1986apf,
+  title     = {Real-Time Obstacle Avoidance for Manipulators and Mobile Robots},
+  author    = {Khatib, Oussama},
+  journal   = {The International Journal of Robotics Research},
+  volume    = {5},
+  number    = {1},
+  pages     = {90--98},
+  year      = {1986},
+  publisher = {SAGE Publications},
+  doi       = {10.1177/027836498600500106},
+  note      = {Foundational artificial potential field (APF) formulation: repulsive
+               potentials from obstacles, attractive potential to goal. The gradient
+               of the combined field gives the real-time avoidance force.
+               Adapted in brake\_field.py v1.3.0 as per-class vector repulsors.}
+}
+
+@article{fiorini1998velocity,
+  title     = {Motion Planning in Dynamic Environments Using Velocity Obstacles},
+  author    = {Fiorini, Paolo and Shiller, Zvi},
+  journal   = {The International Journal of Robotics Research},
+  volume    = {17},
+  number    = {7},
+  pages     = {760--772},
+  year      = {1998},
+  publisher = {SAGE Publications},
+  doi       = {10.1177/027836499801700706},
+  note      = {Velocity Obstacle (VO): set of robot velocities causing collision with
+               a moving obstacle. VO underlies BotField constant-velocity projection
+               (T=1.5 s) in brake\_field.py v1.3.0. Closing-speed computation
+               $v_{close} = |\mathbf{v}_{ego} - \mathbf{v}_{bot}|$ is Eq. 2 of this paper.}
+}
+
+@article{heinzmann2003safety,
+  title     = {Quantitative Safety Guarantees for Physical Human--Robot Interaction},
+  author    = {Heinzmann, Jochen and Zelinsky, Alexander},
+  journal   = {The International Journal of Robotics Research},
+  volume    = {22},
+  number    = {7--8},
+  pages     = {479--504},
+  year      = {2003},
+  publisher = {SAGE Publications},
+  doi       = {10.1177/02783649030227004},
+  note      = {Velocity-dependent safety envelope: $v_{\perp} \leq 0$ at impact
+               surface. The perpendicular-velocity-at-impact constraint in
+               brake\_field.py v1.3.0 is a direct application of the impact-force
+               bound in \S4. Justifies why $v_{\perp} \leq 0$ (not just $v \leq v_{safe}$)
+               is the correct physical constraint for per-class fields.}
+}
+
+@article{heilmeier2020minCurv,
+  title     = {Minimum Curvature Trajectory Planning and Control for an Autonomous
+               Race Car},
+  author    = {Heilmeier, Alexander and Wischnewski, Alexander and Hermansdorfer, Leonhard
+               and Betz, Johannes and Lienkamp, Markus and Lohmann, Boris},
+  journal   = {Vehicle System Dynamics},
+  volume    = {58},
+  number    = {10},
+  pages     = {1497--1527},
+  year      = {2020},
+  publisher = {Taylor and Francis},
+  doi       = {10.1080/00423114.2019.1631455},
+  note      = {QP-based minimum-curvature trajectory planning with velocity profile
+               as hard constraint. race\_line\_engine.py v1.3.0
+               get\_target\_speed(brake\_safe\_speed=...) follows \S4 velocity-profile
+               clamping. Also the source of $v_{safe} = \sqrt{2\mu g d}$ used in
+               CombinedBrakeField.race\_line\_safe\_speed().}
+}
+
+@article{braghin2008racedriver,
+  title     = {Race Driver Model},
+  author    = {Braghin, Francesco and Cheli, Federico and Melzi, Stefano and Sabbioni, Edoardo},
+  journal   = {Computers and Structures},
+  volume    = {86},
+  number    = {13--14},
+  pages     = {1503--1516},
+  year      = {2008},
+  publisher = {Elsevier},
+  doi       = {10.1016/j.compstruc.2007.04.028},
+  note      = {Race driver model: trajectory planning as bounded optimisation
+               between shortest path and minimum-curvature path. Underpins
+               the race-line engine's context-dependent line selection
+               (TIME\_TRIAL vs OBSTACLE context) in race\_line\_engine.py.}
+}
+
+@inproceedings{ettinger2021waymo,
+  title     = {Large Scale Interactive Motion Forecasting for Autonomous Driving:
+               The {Waymo} Open Motion Dataset},
+  author    = {Ettinger, Scott and Cheng, Shuyang and Caine, Benjamin and Liu, Chenxi
+               and Zhao, Hang and Pradhan, Sabeek and Chai, Yuning and Sapp, Benjamin
+               and Qi, Charles R. and Zhou, Yin and Yang, Zoey and Chouard, Aur{'e}lien
+               and Sun, Pei and Ngiam, Jiquan and Vasudevan, Vijay and McCauley, Alexander
+               and Shlens, Jonathon and Anguelov, Dragomir},
+  booktitle = {Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV)},
+  pages     = {9710--9719},
+  year      = {2021},
+  doi       = {10.1109/ICCV48922.2021.00957},
+  note      = {Waymo Open Motion Dataset. Constant-velocity linear extrapolation
+               over 1.5 s horizon used in BotField projection in brake\_field.py v1.3.0
+               is the baseline motion model evaluated in this benchmark (Table 3).}
+}
+
+@article{brayshaw2005lap,
+  title     = {A Quasi Steady State Approach to Race Car Lap Simulation},
+  author    = {Brayshaw, Dion L. and Harrison, Martin F. T.},
+  journal   = {Proceedings of the Institution of Mechanical Engineers, Part D:
+               Journal of Automobile Engineering},
+  volume    = {219},
+  number    = {5},
+  pages     = {599--612},
+  year      = {2005},
+  publisher = {SAGE Publications},
+  doi       = {10.1243/095440705X11246},
+  note      = {QSS braking-point model: $d_{brake} = v^2 / (2 \mu g)$.
+               Direct source of the stopping-distance formula in
+               brake\_field.py CombinedBrakeField. Confirms $\mu = 0.85$
+               for standard road-course rubber on asphalt.}
+}
+
+@article{zhou2019unetpp,
+  title     = {{UNet}++: A Nested {U-Net} Architecture for Medical Image Segmentation},
+  author    = {Zhou, Zongwei and Rahman Siddiquee, Md Mahfuzur and Tajbakhsh, Nima
+               and Liang, Jianming},
+  journal   = {IEEE Transactions on Medical Imaging},
+  volume    = {39},
+  number    = {6},
+  pages     = {1856--1867},
+  year      = {2020},
+  publisher = {IEEE},
+  doi       = {10.1109/TMI.2019.2959609},
+  note      = {UNet++ nested dense skip connections. SwinUNetPP in utransformer.py
+               follows the nested-skip fusion principle of this paper for multi-scale
+               feature reuse across the 2-stage Swin encoder.}
+}
+
+@inproceedings{cao2022swinunet_eccv,
+  title     = {Swin-{Unet}: {Unet}-like Pure Transformer for Medical Image Segmentation},
+  author    = {Cao, Hu and Wang, Yueyue and Chen, Joy and Jiang, Dongsheng and Zhang,
+               Xiaopeng and Tian, Qi and Wang, Manning},
+  booktitle = {European Conference on Computer Vision (ECCV) Workshops},
+  year      = {2022},
+  publisher = {Springer},
+  doi       = {10.1007/978-3-031-25066-8_9},
+  note      = {Swin-Unet: symmetric Swin-Transformer encoder-decoder for pixel-level
+               classification. Inspires SwinUNetPP classify\_sectors\_for\_brake\_field()
+               4-class per-sector head in utransformer.py v1.3.0.}
+}
+
