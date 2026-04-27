@@ -1885,27 +1885,66 @@ def run(hparams):
                     _is_braking_now = bool(_speed < _step_speed_snap - 0.05)
 
                     try:
-                        _bf_step         = _brake_field.step(
-                                            wp_idx=_closest[0] if _closest else 0,
-                                            speed=_speed,
-                                            is_braking=_is_braking_now
-                                        )
-                        _in_brake_field  = _bf_step['in_brake_field']   # True if BrakeField.potential > 0
-                        _brake_potential = _bf_step['brake_potential']   # Phi in [0, 1]
-                        _bf_ok           = (not _in_brake_field) or _is_braking_now
+                        # v1.2.0: full barrier geometry for perp-velocity physics
+                        _bf_swin          = _swin_clearance if '_swin_clearance' in dir() else None
+                        _bf_barrier_dist  = float(_dist_barrier) if '_dist_barrier' in dir() else 5.0
+                        _bf_barrier_angle = float(_barrier_angle_rad) if '_barrier_angle_rad' in dir() else 0.0
+                        _bf_actual_decel  = float(ep_prev_speed - _speed) if ep_prev_speed > 0 else 0.0
+                        _bf_step          = _brake_field.step(
+                            wp_idx        = _closest[0] if _closest else 0,
+                            speed         = _speed,
+                            heading_rad   = float(_heading) if '_heading' in dir() else 0.0,
+                            is_braking    = _is_braking_now,
+                            actual_decel  = _bf_actual_decel,
+                            barrier_dist  = _bf_barrier_dist,
+                            barrier_angle = _bf_barrier_angle,
+                            swin_clearance= _bf_swin,
+                        )
+                        _in_brake_field     = _bf_step['in_brake_field']
+                        _brake_potential    = _bf_step['brake_potential']
+                        _bf_compliance_grad = _bf_step['compliance_gradient']
+                        _bf_v_perp          = _bf_step['v_perp']
+                        _bf_urgency         = _bf_step['urgency']
+                        _bf_ok              = (not _in_brake_field) or _is_braking_now
                     except Exception:
-                        _in_brake_field  = False
-                        _brake_potential = 0.0
-                        _bf_ok           = True
+                        _in_brake_field     = False
+                        _brake_potential    = 0.0
+                        _bf_compliance_grad = 1.0
+                        _bf_v_perp          = 0.0
+                        _bf_urgency         = 0.0
+                        _bf_ok              = True
 
                     _position_compliance = max(0.0, 1.0 - (_dist_from_center / max(_track_width * 0.5, 0.1)))
-                    _rl_compliance       = max(0.0, 1.0 - _racing_line_err)
+                    # v1.2.0: race_engine per-step continuous compliance gradient
+                    if race_engine is not None and race_engine._initialized:
+                        _rl_step_r, _rl_line_info = race_engine.get_combined_reward(
+                            wp_idx      = _closest[0] if _closest else 0,
+                            car_lat_pos = (float(_dist_from_center) * (1 if rp.get('is_left_of_center', False) else -1)
+                                           / max(_track_width * 0.5, 0.1)),
+                            car_speed   = float(_speed),
+                            car_heading = float(_heading) if '_heading' in dir() else 0.0,
+                            track_width = float(_track_width) if '_track_width' in dir() else 0.6,
+                            context     = int(_context) if '_context' in dir() else 0,
+                            lidar_min   = float(_lidar_min) if '_lidar_min' in dir() else 1.0,
+                            nearest_obj = float(_nearest_obj) if '_nearest_obj' in dir() else 5.0,
+                            car_x       = float(rp.get('x', 0.0)),
+                            car_y       = float(rp.get('y', 0.0)),
+                            swin_clearance = _swin_clearance if '_swin_clearance' in dir() else None,
+                        )
+                        _rl_compliance      = float(np.clip(_rl_step_r, 0.0, 1.0))
+                        _rl_compliance_grad = _rl_compliance
+                    else:
+                        _rl_compliance      = max(0.0, 1.0 - _racing_line_err)
+                        _rl_compliance_grad = _rl_compliance
 
+                    # v1.2.0: reward magnitude proportional to continuous compliance gradients
+                    _bf_cg_step = float(_bf_compliance_grad) if '_bf_compliance_grad' in dir() else 1.0
+                    _rl_cg_step = float(_rl_compliance_grad) if '_rl_compliance_grad' in dir() else _rl_compliance
                     _speed_gate = (
-                        max(0.1, min(1.0, (_speed - 0.3) / 1.2))   # base: speed > 0.3 to get full gate
-                        * (0.4 + 0.6 * _position_compliance)         # off-centerline: floor at 40%
-                        * (0.5 + 0.5 * _rl_compliance)               # off-raceline: floor at 50%
-                        * (1.0 if _bf_ok else max(0.3, 1.0 - _brake_potential))  # brake-zone: scales with how deep in field
+                        max(0.1, min(1.0, (_speed - 0.3) / 1.2))   # base speed
+                        * (0.4 + 0.6 * _position_compliance)         # centerline
+                        * (0.3 + 0.7 * _rl_cg_step)                  # race-line gradient
+                        * (0.2 + 0.8 * _bf_cg_step)                  # brake-field gradient
                     )
                     # v1.1.0: removed flat -0.02 subtractive drag (caused freeze trap on near-zero reward agents)
                     # Instead: pure multiplicative speed gate — low speed_gate scales reward toward 0, never below
@@ -2080,6 +2119,11 @@ def run(hparams):
                         'v_perp':               float(_v_perp_barrier) if '_v_perp_barrier' in dir() else 0.0,
                         'in_brake_field':       bool(_in_brake_field) if '_in_brake_field' in dir() else False,
                         'brake_potential':      float(_brake_potential) if '_brake_potential' in dir() else 0.0,
+                        # v1.2.0: continuous compliance gradients
+                        'compliance_gradient':           float(_bf_compliance_grad) if '_bf_compliance_grad' in dir() else 1.0,
+                        'race_line_compliance_gradient': float(_rl_compliance_grad) if '_rl_compliance_grad' in dir() else 0.5,
+                        'v_perp_bf':                     float(_bf_v_perp)  if '_bf_v_perp'  in dir() else 0.0,
+                        'bf_urgency':                    float(_bf_urgency) if '_bf_urgency' in dir() else 0.0,
                     })
                 except Exception:
                     pass
@@ -2364,7 +2408,7 @@ def run(hparams):
                 try:
                     _hm_track_width = float(rp.get('track_width', 1.0)) if rp else 1.0
                     _hm_n_wp = len(rp.get('waypoints', [])) if rp else None
-                    _hm_metrics = _hm.compute_all(
+                    _hm_out = _hm.compute_all(
                         _ep_step_log,
                         final_progress=ep_track_progress_pct / 100.0,
                         n_waypoints=len(_waypoints) if _waypoints else 120,
@@ -2375,9 +2419,9 @@ def run(hparams):
                         bc_seeded=int(n_harvested >= 5) if 'n_harvested' in dir() else 0,
                     )
                     # v1.1.2: explicit compliance scalars → TensorBoard + logger
-                    _rl_adh  = float(_hm_metrics.get("race_line_adherence", 0.0))
-                    _brk_cmp = float(_hm_metrics.get("brake_compliance",    0.0))
-                    _str_smt = float(_hm_metrics.get("smoothness_steering_rate", 0.0))
+                    _rl_adh  = float(_hm_out.get("race_line_adherence", 0.0))
+                    _brk_cmp = float(_hm_out.get("brake_compliance",    0.0))
+                    _str_smt = float(_hm_out.get("smoothness_steering_rate", 0.0))
                     writer.add_scalar("compliance/race_line_adherence",      _rl_adh,  global_step)
                     writer.add_scalar("compliance/brake_compliance",         _brk_cmp, global_step)
                     writer.add_scalar("compliance/smoothness_steering_rate", _str_smt, global_step)
@@ -2394,7 +2438,7 @@ def run(hparams):
                         f"(1=silky, 0=oscillating)  NOTE: steering INPUT rate, not chassis jerk"
                     )
                 except Exception as _e_hm:
-                    logger.warning(f"[HM] compute_all failed: {e_hm}")
+                    logger.warning(f"[HM] compute_all failed: {_e_hm}")
                     _hm_out = {k: 0.0 for k in _hm.SUCCESS_METRICS + _hm.INTERMEDIARY_METRICS} 
                 # v213: race-type tag for plot/CSV differentiation
                 _race_type_tag = {
@@ -2508,7 +2552,10 @@ def run(hparams):
                         'track_progress':       float(_hm_out.get('track_progress', 0.0)),
                         'race_line_adherence':  float(_hm_out.get('race_line_adherence', 0.0)),
                         'brake_compliance':     float(_hm_out.get('brake_compliance', 0.0)),
-                        'smoothness_steering_rms':  float(_hm_out.get('smoothness_steering_rms', 0.0)),
+                        'smoothness_steering_rate': float(_hm_out.get('smoothness_steering_rate', 0.0)),
+                        # v1.2.0: continuous compliance gradients → BSTS Kalman shaping
+                        'brake_field_compliance_gradient': float(_hm_out.get('brake_field_compliance_gradient', 1.0)),
+                        'race_line_compliance_gradient':   float(_hm_out.get('race_line_compliance_gradient',   0.5)),
                     })
                 if {k: v for k, v in bsts_metrics.items()
                  if isinstance(v, (int, float)) and v != 0.0}: # v1.1.2: only pass metrics that have actual signal:
@@ -2646,7 +2693,7 @@ def run(hparams):
                                     logger.info(f"[RaceLine] brake_integral={_rl.get('brake_zone_integral',0):.3f} ")
                                 _rl_eps = [{"steps": e.get("_steps", []), "completion_pct": e.get("lap_completion_pct", 0)} for e in bsts_feedback._all_summaries[-20:]]
                                 _rl_score = score_race_line_compliance(_rl_eps, _rl)
-                                logger.info(f"[RaceLine] perp_v={_rl_score.get(chr(39)+chr(97)+chr(118)+chr(103)+chr(95)+chr(112)+chr(101)+chr(114)+chr(112)+chr(95)+chr(118)+chr(39), 0):.4f}")
+                                logger.info(f"[RaceLine] perp_v={_rl_score.get('avg_perp_v', 0):.4f}")
                             except Exception as _re:
                                 logger.debug(f"Race line analysis skip: {_re}")
                         logger.info(f"[BSTS-Kalman] trends={bsts_feedback.kf_trends} betas_top={dict(list(bsts_feedback.kf_betas.items())[:3])}")
@@ -2949,7 +2996,7 @@ def run(hparams):
                     _td3_bc_val_log = _td3_actor.get("td3_bc_loss_val", 0.0) or 0.0
                     _obs_b_for_log = b_obs[mb_inds]
                     print(f"[TD3_ACTOR] obs_max={_obs_b_for_log.abs().max():.2f}, "
-                        f"bc_loss={_td3_bc_val_log:.4f}, ready={_td3_actor.get(chr(39)+chr(116)+chr(100)+chr(51)+chr(95)+chr(114)+chr(101)+chr(97)+chr(100)+chr(121)+chr(39), False)}")
+                        f"bc_loss={_td3_bc_val_log:.4f}, ready={_td3_actor.get('td3_ready', False)}")
                     # v1.1.1: use td3_ready flag; blend bc_loss into PPO loss
                     # rather than running a separate optimizer step (avoids
                     # double-stepping the optimizer and corrupting GAE returns).

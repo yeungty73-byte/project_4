@@ -376,13 +376,19 @@ class BSTSFeedback:
 
     # ------------------------------------------------------------------
     def adjust_weights(self, base_weights, *, race_type_filter=None) -> dict:
-        """Return re-normalised reward weights adjusted by BSTS+Kalman feedback."""
+        """Return re-normalised reward weights adjusted by BSTS+Kalman feedback.
+
+        v1.2.0: Compliance-gradient-aware shaping.
+        Boost magnitude is PROPORTIONAL to (1 - compliance_gradient) so the
+        reward signal targets exactly the behaviour the agent is weakest at.
+        New signals: brake_field_compliance_gradient, race_line_compliance_gradient.
+        REF: Ng, Harada & Russell (1999); Scott & Varian (2014).
+        """
         effective_race_type = (
             _norm_race_type(str(race_type_filter))
             if race_type_filter is not None
             else self.race_type
         )
-
         if isinstance(base_weights, dict):
             w = {k: float(v) if isinstance(v, (int, float)) else 0.1
                  for k, v in base_weights.items()}
@@ -395,7 +401,33 @@ class BSTSFeedback:
         spd = self.ema.get("avg_speed",          2.0)
         ccr = self.ema.get("corner_crash_rate",  0.0)
 
-        # ---- Layer 1: Kalman trend signals ----
+        def _ema(k, d=0.0):
+            return float(self.ema.get(k, d))
+        def _slope(k):
+            try:
+                return float(self.kf_trends.get(k, 0.0))
+            except Exception:
+                return 0.0
+
+        # ── Layer 0: Compliance gradient shaping (v1.2.0, PRIMARY) ─────────
+        _bf_cg  = _ema("brake_field_compliance_gradient",  1.0)
+        _rl_cg  = _ema("race_line_compliance_gradient",    1.0)
+        _bf_def = float(max(0.0, 1.0 - _bf_cg))
+        _rl_def = float(max(0.0, 1.0 - _rl_cg))
+
+        if _bf_def > 0.05:
+            w["braking"]    = w.get("braking",    0.08) + s * _bf_def * 0.6
+            w["safe_speed"] = w.get("safe_speed", 0.06) + s * _bf_def * 0.3
+        if _slope("brake_field_compliance_gradient") < -0.005:
+            w["braking"]    = w.get("braking", 0.08) + s * abs(_slope("brake_field_compliance_gradient")) * 20.0
+
+        if _rl_def > 0.05:
+            w["racing_line"] = w.get("racing_line", 0.04) + s * _rl_def * 0.7
+            w["heading"]     = w.get("heading",     0.10) + s * _rl_def * 0.3
+        if _slope("race_line_compliance_gradient") < -0.005:
+            w["racing_line"] = w.get("racing_line", 0.04) + s * abs(_slope("race_line_compliance_gradient")) * 20.0
+
+        # ── Layer 1: Kalman trend signals ───────────────────────────────────
         for metric, trend_val in self.kf_trends.items():
             if metric == "crash_rate" and trend_val > 0.01:
                 w["obstacle"] = w.get("obstacle", 0.1) + s * 0.3
@@ -404,14 +436,17 @@ class BSTSFeedback:
                 w["center"]  = w.get("center",  0.1) + s * 0.4
                 w["heading"] = w.get("heading", 0.1) + s * 0.3
 
-        # ---- Layer 1b: Kalman regression coefficients ----
+        # ── Layer 1b: Kalman regression — v_perp and urgency ───────────────
         for metric, beta in self.kf_betas.items():
-            if "perp_velocity" in metric and abs(beta) > 0.1:
-                w["speed_steering"] = w.get("speed_steering", 0.08) + s * abs(beta) * 0.2
-            if "brake_zone" in metric and abs(beta) > 0.1:
-                w["progress"] = w.get("progress", 0.12) + s * abs(beta) * 0.15
+            if "v_perp" in metric and abs(beta) > 0.1:
+                w["braking"]       = w.get("braking",       0.08) + s * abs(beta) * 0.3
+                w["speed_steering"]= w.get("speed_steering",0.08) + s * abs(beta) * 0.2
+            if "urgency" in metric and abs(beta) > 0.1:
+                w["braking"]       = w.get("braking", 0.08) + s * abs(beta) * 0.25
+            if "race_line_compliance_gradient" in metric and abs(beta) > 0.1:
+                w["racing_line"]   = w.get("racing_line", 0.04) + s * abs(beta) * 0.3
 
-        # ---- Layer 2: EMA threshold rules ----
+        # ── Layer 2: EMA threshold rules ────────────────────────────────────
         if cr > 0.3:
             b = s * min(cr, 1.0)
             w["obstacle"] = w.get("obstacle", 0.1) + b * 0.5
@@ -422,21 +457,14 @@ class BSTSFeedback:
             w["heading"] = w.get("heading", 0.1) + b * 0.3
         if spd < 1.5:
             w["curv_speed"] = w.get("curv_speed", 0.15) + s * 0.3
-        # v1.1.1: corner weight only fires after car reaches 10% of track
-        _ep_prog_for_corner = float(self.ema.get("avg_progress", 0.0))
-        if ccr > 0.2 and _ep_prog_for_corner > 10.0:
+        _ep_prog = _ema("avg_progress", 0.0)
+        if ccr > 0.2 and _ep_prog > 10.0:
             w["corner"] = w.get("corner", 0.1) + s * min(ccr, 1.0) * 0.5
 
-        ssr = self.ema.get("avg_safe_speed_ratio", 1.0)
-        ter = self.ema.get("avg_turn_entry_ratio", 1.0)
-        rle = self.ema.get("avg_racing_line_err",  0.0)
-
-        _ssr_thresh = {
-            "TIME_TRIAL":       1.2,
-            "OBJECT_AVOIDANCE": 1.05,
-            "HEAD_TO_BOT":      1.1,
-        }.get(effective_race_type, 1.2)
-
+        ssr = _ema("avg_safe_speed_ratio", 1.0)
+        ter = _ema("avg_turn_entry_ratio", 1.0)
+        rle = _ema("avg_racing_line_err",  0.0)
+        _ssr_thresh = {"TIME_TRIAL": 1.2, "OBJECT_AVOIDANCE": 1.05, "HEAD_TO_BOT": 1.1}.get(effective_race_type, 1.2)
         if ssr > _ssr_thresh:
             w["safe_speed"] = w.get("safe_speed", 0.06) + s * min(ssr - 1.0, 0.5) * 0.3
         if ter > 1.1:
@@ -444,111 +472,33 @@ class BSTSFeedback:
         if rle > 0.4:
             w["racing_line"] = w.get("racing_line", 0.04) + s * min(rle, 1.0) * 0.2
 
-        def _ema(k, d=0.0):
-            return float(self.ema.get(k, d))
-        def _slope(k):
-            try:
-                return float(self.kf_trends.get(k, 0.0))
-            except Exception:
-                return 0.0
-
-        if _ema("race_line_gradient_compliance", 0.5) < 0.5 or _slope("race_line_gradient_compliance") < -0.005:
-            w["racing_line"] = w.get("racing_line", 0.04) + s * 0.25
         if _ema("avg_speed_centerline", 0.0) > 0 and _slope("avg_speed_centerline") < -0.01:
             w["progress"] = w.get("progress", 0.12) + s * 0.20
         if _slope("jerk_rms") < -0.01:
-            w["jerk"] = w.get("jerk", 0.03) + s * 0.15
+            w["jerk"]     = w.get("jerk", 0.03) + s * 0.15
         if _slope("late_corner_entry") < -0.01 or _slope("early_corner_exit") < -0.01:
-            w["corner"] = w.get("corner", 0.10) + s * 0.30
-        if _ema("brake_field_compliance", 0.5) < 0.4:
-            w["braking"] = w.get("braking", 0.08) + s * 0.25
+            w["corner"]   = w.get("corner", 0.10) + s * 0.30
         if _slope("steer_speed_coordination") < -0.01:
             w["speed_steering"] = w.get("speed_steering", 0.08) + s * 0.15
         if _slope("waypoint_coverage") < -0.005:
             w["progress"] = w.get("progress", 0.12) + s * 0.10
 
-        # ---- Layer 3: race_type multipliers ----
+        # ── Layer 3: race_type multipliers ──────────────────────────────────
         if effective_race_type == "OBJECT_AVOIDANCE":
-            w["obstacle"] = max(w.get("obstacle", 0.0), 0.12) * 1.3
-            w["braking"]  = w.get("braking",  0.08) * 1.5
-            w["center"]   = w.get("center",   0.10) * 1.1
+            w["obstacle"]    = max(w.get("obstacle", 0.0), 0.12) * 1.3
+            w["braking"]     = w.get("braking",  0.08) * 1.5
+            w["center"]      = w.get("center",   0.10) * 1.1
         elif effective_race_type == "HEAD_TO_BOT":
             w["obstacle"]       = max(w.get("obstacle", 0.0), 0.15) * 1.5
             w["steering"]       = w.get("steering",       0.02) * 2.0
             w["speed_steering"] = w.get("speed_steering", 0.08) * 1.3
             w["corner"]         = w.get("corner",         0.10) * 1.2
 
-        _prog_floor = 0.08
-        # v1.1.1: PROGRESS FLOOR — never starve forward motion
-        # REF: Ng, Harada & Russell (1999) reward shaping.
-        w['progress'] = max(w.get('progress', 0.0), _prog_floor)
+        w['progress'] = max(w.get('progress', 0.0), 0.08)  # Ng et al. (1999) progress floor
         total = sum(w.values())
         if total > 0:
             return {k: v / total for k, v in w.items()}
         return w
-
-
-# ===========================================================================
-# Helper functions (shared by BSTSSeasonal internals)
-# ===========================================================================
-def _apply_denim():
-    rcParams.update({
-        'figure.facecolor': BG_LIGHT,
-        'axes.facecolor':   WHITE_SMOKE,
-        'axes.edgecolor':   DENIM_DARK,
-        'axes.labelcolor':  DENIM_DARK,
-        'xtick.color':      DENIM_DARK,
-        'ytick.color':      DENIM_DARK,
-        'text.color':       DENIM_DARK,
-        'grid.color':       MUTED_GRAY,
-        'grid.alpha':       0.3,
-        'axes.grid':        True,
-        'font.family':      'sans-serif',
-    })
-
-
-def _load_jsonl(path):
-    rows = []
-    with open(path, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rows.append(json.loads(line))
-            except Exception:
-                pass
-    return rows
-
-
-def _ewma(x, alpha=0.02):
-    x = np.asarray(x, dtype=float)
-    if len(x) == 0:
-        return x
-    out = np.empty_like(x)
-    out[0] = x[0]
-    for i in range(1, len(x)):
-        out[i] = alpha * x[i] + (1 - alpha) * out[i - 1]
-    return out
-
-
-def _ols(X, y):
-    try:
-        beta, *_ = np.linalg.lstsq(X, y, rcond=None)
-        return beta, X @ beta
-    except Exception:
-        return np.zeros(X.shape[1]), np.zeros_like(y)
-
-
-# ===========================================================================
-# BSTSSeasonal  (batch decomposer — unchanged from v1.0.13)
-# ===========================================================================
-class BSTSSeasonal:
-    """Batch BSTS decomposition + live per-step buffer for run.py integration."""
-
-    STEP_BUFFER_MAXLEN       = 5000
-    STEP_BUFFER_MIN_EPISODES = 5 # was 20
-    TREND_WINDOW             = 30
 
     def __init__(self, n_segments=12, save_dir='results', alpha=0.02):
         self.n_segments = int(n_segments)
