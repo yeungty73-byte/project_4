@@ -520,6 +520,99 @@ class BSTSFeedback:
             return {k: v / total for k, v in w.items()}
         return w
 
+
+# ---------------------------------------------------------------------------
+# Module-level helpers for BSTSSeasonal
+# ---------------------------------------------------------------------------
+def _ewma(y, alpha=0.02):
+    """Exponentially-weighted moving average (EWMA) trend extraction.
+    REF: Cleveland et al. (1990) STL decomposition — trend component.
+    """
+    out = np.empty_like(y, dtype=float)
+    out[0] = y[0]
+    for i in range(1, len(y)):
+        out[i] = alpha * y[i] + (1.0 - alpha) * out[i - 1]
+    return out
+
+
+def _ols(X, y):
+    """OLS via normal equations with ridge regularisation (lambda=1e-4).
+    REF: Durbin & Koopman (2012) §3.2 regression component in state-space.
+    """
+    try:
+        XtX = X.T @ X + 1e-4 * np.eye(X.shape[1])
+        beta = np.linalg.solve(XtX, X.T @ y)
+        return beta, X @ beta
+    except np.linalg.LinAlgError:
+        return np.zeros(X.shape[1]), np.zeros(len(y))
+
+
+def _load_jsonl(path):
+    """Load a JSONL file into a list of dicts. Silently skips malformed lines."""
+    rows = []
+    try:
+        with open(path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+    except FileNotFoundError:
+        pass
+    return rows
+
+
+def _apply_denim():
+    """Apply denim theme to matplotlib rcParams."""
+    if not HAS_MPL:
+        return
+    rcParams.update({
+        'axes.facecolor':   BG_LIGHT,
+        'figure.facecolor': BG_LIGHT,
+        'axes.edgecolor':   DENIM_DARK,
+        'axes.labelcolor':  DENIM_DARK,
+        'xtick.color':      DENIM_DARK,
+        'ytick.color':      DENIM_DARK,
+        'text.color':       DENIM_DARK,
+        'grid.color':       DENIM_MID,
+        'grid.alpha':       0.3,
+        'axes.grid':        True,
+    })
+
+
+# ===========================================================================
+# BSTSSeasonal  — Batch BSTS decomposition + live per-step buffer
+# ===========================================================================
+class BSTSSeasonal:
+    """Batch BSTS decomposition with live per-step buffer for run.py.
+
+    Provides:
+      record_step()       -- buffer per-step observations
+      fit_from_jsonl()    -- full BSTS fit from episode JSONL log
+      get_trend()         -- cached trend dict (phase, slope, kf_level, ...)
+      get_season()        -- cached season dict (worst_segments, segments)
+      get_seasonal()      -- alias for get_season()
+
+    REF:
+      Cleveland, R. B. et al. (1990). STL: A seasonal-trend decomposition
+        procedure based on Loess. J. Off. Stat., 6(1), 3-73.
+      Scott, S. L. & Varian, H. R. (2014). Predicting the present with
+        Bayesian structural time series. Int. J. Math. Model. Numer.
+        Optim., 5(1-2), 4-23.
+      Brodersen, K. H. et al. (2015). Inferring causal impact using
+        Bayesian structural time-series models. Ann. Appl. Stat., 9(1),
+        247-274.
+      Durbin, J. & Koopman, S. J. (2012). Time Series Analysis by State
+        Space Methods (2nd ed.). Oxford University Press.
+    """
+
+    STEP_BUFFER_MAXLEN      = 10_000
+    STEP_BUFFER_MIN_EPISODES = 5
+    TREND_WINDOW             = 10
+
     def __init__(self, n_segments=12, save_dir='results', alpha=0.02):
         self.n_segments = int(n_segments)
         self.save_dir   = str(save_dir)
