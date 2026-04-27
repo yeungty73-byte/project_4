@@ -1340,6 +1340,7 @@ def run(hparams):
     ep_decel_penalties = []
     ep_safe_speed_ratios = []
     ep_racing_line_errors = []
+    _brake_field = None  # BUG-FIX v1.3.1b: ensure bound before first episode step
     ep_recovery_steps = 0
     ep_in_recovery = False
     ep_turn_entry_speeds = []
@@ -1768,10 +1769,13 @@ def run(hparams):
                         logger.info(f"[V16] MultiRaceLineEngine initialized+.initialize() called with {len(_waypoints)} waypoints")
                     except Exception as _re_init_err:
                         logger.warning(f"[V16] race_engine.initialize() failed: {_re_init_err}")
-                    # BrakeField waypoints now set at episode start; update if waypoints just arrived
-                    if _brake_field is not None and (not hasattr(_brake_field, 'waypoints') or _brake_field.waypoints is None):
+                    # BUG-FIX v1.3.1b: create BrakeField on first waypoints if episode-start block hasn't run yet
+                    if _brake_field is None:
+                        _brake_field = BrakeField()
+                        logger.info(f"[V41] BrakeField created on first waypoint arrival")
+                    if not hasattr(_brake_field, 'waypoints') or _brake_field.waypoints is None:
                         _brake_field.set_waypoints(np.array(_waypoints))
-                        logger.info(f"[V41] BrakeField waypoints set mid-episode: {len(_waypoints)} wps")
+                        logger.info(f"[V41] BrakeField waypoints set: {len(_waypoints)} wps")
 
                 # === Build racing line map lazily on first step ===
                 # v39: Force track discovery before meaningful training
