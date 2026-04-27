@@ -129,7 +129,9 @@ def _corner_speed_error(steps):
     for s in steps:
         spd = _safe(s.get("speed", 0))
         tgt = _safe(s.get("corner_speed_target", spd))
-        if tgt > 0 and s.get("in_corner", False):
+        # BUG-FIX v1.3.1: DeepRacer rp has no 'is_turn'; accept either key
+        in_c = s.get("in_corner", False) or s.get("is_turn", False)
+        if tgt > 0 and in_c:
             errs.append(abs(spd - tgt) / max(tgt, 0.1))
     return float(np.clip(1.0 - np.mean(errs), 0.0, 1.0)) if errs else 0.5
 
@@ -140,7 +142,8 @@ def _heading_alignment(steps):
 
 
 def _smoothness_steering_rate(steps):
-    steers = [_safe(s.get("steering", 0)) for s in steps]
+    # BUG-FIX v1.3.1: accept 'steering_angle' (run.py step_log key) OR 'steering' (legacy)
+    steers = [_safe(s.get("steering_angle", s.get("steering", 0))) for s in steps]
     if len(steers) < 2:
         return 1.0
     diffs = [abs(steers[i] - steers[i - 1]) for i in range(1, len(steers))]
@@ -172,7 +175,8 @@ def _vprofile_compliance(steps):
     for s in steps:
         tgt = _safe(s.get("corner_speed_target", 0))
         spd = _safe(s.get("speed", 0))
-        if tgt > 0:
+        # BUG-FIX v1.3.1: count all steps where a speed target is set (in_corner not required)
+        if tgt > 0 and tgt != spd:  # tgt != spd avoids default-passthrough steps
             total += 1
             if abs(spd - tgt) / tgt < 0.20:
                 ok += 1
@@ -182,7 +186,10 @@ def _vprofile_compliance(steps):
 def _curvature_anticipation(steps):
     slowing = corners = 0
     for i in range(1, len(steps)):
-        if steps[i].get("in_corner") and not steps[i - 1].get("in_corner"):
+        # BUG-FIX v1.3.1: accept 'in_corner' OR 'is_turn'
+        cur  = steps[i].get("in_corner", steps[i].get("is_turn", False))
+        prev = steps[i - 1].get("in_corner", steps[i - 1].get("is_turn", False))
+        if cur and not prev:
             corners += 1
             if _safe(steps[i].get("speed", 0)) < _safe(steps[i - 1].get("speed", 1)):
                 slowing += 1

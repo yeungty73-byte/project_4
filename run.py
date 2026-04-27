@@ -1737,7 +1737,9 @@ def run(hparams):
             if _speed > 0.1: reward += min(_speed, 4.0) * 0.05  # v39: halved from 0.1
             ep_step_count += 1  # v28: FIX missing increment
             
-            _brake_field = BrakeField()
+            # BUG-FIX v1.3.1: BrakeField must NOT be re-instantiated every step.
+            # It was created fresh each step, discarding all waypoint/corner state.
+            # Now only created once per episode (at episode start below).
             if rp:
                 _speed = rp.get("speed", 0)
                 # v4-bsts: barrier proximity from LIDAR and objects
@@ -1760,9 +1762,16 @@ def run(hparams):
                 # v16: Lazy-init BrakeField alongside race engine
                 if _waypoints and race_engine is None:
                     race_engine = MultiRaceLineEngine(_waypoints)
-                    logger.info(f"[V16] MultiRaceLineEngine initialized with {len(_waypoints)} waypoints")
-                    _brake_field.set_waypoints(np.array(_waypoints)) # v222
-                    logger.info(f"[V41] BrakeField waypoints set: {len(_waypoints)} wps")
+                    # BUG-FIX v1.3.1: .initialize() was never called → engine always dead
+                    try:
+                        race_engine.initialize()
+                        logger.info(f"[V16] MultiRaceLineEngine initialized+.initialize() called with {len(_waypoints)} waypoints")
+                    except Exception as _re_init_err:
+                        logger.warning(f"[V16] race_engine.initialize() failed: {_re_init_err}")
+                    # BrakeField waypoints now set at episode start; update if waypoints just arrived
+                    if _brake_field is not None and (not hasattr(_brake_field, 'waypoints') or _brake_field.waypoints is None):
+                        _brake_field.set_waypoints(np.array(_waypoints))
+                        logger.info(f"[V41] BrakeField waypoints set mid-episode: {len(_waypoints)} wps")
 
                 # === Build racing line map lazily on first step ===
                 # v39: Force track discovery before meaningful training
@@ -1922,7 +1931,8 @@ def run(hparams):
                         _bf_step          = _brake_field.step(
                             wp_idx          = _closest[0] if _closest else 0,
                             speed           = _speed,
-                            heading_rad     = float(_heading) if '_heading' in dir() else 0.0,
+                            # BUG-FIX v1.3.1: _heading is in DEGREES (from rp); must convert to radians
+                            heading_rad     = math.radians(float(_heading)) if '_heading' in dir() else 0.0,
                             car_x           = float(rp.get('x', 0.0)),
                             car_y           = float(rp.get('y', 0.0)),
                             is_braking      = _is_braking_now,
@@ -1975,7 +1985,8 @@ def run(hparams):
                             car_lat_pos = (float(_dist_from_center) * (1 if rp.get('is_left_of_center', False) else -1)
                                            / max(_track_width * 0.5, 0.1)),
                             car_speed   = float(_speed),
-                            car_heading = float(_heading) if '_heading' in dir() else 0.0,
+                            # BUG-FIX v1.3.1: degrees→radians for race_engine too
+                            car_heading = math.radians(float(_heading)) if '_heading' in dir() else 0.0,
                             track_width = float(_track_width) if '_track_width' in dir() else 0.6,
                             context     = int(_context) if '_context' in dir() else 0,
                             lidar_min   = float(_lidar_min) if '_lidar_min' in dir() else 1.0,
@@ -2147,6 +2158,7 @@ def run(hparams):
                         'heading':              float(_rp_log.get('heading', 0.0)),
                         'speed':                float(_speed),   # already resolved above
                         'steering_angle':       float(action[0]) if hasattr(action, '__getitem__') else 0.0,
+                        'steering':             float(action[0]) if hasattr(action, '__getitem__') else 0.0,  # BUG-FIX v1.3.1: harmonized_metrics reads 'steering'; alias required
                         'throttle':             float(action[1]) if hasattr(action, '__getitem__') and len(action) > 1 else 0.0,
                         'reward':               float(reward),
                         'all_wheels_on_track':  bool(_rp_log.get('all_wheels_on_track', True)),
@@ -2165,7 +2177,9 @@ def run(hparams):
                         'heading_diff':         float(ep_heading_diffs[-1]) if ep_heading_diffs else 0.0,
                         'safe_speed_ratio':     float(_speed_ratio) if '_speed_ratio' in dir() else 1.0,
                         'racing_line_offset':   float(_racing_line_err) if '_racing_line_err' in dir() else 0.0,
-                        'in_corner':            bool(_rp_log.get('is_turn', False)),
+                        # BUG-FIX v1.3.1: DeepRacer rp has no 'is_turn' key; use curvature proxy
+                        'in_corner':            bool(abs(getattr(_curvature if "_curvature" in dir() else 0, "real", 0)) > 0.10),
+                        'is_turn':              bool(abs(getattr(_curvature if "_curvature" in dir() else 0, "real", 0)) > 0.10),
                         'track_width':          float(_tw) if '_tw' in dir() else float(_rp_log.get('track_width', 1.0)),
                         # v1.1.0: jerk for brake_intent scoring
                         'accel':                float(_accel) if '_accel' in dir() else 0.0,
@@ -2827,6 +2841,10 @@ def run(hparams):
                     except Exception as _fe:
                         logger.debug(f"BSTS flush error: {_fe}")
                 _ep_step_log = []
+                # BUG-FIX v1.3.1: one BrakeField per episode; reset() flushes step-level stats
+                _brake_field = BrakeField()
+                if _waypoints:
+                    _brake_field.set_waypoints(np.array(_waypoints))
                 ep_recovery_steps = 0
                 ep_in_recovery = False
                 ep_turn_entry_speeds = []
