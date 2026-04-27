@@ -108,7 +108,7 @@ def extract_intermediary_metrics(ep: dict) -> dict:
     steps = ep.get('steps', ep.get('trajectory', []))
     if len(steps) < 3:
         return {m: 0.0 for m in INTERMEDIARY_METRICS}
-    n_wp = int(ep.get('n_waypoints', 100))
+    n_wp = int(ep.get('n_waypoints', 120))   # v1.6.0: 120 matches run.py default
     track_width = float(ep.get('track_width', 0.6))
     scalars = compute_intermediary(steps, n_waypoints=n_wp, track_width=track_width)
     # Ensure every expected key is present (zero-fill missing)
@@ -124,11 +124,15 @@ def episode_summary_metrics(ep: dict, intermediary: dict) -> dict:
     crashed = ep.get('crashed', ep.get('termination_reason', '') == 'crashed')
     completion = ep.get('completion_pct', ep.get('progress', 0))
     
+    # v1.6.0 FIX-I: forward track_length_m and n_waypoints to compute_success.
+    # ep_data now carries these (FIX-L in run.py). Without them compute_success
+    # uses 100 n_wp and 0.6 tw defaults → tracklengthm=0.0 in every Kalman line.
     # --- Success metrics: harmonized v3.0 (VIF<5, collinearity-free) ---
     from harmonized_metrics import compute_success
     steps_for_success = ep.get('steps', ep.get('trajectory', []))
-    n_wp = int(ep.get('n_waypoints', 100))
+    n_wp = int(ep.get('n_waypoints', 120))           # FIX-I: was 100
     track_width = float(ep.get('track_width', 0.6))
+    track_length_m = float(ep.get('track_length_m', 16.6))  # FIX-I: forward from ep_data
     succ = compute_success(steps_for_success, n_waypoints=n_wp, track_width=track_width) if steps_for_success else {}
     summary = {k: float(succ.get(k, 0.0)) for k in SUCCESS_METRICS}
     # Keep legacy scalars available for audit / back-compat dashboards
