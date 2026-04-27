@@ -912,12 +912,14 @@ def harvest_htm_pilots(env, htm_agent, td3sac, n_episodes=12, min_progress=2.0):
             # REF: AWS (2020) — DeepRacer obs_space is flat float32 of shape (38464,).
             obs_t  = torch.tensor(obs_to_array(obs),      dtype=torch.float32)
             nobs_t = torch.tensor(obs_to_array(next_obs), dtype=torch.float32)
-            # v1.1.0: normalize pixel obs before replay storage to prevent critic NaN
-            # Raw DeepRacer obs values are in [0,255]; must be [0,1] for stable critic training.
-            _obs_scale = obs_t.abs().max().item()
-            if _obs_scale > 2.0:
-                obs_t  = obs_t  / max(_obs_scale, 1.0)
-                nobs_t = nobs_t / max(nobs_t.abs().max().item(), 1.0)
+            # v1.1.5 FIX Bug M: Use GLOBAL /255.0 normalization (not per-sample max).
+            # Per-sample division means sample_i scaled to [0,1] if max=255, but
+            # sample_j scaled to [0,2.55] if max=100, making replay inconsistent.
+            # DeepRacer camera is uint8 [0,255] → divide by 255 unconditionally.
+            # This MUST match the main-loop store (see Bug N fix below).
+            _OBS_NORM_SCALE = 255.0
+            obs_t  = obs_t  / _OBS_NORM_SCALE
+            nobs_t = nobs_t / _OBS_NORM_SCALE
             # v1.4.0: Ng et al. (1999) potential-based BC reward: r = alpha * delta_progress_m
             # Decouples lap TIME from traversed DISTANCE. Slow-but-far > fast-but-crash.
             # REF: Ng, Harada & Russell (1999) ICML -- potential phi(s)=alpha*arc_progress_m
@@ -2780,7 +2782,13 @@ def run(hparams):
                 _nobs_t = next_obs.cpu() if isinstance(next_obs, torch.Tensor) else torch.tensor(obs_to_array(observation), dtype=torch.float32)
                 # Store the continuous action tensor (what the critic sees), not the discretized env action
                 _td3_action = action.squeeze(0).detach().cpu()
-                td3sac.store_transition(obs[step], _td3_action, reward, next_obs, terminated or truncated)
+                # v1.1.5 FIX: normalize obs to [0,1] before replay store.
+                # Must match BC harvest normalization scale (255.0) for homogeneous replay.
+                _td3_obs_n  = obs[step].float() / 255.0
+                _td3_nobs_n = next_obs.float()  / 255.0 if isinstance(next_obs, torch.Tensor) \
+                              else torch.tensor(obs_to_array(next_obs), dtype=torch.float32) / 255.0
+                if torch.isfinite(_td3_obs_n).all() and torch.isfinite(_td3_nobs_n).all():
+                    td3sac.store_transition(_td3_obs_n, _td3_action, reward, _td3_nobs_n, terminated or truncated)
             except Exception:
                 pass
             # context label: 0=straight, 1=left_curve, 2=right_curve
@@ -3183,31 +3191,84 @@ def run(hparams):
                 rw = _adjusted_rw
             # === Online Kalman BSTS update ===
                 try:
-                    ep_data = {'steps': _ep_step_log, 'completion_pct': bsts_metrics.get('completion_pct', 0),
-                               'termination_reason': term_reason}
+                    ep_data = {
+                        'steps': _ep_step_log,
+                        'completion_pct': bsts_metrics.get('completion_pct', 0),
+                        'termination_reason': term_reason,
+                        # v1.6.0 FIX-L: pass tw + n_wp so extract_intermediary_metrics
+                        # and episode_summary_metrics use real values, not 0.6 / 100 defaults.
+                        'track_width':  float(_tw) if '_tw' in dir() and _tw else 0.6,
+                        'n_waypoints':  len(_waypoints) if '_waypoints' in dir() and _waypoints else 120,
+                    }
                     # Wire: extract real intermediary metrics from episode step log
                     try:
                         intermediary = extract_intermediary_metrics({'steps': _ep_step_log})
-                    except Exception:
-                        intermediary = {m: [0] for m in INTERMEDIARY_METRICS}  # fallback
+                    except Exception as _im_exc:
+                        # v1.6.0 FIX-M: neutral defaults, not zeros.
+                        # [0] → mean([0])=0.0 overwrites correct neutrals downstream.
+                        _INTERM_NEUTRAL = {
+                            'race_line_adherence': 0.5,
+                            'brake_compliance': 1.0,
+                            'brake_field_compliance_gradient': 1.0,
+                            'race_line_compliance_gradient': 0.5,
+                            'smoothness_steering_rate': 1.0,
+                            'corner_speed_error': 0.5,
+                            'heading_alignment_mean': 0.0,
+                        }
+                        intermediary = {
+                            m: _INTERM_NEUTRAL.get(m, 0.0)
+                            for m in INTERMEDIARY_METRICS
+                        }
+                        logger.debug(f"[KF-INTERM] extract_intermediary_metrics fallback: {_im_exc!r}")
                     summary = episode_summary_metrics(ep_data, intermediary)
+                    # v1.6.0 FIX-N: Override with bsts_metrics neutral-correct values.
+                    # episode_summary_metrics may still produce 0.0 if steps lack
+                    # dist_to_raceline (not yet populated). bsts_metrics already has
+                    # correct neutrals (0.5 / 1.0) from _hm_out merge above.
+                    for _fix_k in ('race_line_adherence', 'brake_compliance',
+                                   'brake_field_compliance_gradient',
+                                   'race_line_compliance_gradient',
+                                   'smoothness_steering_rate'):
+                        if _fix_k in bsts_metrics and math.isfinite(float(bsts_metrics[_fix_k])):
+                            summary[_fix_k] = float(bsts_metrics[_fix_k])
                     # Override with actual bsts_metrics values
                     summary['lap_completion_pct'] = bsts_metrics.get('completion_pct', 0)
                     summary['reward_per_step'] = bsts_metrics.get('avg_reward', 0)
                     summary['off_track_rate'] = bsts_metrics.get('offtrack_rate', 0)
                     summary['crash_rate'] = 1.0 if term_reason == 'crashed' else 0.0
+                    # v1.1.5 FIX: Mirror _hm_out into summary with BOTH
+                    # bare key AND _mean key. reg_names in X-matrix uses f'{m}_mean'
+                    # but episode_summary_metrics() writes bare keys only → all-zeros.
+                    # Bug L: bsts_row.update(_hm_out) is independent of summary build,
+                    # so also pull from bsts_row as authoritative fallback.
+                    if '_hm_out' in dir() and _hm_out:
+                        for _hm_k, _hm_v in _hm_out.items():
+                            summary[_hm_k]           = float(_hm_v)
+                            summary[f'{_hm_k}_mean'] = float(_hm_v)
+                    if 'bsts_row' in dir() and bsts_row:
+                        for _bk in ('race_line_adherence', 'brake_compliance',
+                                    'brake_field_compliance_gradient',
+                                    'race_line_compliance_gradient'):
+                            if _bk in bsts_row:
+                                summary[_bk]             = float(bsts_row[_bk])
+                                summary[f'{_bk}_mean']   = float(bsts_row[_bk])
                     _kf_episode_buffer.append(summary)
                     if hasattr(bsts_feedback, "_all_summaries"): bsts_feedback._all_summaries.append(summary)
                     # v1.1.1: flush Kalman every episode (was 10). Eps are 14-29 steps each;
                     # at batch=10, Kalman was dead (all zeros) for 200+ episodes.
                     if len(_kf_episode_buffer) >= 1:
                         # import numpy as np  # use global
-                        reg_names = [f'{m}_mean' for m in INTERMEDIARY_METRICS]
+                        # v1.6.0 FIX-K: episode_summary_metrics stores intermediary
+                        # scalars under plain keys (e.g., "race_line_adherence"), NOT
+                        # "_mean" suffixed keys (e.g., "race_line_adherence_mean").
+                        # Old code used f'{m}_mean' → every regressor read returned 0.0
+                        # → X regressor matrix was all-zeros → BSTS KF regressors useless.
+                        reg_names = list(INTERMEDIARY_METRICS)   # FIX-K: plain keys
                         n = len(_kf_episode_buffer)
                         X = np.zeros((n, len(reg_names)))
                         for t in range(n):
                             for j, rn in enumerate(reg_names):
-                                X[t, j] = _kf_episode_buffer[t].get(rn, 0.0)
+                                X[t, j] = float(_kf_episode_buffer[t].get(rn, 0.0))
                         X_std = X.std(axis=0) + 1e-8
                         X_norm = (X - X.mean(axis=0)) / X_std
                         for sm in SUCCESS_METRICS:
@@ -3602,8 +3663,10 @@ def run(hparams):
                 if global_step % (_td3sac_update_freq * 2) == 0:
                     _td3_actor = td3sac.update_actor(agent, batch_size=256)
                     _td3_bc_val_log = _td3_actor.get("td3_bc_loss_val", 0.0) or 0.0
-                    _obs_b_for_log = b_obs[mb_inds]
-                    print(f"[TD3_ACTOR] obs_max={_obs_b_for_log.abs().max():.2f}, "
+                    # v1.1.5: log replay obs stats, not PPO buffer stats
+                    _td3_replay_sample, _, _, _, _ = td3sac.replay.sample(min(32, len(td3sac.replay)))
+                    _obs_b_for_log = torch.as_tensor(_td3_replay_sample, dtype=torch.float32)
+                    print(f"[TD3_ACTOR] replay_obs_max={_obs_b_for_log.abs().max():.4f}, "
                         f"bc_loss={_td3_bc_val_log:.4f}, ready={_td3_actor.get('td3_ready', False)}")
                     # v1.1.1: use td3_ready flag; blend bc_loss into PPO loss
                     # rather than running a separate optimizer step (avoids
