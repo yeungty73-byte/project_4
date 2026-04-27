@@ -1117,3 +1117,79 @@
              fixed in v1.1.5c) ensures BC replay and online TD3 transitions are on
              the same scale, preventing replay poisoning documented in run.py L2787.}
 }
+
+@inproceedings{bengio2009curriculum,
+  author    = {Bengio, Yoshua and Louradour, J{\'e}r{\^o}me and Collobert, Ronan and Weston, Jason},
+  title     = {Curriculum Learning},
+  booktitle = {Proceedings of the 26th Annual International Conference on Machine Learning (ICML)},
+  pages     = {41--48},
+  year      = {2009},
+  publisher = {ACM},
+  note      = {Foundational curriculum learning: easy-before-hard ordering accelerates
+               convergence. Motivates Phase A/B/C annealing in TrackProgressAnnealer:
+               Phase A (progress only) precedes Phase B (brake divergence from raceline)
+               which precedes Phase C (convergence + speed). Throttle headroom also
+               gates on phase_blend via process_action_scale(). APA: Bengio, Y.,
+               Louradour, J., Collobert, R., \& Weston, J. (2009). Curriculum learning.
+               \textit{ICML}, 41--48.}
+}
+
+@article{mnih2015humanlevel,
+  author    = {Mnih, Volodymyr and Kavukcuoglu, Koray and Silver, David and Rusu, Andrei A.
+               and Veness, Joel and Bellemare, Marc G. and Graves, Alex and Riedmiller, Martin
+               and Fidjeland, Andreas K. and Ostrovski, Georg and Petersen, Stig and Beattie,
+               Charles and Sadik, Amir and Antonoglou, Ioannis and King, Helen and Kumaran,
+               Dharshan and Wierstra, Daan and Legg, Shane and Hassabis, Demis},
+  title     = {Human-Level Control Through Deep Reinforcement Learning},
+  journal   = {Nature},
+  volume    = {518},
+  number    = {7540},
+  pages     = {529--533},
+  year      = {2015},
+  publisher = {Nature Publishing Group},
+  doi       = {10.1038/nature14236},
+  note      = {DQN replay buffer: stored transitions must be on homogeneous scale.
+               Motivates /255.0 normalisation of camera obs before store_transition()
+               (Bugs M+N, fixed in v1.1.5c). Reward clipping [-1,1] in DQN analogous
+               to division-form ARS: prevents shaped reward going strongly negative and
+               inducing the freeze-trap documented in Amodei et al. (2016).}
+}
+
+@inproceedings{koenig2004gazebo,
+  author    = {Koenig, Nathan and Howard, Andrew},
+  title     = {Design and Use Paradigms for {Gazebo}, an Open-Source Multi-Robot Simulator},
+  booktitle = {Proceedings of the IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)},
+  year      = {2004},
+  pages     = {2149--2154},
+  doi       = {10.1109/IROS.2004.1389727},
+  note      = {Gazebo physics step: model state is set via Model::SetLinearVel() and
+               Model::SetWorldPose() from the ROS topic /deepracer/reset_car.
+               The AWS DeepRacer sim injects the spawn velocity (typically 2.25--4.0 m/s)
+               BEFORE the first reward-function step to prevent physics solver jitter at
+               zero-velocity startup. This is a Gazebo-level operation: the reward
+               function's rp['speed'] at step 0 reflects the injected spawn speed,
+               NOT a policy action. The heading at spawn (is_reversed=True episodes:
+               heading ~ 158.4 deg or 102.1 deg) is set by Gazebo's spawn orientation,
+               also not controllable via reward function. Mitigation: multiplicative
+               reward gate at step 0-1 (already implemented); curriculum warm-up via
+               TPA that treats early reversed episodes as noise.}
+}
+
+@article{peng2018deepmimic,
+  author    = {Peng, Xue Bin and Abbeel, Pieter and Levine, Sergey and van de Panne, Michiel},
+  title     = {DeepMimic: Example-Guided Deep Reinforcement Learning of Physics-Based Character Skills},
+  journal   = {ACM Transactions on Graphics},
+  volume    = {37},
+  number    = {4},
+  pages     = {143:1--143:14},
+  year      = {2018},
+  doi       = {10.1145/3197517.3201311},
+  note      = {Reference pose injection in physics simulators: initial state distribution
+               affects sample efficiency. Analogous to Gazebo spawn velocity injection:
+               the 4.0 m/s at step 0 is an initial-state distribution artefact, not a
+               policy output. The correct mitigation is an episode-start mask (already
+               implemented as multiplicative gate) rather than attempting to modify the
+               simulator. Early-episode reward zeroing is consistent with DeepMimic's
+               warm-start handling.}
+}
+
