@@ -272,6 +272,17 @@ class BSTSKalmanFilter:
     def update(self, y_t: float, X_t: Optional[np.ndarray] = None):
         """Kalman update step.
 
+        v1.5.0: isfinite guard + nan_to_num state recovery.
+          Non-finite y_t (nan/±inf) are SKIPPED — same measurement-gating
+          pattern as bsts_seasonal.BSTSKalmanFilter v1.3.1.
+          A single nan y_t poisons self.state via:
+            residual = nan → K * nan = nan → state = nan → trend = nan
+          After every update, nan/inf that leaked through numerical edge
+          cases (e.g., singular P, near-zero S denom) are recovered.
+          REF: Thrun, Burgard & Fox (2005) Probabilistic Robotics §3.4
+               measurement gating — reject corrupt observations.
+          REF: Welch & Bishop (1995) TR 95-041 — numerical stability.
+
         v1.1.0: Adaptive sigma_obs and spike-and-slab variable selection now
         fire automatically every 10 updates inside this method.  The previously
         commented-out stub block has been removed; the calls live here.
@@ -281,6 +292,26 @@ class BSTSKalmanFilter:
         REF: George & McCulloch (1993) Variable selection via Gibbs sampling.
              JASA, 88(423), 881-889.
         """
+        # v1.5.0 FIX-F: skip non-finite observations (measurement gating).
+        # nan y_t → residual=nan → K*nan=nan → state=[nan,nan,...] → trend=nan.
+        # Skipping is preferable to substituting 0.0 (would bias the level down).
+        # REF: Thrun et al. (2005) §3.4 — measurement gating.
+        y_t = float(y_t)
+        if not math.isfinite(y_t):
+            return {
+                'y_pred': 0.0, 'residual': 0.0,
+                'level': float(self.state[0]),
+                'trend': float(self.state[1]),
+                'seasonal': float(self.state[2]) if self.S > 1 else 0.0,
+                'beta': self.state[2 + self.S - 1:].tolist() if self.p > 0 else [],
+                'kalman_gain_norm': 0.0,
+            }
+        # v1.5.0: recover nan/inf that may have leaked through numerical edge cases
+        # (singular P, near-zero innovation variance S → gain explosion).
+        if not np.all(np.isfinite(self.state)):
+            self.state = np.nan_to_num(self.state, nan=0.0, posinf=0.0, neginf=0.0)
+        if not np.all(np.isfinite(self.P)):
+            self.P = np.nan_to_num(self.P, nan=1e4, posinf=1e4, neginf=0.0)
         # --- step counter (drives the periodic adapt/prune cadence) ---
         self._t = getattr(self, '_t', 0) + 1
         Z = self._obs_vector(X_t)

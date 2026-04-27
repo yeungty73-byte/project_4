@@ -2790,7 +2790,14 @@ def run(hparams):
             next_done = tensor(np.array(float(terminated or truncated)))
 
             if terminated or truncated:
-                ep_return = cumulative_ep_reward
+                # v1.5.0 FIX-E: guard ep_return against non-finite cumulative reward.
+                # cumulative_ep_reward starts at 0.0 (L1821: ep_return = float("-inf")
+                # is the sentinel for "not yet assigned", NOT the accumulator).
+                # If any per-step reward was nan (e.g., from unguarded 0/0 in
+                # reward shaping), cumulative_ep_reward becomes nan, poisoning
+                # every downstream Kalman EMA that reads ep_return.
+                # REF: Welch & Bishop (1995) TR 95-041 — numerical stability for Kalman.
+                ep_return = cumulative_ep_reward if math.isfinite(cumulative_ep_reward) else 0.0
                 ep_length = ep_step_count
                 # ep_progress = max(ep_track_progress_pct, _final_pct)
                 # _raw_final_progress = float(_final_rp.get("progress", 0.0) or 0.0)
@@ -2952,8 +2959,14 @@ def run(hparams):
                         bc_seeded=int(n_harvested >= 5) if 'n_harvested' in dir() else 0,
                     )
                     # v1.1.2: explicit compliance scalars → TensorBoard + logger
-                    _rl_adh  = float(_hm_out.get("race_line_adherence", 0.0))
-                    _brk_cmp = float(_hm_out.get("brake_compliance",    0.0))
+                    # v1.1.4c/v1.5.0 FIX-D: use neutral defaults here too.
+                    # Lines 3093-3094 (bsts_metrics merge) already use neutrals;
+                    # this TensorBoard scalar path was still returning 0.0 when
+                    # compute_all() throws and returns {} — causing TensorBoard
+                    # charts to show spurious zeros and the printed log to read
+                    # "adherence=0.000" even on vacuously compliant episodes.
+                    _rl_adh  = float(_hm_out.get("race_line_adherence", 0.5))   # v1.5.0: neutral=0.5
+                    _brk_cmp = float(_hm_out.get("brake_compliance",    1.0))   # v1.5.0: neutral=1.0
                     _str_smt = float(_hm_out.get("smoothness_steering_rate", 0.0))
                     writer.add_scalar("compliance/race_line_adherence",      _rl_adh,  global_step)
                     writer.add_scalar("compliance/brake_compliance",         _brk_cmp, global_step)

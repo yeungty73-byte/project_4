@@ -1071,3 +1071,44 @@
                heinzmann2003safety entry but with correct journal volume/pages.
                v1.4.1 FIX-6: penalty now reaches PPO rewards[step] buffer.}
 }
+@article{kalman1960filter,
+  author  = {Kalman, Rudolf E.},
+  title   = {A New Approach to Linear Filtering and Prediction Problems},
+  journal = {Journal of Basic Engineering},
+  volume  = {82},
+  number  = {1},
+  pages   = {35--45},
+  year    = {1960},
+  doi     = {10.1115/1.3662552},
+  note    = {Canonical Kalman filter derivation. Measurement-gating principle:
+             non-finite observations must be skipped to prevent state-vector
+             poisoning (residual=nan propagates through gain update to state=nan).
+             Applied in analyze\_logs.BSTSKalmanFilter.update() v1.5.0 isfinite
+             guard (Patch F) and bsts\_seasonal.BSTSKalmanFilter.update() v1.3.1.}
+}
+
+@book{thrun2005probabilistic,
+  author    = {Thrun, Sebastian and Burgard, Wolfram and Fox, Dieter},
+  title     = {Probabilistic Robotics},
+  publisher = {MIT Press},
+  year      = {2005},
+  isbn      = {978-0262201629},
+  note      = {\S3.4 measurement gating: reject outlier/corrupt observations before
+               Kalman update to prevent state-vector poisoning. Applied in
+               analyze\_logs.BSTSKalmanFilter v1.5.0 (Patch F) and
+               bsts\_seasonal.BSTSKalmanFilter v1.3.1 nan-skip guards.}
+}
+
+@techreport{welch1995kalman,
+  author      = {Welch, Greg and Bishop, Gary},
+  title       = {An Introduction to the Kalman Filter},
+  institution = {University of North Carolina at Chapel Hill},
+  year        = {1995},
+  number      = {TR 95-041},
+  note        = {Numerical stability for discrete Kalman implementations: after
+                 posterior update, recover nan/inf that leaked through numerical
+                 edge cases (near-singular P, near-zero innovation variance) via
+                 nan\_to\_num. Applied in analyze\_logs.BSTSKalmanFilter.update()
+                 v1.5.0 (Patch F) and bsts\_seasonal.BSTSKalmanFilter.update()
+                 v1.3.1 state recovery.}
+}
