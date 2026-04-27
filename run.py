@@ -1890,6 +1890,15 @@ def run(hparams):
             _step_action = None
             global_step += 1
             # Safe defaults
+            # v1.4.3 FIX-E: init compliance vars at TOP of per-step loop (not just episode-end).
+            # Without this, first step of first episode gets stale Python frame values.
+            _rl_compliance_grad = 0.5   # neutral: no race-line data yet
+            _bf_compliance_grad = 1.0   # vacuously compliant: no brake events yet
+            _in_brake_field     = False
+            _brake_potential    = 0.0
+            _rl_compliance      = 0.5
+            _bf_v_perp          = 0.0
+            _bf_urgency         = 0.0
             _approaching_stuck = False
             _stuck_bonus = 0.0
             _stuck_wp = -1
@@ -2438,121 +2447,6 @@ def run(hparams):
             if ep_step_count > 500 and not terminated and not truncated:
                 truncated = True
                 logger.info(f"[HARD_TRUNC] ep_step={ep_step_count} > 500")
-                ep_rewards_components["center"].append(_center_r)
-                ep_rewards_components["speed"].append(_speed_r)
-                ep_rewards_components["steering"].append(_steer_r)
-                ep_rewards_components["progress"].append(_prog_r)
-                ep_rewards_components["efficiency"].append(_eff_r)
-                ep_rewards_components["heading"].append(_head_r)
-                ep_rewards_components["braking"].append(_brake_r)
-                ep_rewards_components["turn_align"].append(_turn_align_r)
-                ep_speeds.append(_speed)
-                ep_headings.append(_heading)  # v26
-                ep_closest_wps.append(_cwps)  # v26
-                ep_dist_from_center.append(_dist)
-                _accel = (_speed - _step_speed_snap) / 0.1
-                try:  # v37 per-step
-                    if ep_heading_diffs:
-                        ep_ang_vel_centerline.append(abs(float(ep_heading_diffs[-1])))
-                except Exception: pass
-                try:
-                    if ep_prev_accel is not None:
-                        _jerk = abs(_accel - ep_prev_accel) / 0.1   # true da/dt in m/s³
-                        ep_jerk_abs.append(_jerk)
-                    ep_prev_accel = _accel   # update AFTER use
-                except Exception:
-                    pass
-                try:  # v37 brake compliance — v1.4.1 FIX: read speed from rp not top-level info
-                    # top-level info has no "speed" key; was always falling back to ep_speeds[-1] stale value
-                    # Use _dist_barrier < track_half_w (geometric) rather than ep_barrier_proximities (lidar proxy)
-                    _rp_v37   = info.get("reward_params", {}) if isinstance(info, dict) else {}
-                    _sp_now2  = float(_rp_v37.get("speed", ep_speeds[-1] if ep_speeds else 0.0))
-                    _near_barrier = float(_dist_barrier) < (float(_track_width) / 2.0) if '_dist_barrier' in dir() and '_track_width' in dir() else False
-                    if _near_barrier and ep_prev_speed is not None:
-                        _dec = float(ep_prev_speed) - _sp_now2
-                        if _dec > 0: ep_brake_before_barrier.append(_dec)
-                except Exception: pass
-                # v3-bsts per-step tracking
-                ep_heading_diffs.append(_ddiff if "_ddiff" in dir() else 0.0)
-                ep_steerings_raw.append(_steer)
-                # Collect step dict for extract_intermediary_metrics
-                try:
-                    # v1.1.0 FIX: x/y/heading/speed live in rp (reward_params), NOT top-level info
-                    # top-level info keys are: reward_params, episode_status, goal
-                    # Using _step_info.get('x') was ALWAYS 0 — causing all BSTS zeros.
-                    _rp_log = rp if rp else (info.get("reward_params", {}) if isinstance(info, dict) else {})
-                    # v1.1.0: record_step for BSTSSeasonal live buffer
-                    try:
-                        if bsts_season is not None and hasattr(bsts_season, 'record_step'):
-                            _rl_err_step = float(_racing_line_err) if '_racing_line_err' in dir() else 0.0
-                            bsts_season.record_step(
-                                progress=float(_prog) if '_prog' in dir() else 0.0,
-                                speed=float(_speed) if '_speed' in dir() else 0.0,
-                                steering=float(action[0]) if hasattr(action, '__getitem__') else 0.0,
-                                heading_err=float(_heading) * 3.14159 / 180.0 if '_heading' in dir() else 0.0,
-                                raceline_err=_rl_err_step,
-                                reward=float(reward),
-                                lidar_min=float(_lidar_min_step) if '_lidar_min_step' in dir() else 1.0,
-                                wp_idx=int(_closest[0]) if isinstance(_closest, (list,tuple)) and _closest else 0,
-                            )
-                    except Exception:
-                        pass
-                    _ep_step_log.append({
-                        'x':                    float(_rp_log.get('x', 0.0)),
-                        'y':                    float(_rp_log.get('y', 0.0)),
-                        'heading':              float(_rp_log.get('heading', 0.0)),
-                        'speed':                float(_speed),   # already resolved above
-                        'steering_angle':       float(action[0]) if hasattr(action, '__getitem__') else 0.0,
-                        'steering':             float(action[0]) if hasattr(action, '__getitem__') else 0.0,  # BUG-FIX v1.3.1: harmonized_metrics reads 'steering'; alias required
-                        'throttle':             float(action[1]) if hasattr(action, '__getitem__') and len(action) > 1 else 0.0,
-                        'reward':               float(reward),
-                        'all_wheels_on_track':  bool(_rp_log.get('all_wheels_on_track', True)),
-                        'distance_from_center': float(_dist_from_center) if '_dist_from_center' in dir() else float(_rp_log.get('distance_from_center', 0.0)),
-                        'closest_waypoint':     int(_closest[0]) if isinstance(_closest, (list, tuple)) and len(_closest) > 0 else -1,  # v1.1.0: fix: was 'closest_wp_idx'[1]; hm needs 'closest_waypoint'[0]
-                        'dist_to_raceline':   _hm._safe(_racing_line_err) if '_racing_line_err' in dir() else 0.0,
-                        # v1.1.0: fields _translate_step() / extract_intermediary_metrics() need
-                        'braking':              int(_braking_intent) if '_braking_intent' in dir() else 0,
-                        'is_braking':           bool(
-                                                    (_in_brake_field if '_in_brake_field' in dir() else False)
-                                                    or (_accel < -0.5 if '_accel' in dir() else False)
-                                                ),
-                        'corner_speed_target':  float(_safe_speed_ahead) if '_safe_speed_ahead' in dir() else 1.0,
-                        'is_offtrack':          bool(_offtrack),
-                        'progress':             float(_prog),
-                        'heading_diff':         float(ep_heading_diffs[-1]) if ep_heading_diffs else 0.0,
-                        'safe_speed_ratio':     float(_speed_ratio) if '_speed_ratio' in dir() else 1.0,
-                        'racing_line_offset':   float(_racing_line_err) if '_racing_line_err' in dir() else 0.0,
-                        # BUG-FIX v1.3.1: DeepRacer rp has no 'is_turn' key; use curvature proxy
-                        'in_corner':            bool(abs(getattr(_curvature if "_curvature" in dir() else 0, "real", 0)) > 0.10),
-                        'is_turn':              bool(abs(getattr(_curvature if "_curvature" in dir() else 0, "real", 0)) > 0.10),
-                        'track_width':          float(_tw) if '_tw' in dir() else float(_rp_log.get('track_width', 1.0)),
-                        # v1.1.0: jerk for brake_intent scoring
-                        'accel':                float(_accel) if '_accel' in dir() else 0.0,
-                        'v_perp':               float(_v_perp_barrier) if '_v_perp_barrier' in dir() else 0.0,
-                        'in_brake_field':       bool(_in_brake_field) if '_in_brake_field' in dir() else False,
-                        'brake_potential':      float(_brake_potential) if '_brake_potential' in dir() else 0.0,
-                        # v1.2.0: continuous compliance gradients
-                        'compliance_gradient':           float(_bf_compliance_grad),   # v1.4.1: always initialised above
-                        'race_line_compliance_gradient': float(_rl_compliance_grad),   # v1.4.1: always initialised above
-                        'v_perp_bf':                     float(_bf_v_perp)  if '_bf_v_perp'  in dir() else 0.0,
-                        'bf_urgency':                    float(_bf_urgency) if '_bf_urgency' in dir() else 0.0,
-                        # v1.4.0: AdaptiveRewardShaper per-step telemetry
-                        'ars_vperp_pen':   float(_ars_info.get('ars_vperp_pen', 0.0)) if '_ars_info' in dir() else 0.0,
-                        'ars_sig_pen':     float(_ars_info.get('ars_sig_pen', 0.0))   if '_ars_info' in dir() else 0.0,
-                        'ars_reversed':    bool(_ars_info.get('ars_reversed', False))  if '_ars_info' in dir() else False,
-                    })
-                except Exception:
-                    pass
-                ep_positions.append((rp.get("x", 0.0), rp.get("y", 0.0)))
-                ep_progress_hist.append(_prog)
-                if (_offtrack or not _aot) and ep_first_offtrack_step is None:
-                    ep_first_offtrack_step = ep_step_count
-                if rp.get("is_reversed", False):
-                    ep_reversed_count += 1
-                if _speed < 0.01:
-                    ep_zero_speed_count += 1
-                if _offtrack or not _aot:
-                    ep_offtrack_count += 1
 
             
             # v13: On-track bonus (no penalties, only rewards)
@@ -2609,6 +2503,21 @@ def run(hparams):
             # Blend with lidar: take minimum (most conservative) when lidar is real
             _lidar_dist = float(_lidar_min) * max(float(_track_width) if '_track_width' in dir() else 0.1, 0.1)
             _dist_barrier = _geo_dist if (_lidar_min >= 0.99) else min(_geo_dist, _lidar_dist)
+            # v1.4.3 FIX-B: _barrier_angle_rad was never assigned → always 0.0 from 'in dir()' fallback.
+            # angle_w = |sin(heading - curb_angle)| = 0 on straights → in_brake_field never fires.
+            # Track tangent from waypoints gives correct curb approach angle.
+            try:
+                if _waypoints and len(_waypoints) >= 2 and _closest and len(_closest) >= 2:
+                    _wp0 = _waypoints[int(_closest[0]) % len(_waypoints)]
+                    _wp1 = _waypoints[int(_closest[1]) % len(_waypoints)]
+                    _barrier_angle_rad = math.atan2(float(_wp1[1]) - float(_wp0[1]),
+                                                    float(_wp1[0]) - float(_wp0[0]))
+                elif '_heading' in dir():
+                    _barrier_angle_rad = math.radians(float(_heading))
+                else:
+                    _barrier_angle_rad = 0.0
+            except Exception:
+                _barrier_angle_rad = 0.0
             # stopping distance: d = v_perp^2 / (2*a_max) where a_max~3.0 m/s^2
             _A_MAX_BRAKE = 3.0
             _stop_dist = (_v_perp_barrier**2) / (2*_A_MAX_BRAKE + 1e-8)
@@ -2723,6 +2632,114 @@ def run(hparams):
                 _step_reward_final += _spawn_penalty
                 _spawn_penalty = 0.0  # consumed; do NOT also add in episode-end block
             rewards[step] = tensor(np.array(_step_reward_final))
+
+            # v1.4.3 FIX-A: Step-data collection moved here (unconditional).
+            # Was gated inside `if ep_step_count > 500` — never ran for 13-36 step episodes.
+            # compute_all([]) always returned {k: 0.0} because _ep_step_log was always empty.
+            ep_rewards_components["center"].append(_center_r)
+            ep_rewards_components["speed"].append(_speed_r)
+            ep_rewards_components["steering"].append(_steer_r)
+            ep_rewards_components["progress"].append(_prog_r)
+            ep_rewards_components["efficiency"].append(_eff_r)
+            ep_rewards_components["heading"].append(_head_r)
+            ep_rewards_components["braking"].append(_brake_r)
+            ep_rewards_components["turn_align"].append(_turn_align_r)
+            ep_speeds.append(_speed)
+            ep_headings.append(_heading)
+            ep_closest_wps.append(_cwps)
+            ep_dist_from_center.append(_dist)
+            _accel = (_speed - _step_speed_snap) / 0.1
+            try:
+                if ep_heading_diffs:
+                    ep_ang_vel_centerline.append(abs(float(ep_heading_diffs[-1])))
+            except Exception: pass
+            try:
+                if ep_prev_accel is not None:
+                    _jerk = abs(_accel - ep_prev_accel) / 0.1
+                    ep_jerk_abs.append(_jerk)
+                ep_prev_accel = _accel
+            except Exception: pass
+            try:  # v37 brake compliance
+                _rp_v37   = info.get("reward_params", {}) if isinstance(info, dict) else {}
+                _sp_now2  = float(_rp_v37.get("speed", ep_speeds[-1] if ep_speeds else 0.0))
+                _near_barrier = float(_dist_barrier) < (float(_track_width) / 2.0) if '_dist_barrier' in dir() and '_track_width' in dir() else False
+                if _near_barrier and ep_prev_speed is not None:
+                    _dec = float(ep_prev_speed) - _sp_now2
+                    if _dec > 0: ep_brake_before_barrier.append(_dec)
+            except Exception: pass
+            ep_heading_diffs.append(_ddiff if "_ddiff" in dir() else 0.0)
+            ep_steerings_raw.append(_steer)
+            try:
+                _rp_log = rp if rp else (info.get("reward_params", {}) if isinstance(info, dict) else {})
+                try:
+                    if bsts_season is not None and hasattr(bsts_season, 'record_step'):
+                        _rl_err_step = float(_racing_line_err) if '_racing_line_err' in dir() else 0.0
+                        bsts_season.record_step(
+                            progress=float(_prog) if '_prog' in dir() else 0.0,
+                            speed=float(_speed) if '_speed' in dir() else 0.0,
+                            steering=float(rp.get('steering_angle', 0.0)) if rp else 0.0,
+                            heading_err=float(_heading) * 3.14159 / 180.0 if '_heading' in dir() else 0.0,
+                            raceline_err=_rl_err_step,
+                            reward=float(reward),
+                            lidar_min=float(_lidar_min_step) if '_lidar_min_step' in dir() else 1.0,
+                            wp_idx=int(_closest[0]) if isinstance(_closest, (list,tuple)) and _closest else 0,
+                        )
+                except Exception: pass
+                # v1.4.3 FIX-C: steering_angle uses sim degrees from rp, NOT raw tanh action[0]
+                # action[0] ∈ [-2.2, +2.2] (tanh) → RMS ~1.6 → smoothness_sigmoid≈0.38
+                # rp['steering_angle'] ∈ [-30°, +30°] → diffs ≤15° → RMS < 0.5 → sigmoid>0.6
+                _steer_angle_deg = float(rp.get('steering_angle', 0.0)) if rp else (float(action[0]) if hasattr(action, '__getitem__') else 0.0)
+                _ep_step_log.append({
+                    'x':                    float(_rp_log.get('x', 0.0)),
+                    'y':                    float(_rp_log.get('y', 0.0)),
+                    'heading':              float(_rp_log.get('heading', 0.0)),
+                    'speed':                float(_speed),
+                    'steering_angle':       _steer_angle_deg,
+                    'steering':             _steer_angle_deg,
+                    'throttle':             float(action[1]) if hasattr(action, '__getitem__') and len(action) > 1 else 0.0,
+                    'reward':               float(reward),
+                    'all_wheels_on_track':  bool(_rp_log.get('all_wheels_on_track', True)),
+                    'distance_from_center': float(_dist_from_center) if '_dist_from_center' in dir() else float(_rp_log.get('distance_from_center', 0.0)),
+                    'closest_waypoint':     int(_closest[0]) if isinstance(_closest, (list, tuple)) and len(_closest) > 0 else -1,
+                    'dist_to_raceline':     _hm._safe(_racing_line_err) if '_racing_line_err' in dir() else 0.0,
+                    'braking':              int(_braking_intent) if '_braking_intent' in dir() else 0,
+                    'is_braking':           bool(
+                                                (_in_brake_field if '_in_brake_field' in dir() else False)
+                                                or (_accel < -0.5 if '_accel' in dir() else False)
+                                            ),
+                    'corner_speed_target':  float(_safe_speed_ahead) if '_safe_speed_ahead' in dir() else 1.0,
+                    'is_offtrack':          bool(_offtrack),
+                    'progress':             float(_prog),
+                    'heading_diff':         float(ep_heading_diffs[-1]) if ep_heading_diffs else 0.0,
+                    'safe_speed_ratio':     float(_speed_ratio) if '_speed_ratio' in dir() else 1.0,
+                    'racing_line_offset':   float(_racing_line_err) if '_racing_line_err' in dir() else 0.0,
+                    'in_corner':            bool(abs(getattr(_curvature if "_curvature" in dir() else 0, "real", 0)) > 0.10),
+                    'is_turn':              bool(abs(getattr(_curvature if "_curvature" in dir() else 0, "real", 0)) > 0.10),
+                    'track_width':          float(_tw) if '_tw' in dir() else float(_rp_log.get('track_width', 1.0)),
+                    'accel':                float(_accel) if '_accel' in dir() else 0.0,
+                    'v_perp':               float(_v_perp_barrier) if '_v_perp_barrier' in dir() else 0.0,
+                    'in_brake_field':       bool(_in_brake_field) if '_in_brake_field' in dir() else False,
+                    'brake_potential':      float(_brake_potential) if '_brake_potential' in dir() else 0.0,
+                    'compliance_gradient':           float(_bf_compliance_grad),
+                    'race_line_compliance_gradient': float(_rl_compliance_grad),
+                    'v_perp_bf':                     float(_bf_v_perp)  if '_bf_v_perp'  in dir() else 0.0,
+                    'bf_urgency':                    float(_bf_urgency) if '_bf_urgency' in dir() else 0.0,
+                    'ars_vperp_pen':   float(_ars_info.get('ars_vperp_pen', 0.0)) if '_ars_info' in dir() else 0.0,
+                    'ars_sig_pen':     float(_ars_info.get('ars_sig_pen', 0.0))   if '_ars_info' in dir() else 0.0,
+                    'ars_reversed':    bool(_ars_info.get('ars_reversed', False))  if '_ars_info' in dir() else False,
+                })
+            except Exception: pass
+            ep_positions.append((rp.get("x", 0.0) if rp else 0.0, rp.get("y", 0.0) if rp else 0.0))
+            ep_progress_hist.append(_prog)
+            if (_offtrack or not _aot) and ep_first_offtrack_step is None:
+                ep_first_offtrack_step = ep_step_count
+            if rp and rp.get("is_reversed", False):
+                ep_reversed_count += 1
+            if _speed < 0.01:
+                ep_zero_speed_count += 1
+            if _offtrack or not _aot:
+                ep_offtrack_count += 1
+
             # v19: off-policy replay store
             try:
                 _nobs_t = next_obs.cpu() if isinstance(next_obs, torch.Tensor) else torch.tensor(obs_to_array(observation), dtype=torch.float32)
@@ -3031,7 +3048,7 @@ def run(hparams):
                     'track_progress':       float(_hm_out.get('track_progress', 0.0)),
                     'race_line_adherence':  float(_hm_out.get('race_line_adherence', 0.5)),   # neutral=0.5
                     'brake_compliance':     float(_hm_out.get('brake_compliance',    1.0)),   # neutral=1.0
-                    'smoothness_steering_rate': float(_hm_out.get('smoothness_steering_rate', 0.0)),
+                    'smoothness_steering_rate': float(_hm_out.get('smoothness_steering_rate', 1.0)),   # v1.4.3: neutral=1.0 (no data = perfectly smooth, not oscillating)
                     # v1.2.0: continuous compliance gradients → BSTS Kalman shaping
                     'brake_field_compliance_gradient': float(_hm_out.get('brake_field_compliance_gradient', 1.0)),
                     'race_line_compliance_gradient':   float(_hm_out.get('race_line_compliance_gradient',   0.5)),

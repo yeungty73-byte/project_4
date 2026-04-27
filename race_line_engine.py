@@ -199,8 +199,11 @@ class RaceLine:
         spd_r  = math.exp(-0.5 * ((car_speed   - target_speed)  / 0.6)**2)
         hdg_diff = abs(math.atan2(math.sin(car_heading - target_heading),
                                 math.cos(car_heading - target_heading)))
-        hdg_r  = math.exp(-0.5 * (hdg_diff / 0.3)**2)
-        return 0.45*lat_r + 0.35*spd_r + 0.20*hdg_r
+        # v1.4.3 FIX-F: sigma widened 0.3->0.8 rad. At 83° (1.45rad) error: hdg_r≈0.19 (not ≈0).
+        # Narrow sigma killed signal for ALL early-training episodes (cornering, reversed spawn).
+        # Heading demoted to 5% weight — lateral position (primary race-line constraint) at 60%.
+        hdg_r  = math.exp(-0.5 * (hdg_diff / 0.8)**2)
+        return 0.60*lat_r + 0.35*spd_r + 0.05*hdg_r
 
 
 class MultiRaceLineEngine:
