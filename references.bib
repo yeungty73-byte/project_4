@@ -87,7 +87,7 @@
   year={2018}
 }
 
-@article{haarnoja2018sac,
+@inproceedings{haarnoja2018sac,
   title={Soft Actor-Critic: Off-Policy Maximum Entropy Deep Reinforcement Learning with a Stochastic Actor},
   author={Haarnoja, Tuomas and Zhou, Aurick and Abbeel, Pieter and Levine, Sergey},
   journal={International Conference on Machine Learning},
@@ -1026,4 +1026,48 @@
   note      = {Maximum entropy RL: SAC entropy bonus aids exploration past reversed-spawn
                trap. update\_alpha() in td3\_sac\_ensemble.py implements the dual variable
                update from this work. See also haarnoja2018sac entry.}
+}
+
+@inproceedings{ng1999potential,
+  author    = {Ng, Andrew Y and Harada, Daishi and Russell, Stuart},
+  title     = {Policy Invariance Under Reward Transformations: Theory and Application to Reward Shaping},
+  booktitle = {Proceedings of the 16th International Conference on Machine Learning (ICML)},
+  pages     = {278--287},
+  year      = {1999},
+  note      = {Potential-based shaping F(s,s')=gamma*phi(s')-phi(s) preserves optimal
+               policy. AdaptiveRewardShaper.bc\_pilot\_reward() uses phi(s)=alpha*arc\_progress\_m,
+               satisfying this invariance. Also cited as ng1999policy and Ng1999 in this bib.
+               CANONICAL cite for BC pilot reward design in run.py line 933.}
+}
+
+@inproceedings{pathak2017icm,
+  author    = {Pathak, Deepak and Agrawal, Pulkit and Efros, Alexei A. and Darrell, Trevor},
+  title     = {Curiosity-Driven Exploration by Self-Supervised Prediction},
+  booktitle = {Proceedings of the 34th International Conference on Machine Learning (ICML)},
+  series    = {PMLR},
+  volume    = {70},
+  pages     = {2778--2787},
+  year      = {2017},
+  note      = {Intrinsic Curiosity Module (ICM): encoder + inverse model + forward model.
+               r\_i = eta * 0.5 * ||phi\_t+1 - phi\_hat\_t+1||^2 * hotspot\_weight.
+               Fully implemented in icm.py (ICMEncoder, ICMInverseModel, ICMForwardModel).
+               Wired into run.py at v1.4.1 FIX-7 (after being dead code since v1.0).
+               Hotspot weighting: failure\_sampler.get\_failure\_hotspots() feeds
+               icm\_module.update\_hotspot\_weights() so crash segments get 3x bonus.}
+}
+
+@article{heinzmann2003quantified,
+  author    = {Heinzmann, Jochen and Zelinsky, Alexander},
+  title     = {Quantitative Safety Guarantees for Physical Human--Robot Interaction},
+  journal   = {The International Journal of Robotics Research},
+  volume    = {22},
+  number    = {7--8},
+  pages     = {479--504},
+  year      = {2003},
+  doi       = {10.1177/02783649030227004},
+  note      = {Velocity-dependent safety envelope: v\_perp <= 0 at impact surface.
+               AdaptiveRewardShaper.shape() applies per-step v\_perp penalty
+               (weight=0.50) when dist\_to\_border < 1.5m. Same physics as
+               heinzmann2003safety entry but with correct journal volume/pages.
+               v1.4.1 FIX-6: penalty now reaches PPO rewards[step] buffer.}
 }

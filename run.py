@@ -493,12 +493,12 @@ Schulman et al. (2017) arXiv: PPO prospective penalty in short episodes.
 AWS DeepRacer docs (2020): is_reversed=True => CW driving; spawn speed 4.0 m/s.
 """
 
-# ── Module-level constants (mirrors run.py) ──────────────────────────────────
+# ── Module-level constants ────────────────────────────────────────────────────
 _BETA            = 0.05    # per-crash budget tightening rate (Heilmeier 2020)
 _BC_ALPHA        = 0.30    # BC pilot reward scale (Ng et al. 1999)
-_VPERP_THRESHOLD = 0.30    # m/s -- v_perp below this is safe (Heinzmann 2003)
+_VPERP_THRESHOLD = 0.30    # m/s — v_perp below this is safe (Heinzmann 2003)
 _VPERP_PENALTY_W = 0.50    # per-step v_perp penalty weight
-_BORDER_DIST_GATE= 1.50    # m -- penalty only within this dist to any boundary
+_BORDER_DIST_GATE = 1.50   # m — penalty only within this dist to any boundary
 
 
 class PerWaypointVPerpTracker:
@@ -520,9 +520,7 @@ class PerWaypointVPerpTracker:
         self._ema[i] = (1 - self.alpha) * self._ema[i] + self.alpha * max(0.0, float(v_perp))
 
     def curb_urgency_mul(self, wp_idx: int) -> float:
-        """Return urgency multiplier [1.0, 3.0] for curb field at this WP.
-        alpha_i = 1 + k * mean_v_perp[i]  (Khatib 1986)
-        """
+        """Return urgency multiplier [1.0, 3.0] for curb field at this WP."""
         i = int(wp_idx) % self.n
         return float(np.clip(1.0 + self._k * self._ema[i], 1.0, 3.0))
 
@@ -594,10 +592,24 @@ class KalmanSignatureDetector:
         return 0.0
 
     def reset(self):
-        self._prog_buf.clear(); self._spd_buf.clear(); self._steer_buf.clear()
+        self._prog_buf.clear()
+        self._spd_buf.clear()
+        self._steer_buf.clear()
         self._triggered = False
 
-class AdaptiveRewardShaper:    
+
+class AdaptiveRewardShaper:
+    """All-in-one per-step reward shaping for AWS DeepRacer training.
+
+    Responsibilities:
+      1. episode_start()   — spawn penalty for is_reversed=True episodes
+      2. shape()           — per-step v_perp penalty + Kalman-signature penalty
+      3. episode_end()     — crash credit for PerWaypointSpeedBudget
+      4. bc_pilot_reward() — potential-based BC reward (Ng et al. 1999)
+      5. speed_budget()    — exposes per-WP budget to race_line_engine
+      6. curb_urgency_mul()— exposes per-WP urgency to CombinedBrakeField
+    """
+
     def __init__(self, n_waypoints: int = 120, border_dist_gate: float = _BORDER_DIST_GATE):
         self.n = max(int(n_waypoints), 1)
         self._vperp_tracker = PerWaypointVPerpTracker(self.n)
@@ -612,8 +624,8 @@ class AdaptiveRewardShaper:
         """Call at episode reset. Returns immediate reward delta.
 
         Returns -5.0 for reversed spawn (is_reversed=True = driving clockwise).
-        This large negative gives the BSTS Kalman EMA a strong signal that
-        reversed episodes are structurally non-recoverable in early training.
+        NOTE: the -5.0 MUST be added to rewards[step] in run.py at ep_step_count==1.
+        See run.py FIX-6 — without this, PPO optimizer never sees the penalty.
 
         REF: AWS DeepRacer docs -- is_reversed=True iff car is driving CW on CCW track.
              Spawn speed is always 4.0 m/s (hardcoded sim constant, not controllable).
@@ -649,18 +661,18 @@ class AdaptiveRewardShaper:
     ) -> Tuple[float, Dict]:
         """Apply all per-step shaping rules. Returns (shaped_reward, sinfo_dict).
 
-        Shaping rules (all additive, documented):
-          a) Reversed gating: reward * 0.0 when is_reversed (clockwise driver)
+        Rules (all additive, all documented):
+          a) Reversed gating: reward <- 0.0 when is_reversed (CW driver)
           b) v_perp penalty outside brake field: -0.5 * max(0, v_perp - 0.3) within 1.5m
           c) Prospective Kalman-signature penalty: -0.30 pre-crash
-          d) v_perp tracker update (telemetry only)
+          d) v_perp tracker update (telemetry only, no reward effect)
           e) Speed budget relaxation for clean on-track steps
 
         REF: Ng et al. (1999) -- potential-based shaping for gradient-compatible dense signal.
         REF: Heinzmann & Zelinsky (2003) -- per-step v_perp safety signal.
         """
-        shaped   = float(reward)
-        _is_rev  = bool(rp.get("is_reversed", self._reversed_ep))
+        shaped  = float(reward)
+        _is_rev = bool(rp.get("is_reversed", self._reversed_ep))
 
         if _is_rev:
             shaped = 0.0
@@ -696,7 +708,7 @@ class AdaptiveRewardShaper:
     def curb_urgency_mul(self, wp_idx: int) -> float:
         """Per-waypoint curb urgency multiplier for CombinedBrakeField.step()."""
         return self._vperp_tracker.curb_urgency_mul(int(wp_idx))
-    
+
     def bc_pilot_reward(
         self,
         rp:              dict,
@@ -713,10 +725,10 @@ class AdaptiveRewardShaper:
              policy-invariant: optimal policy is unchanged (Theorem 1, Ng et al. 1999).
              AWS DeepRacer docs -- progress key is percentage 0-100; we use arc_m for scale.
         """
-        if rp.get("is_reversed", False):
-            r_bc = min(r_bc, -1.0)        
         delta_m = float(curr_progress_m) - float(prev_progress_m)
         r_bc = float(np.clip(_BC_ALPHA * max(0.0, delta_m), -10.0, 10.0))
+        if rp.get("is_reversed", False):
+            r_bc = min(r_bc, -1.0)
         return r_bc
 
 # ============================================================
