@@ -371,7 +371,15 @@ class BSTSFeedback:
         if race_type_tag is not None:
             self.race_type = _norm_race_type(str(race_type_tag))
 
-        for k, v in metrics_dict.items():
+        # v1.1.5c FIX-Q: normalise key aliases before ingesting so EMA/KF have both names.
+        # avg_jerk → jerk_rms alias: adjust_weights._slope("jerk_rms") works without data.
+        # track_progress_m → track_progress alias: bsts_metrics sends both; KF uses one.
+        _KEY_ALIASES = {'avg_jerk': 'jerk_rms', 'track_progress_m': 'track_progress'}
+        _aliased = dict(metrics_dict)
+        for _ak, _av_key in _KEY_ALIASES.items():
+            if _ak in _aliased:
+                _aliased.setdefault(_av_key, _aliased[_ak])
+        for k, v in _aliased.items():
             if not isinstance(v, (int, float)):
                 continue
             v = float(v)
@@ -570,7 +578,10 @@ class BSTSFeedback:
 
         if _ema("avg_speed_centerline", 0.0) > 0 and _slope("avg_speed_centerline") < -0.01:
             w["progress"] = w.get("progress", 0.12) + s * 0.20
-        if _slope("jerk_rms") < -0.01:
+        # v1.1.5c FIX-Q: bsts_metrics sends 'avg_jerk'; adjust_weights read 'jerk_rms' → zero slope.
+        # REF: Balaban (2018) — jerk characterises intentionality of braking input.
+        _jerk_slope = min(_slope("jerk_rms"), _slope("avg_jerk"))
+        if _jerk_slope < -0.01:
             w["jerk"]     = w.get("jerk", 0.03) + s * 0.15
         if _slope("late_corner_entry") < -0.01 or _slope("early_corner_exit") < -0.01:
             w["corner"]   = w.get("corner", 0.10) + s * 0.30
