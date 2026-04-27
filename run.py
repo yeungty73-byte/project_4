@@ -93,6 +93,7 @@ _purge_stale_pycache()
 del _purge_stale_pycache
 
 from bsts_seasonal import BSTSFeedback
+from icm import ICM  # v1.4.1: intrinsic curiosity module
 # REF: Scott, S. L. & Varian, H. R. (2014). Predicting the present with Bayesian structural time series. Int. J. Math. Model. Numer. Optim., 5(1-2), 4-23.
 live_analyze = lambda *a,**k: None  # live_metrics.py purged (stubbed)
 try:
@@ -1584,6 +1585,26 @@ def run(hparams):
                 for sm in SUCCESS_METRICS}
     _kf_episode_buffer = []  # accumulate per-episode summaries for online BSTS
     bsts_feedback.kf_trends = {}
+
+    # v1.4.1: Intrinsic Curiosity Module (Pathak et al., 2017)
+    # icm.py was fully implemented but never instantiated in run.py — now wired.
+    # Provides hotspot-weighted exploration bonus; small eta=0.005 to not swamp PPO gradient.
+    try:
+        _icm = ICM(
+            obs_dim        = _obs_dim,
+            act_dim        = _act_dim_agent,
+            phi_dim        = 64,
+            eta            = 0.005,   # intrinsic reward scale — conservative to start
+            beta           = 0.2,     # forward vs inverse loss mix
+            hotspot_scale  = 3.0,     # crash hotspot waypoints get 3x curiosity weight
+        ).to(device)
+        _icm_optim = torch.optim.Adam(_icm.parameters(), lr=3e-4)
+        _icm_prev_obs = None          # store obs_t for next step transition
+        logger.info("[ICM] Intrinsic Curiosity Module initialised — obs_dim=%d act_dim=%d", _obs_dim, _act_dim_agent)
+    except Exception as _icm_init_err:
+        _icm = None
+        _icm_prev_obs = None
+        logger.warning("[ICM] Init failed (non-fatal): %s", _icm_init_err)
     bsts_feedback.kf_betas = {}
     # v4-bsts accumulators
     ep_heading_diffs = []
@@ -2429,9 +2450,13 @@ def run(hparams):
                     ep_prev_accel = _accel   # update AFTER use
                 except Exception:
                     pass
-                try:  # v37 brake compliance
-                    if ep_barrier_proximities and float(ep_barrier_proximities[-1]) < 1.0 and ep_prev_speed is not None:
-                        _sp_now2 = float(info.get("speed", ep_speeds[-1] if ep_speeds else 0.0))
+                try:  # v37 brake compliance — v1.4.1 FIX: read speed from rp not top-level info
+                    # top-level info has no "speed" key; was always falling back to ep_speeds[-1] stale value
+                    # Use _dist_barrier < track_half_w (geometric) rather than ep_barrier_proximities (lidar proxy)
+                    _rp_v37   = info.get("reward_params", {}) if isinstance(info, dict) else {}
+                    _sp_now2  = float(_rp_v37.get("speed", ep_speeds[-1] if ep_speeds else 0.0))
+                    _near_barrier = float(_dist_barrier) < (float(_track_width) / 2.0) if '_dist_barrier' in dir() and '_track_width' in dir() else False
+                    if _near_barrier and ep_prev_speed is not None:
                         _dec = float(ep_prev_speed) - _sp_now2
                         if _dec > 0: ep_brake_before_barrier.append(_dec)
                 except Exception: pass
@@ -2495,8 +2520,8 @@ def run(hparams):
                         'in_brake_field':       bool(_in_brake_field) if '_in_brake_field' in dir() else False,
                         'brake_potential':      float(_brake_potential) if '_brake_potential' in dir() else 0.0,
                         # v1.2.0: continuous compliance gradients
-                        'compliance_gradient':           float(_bf_compliance_grad) if '_bf_compliance_grad' in dir() else 1.0,
-                        'race_line_compliance_gradient': float(_rl_compliance_grad) if '_rl_compliance_grad' in dir() else 0.5,
+                        'compliance_gradient':           float(_bf_compliance_grad),   # v1.4.1: always initialised above
+                        'race_line_compliance_gradient': float(_rl_compliance_grad),   # v1.4.1: always initialised above
                         'v_perp_bf':                     float(_bf_v_perp)  if '_bf_v_perp'  in dir() else 0.0,
                         'bf_urgency':                    float(_bf_urgency) if '_bf_urgency' in dir() else 0.0,
                         # v1.4.0: AdaptiveRewardShaper per-step telemetry
@@ -2524,6 +2549,27 @@ def run(hparams):
             if rp_v7.get("speed", 0) > 2.0:
                 reward += 2.0 * min(rp_v7.get("speed", 0), 4.0)
             cumulative_ep_reward += reward
+
+            # v1.4.1: ICM intrinsic reward — curiosity bonus per step
+            # Only fires when forward progress > 0 to prevent rewarding reversals.
+            # REF: Pathak et al. (2017) — intrinsic reward = forward prediction error.
+            # REF: v1.3.1 comment line 2339: "only reward novelty WITH forward progress"
+            if _icm is not None and _icm_prev_obs is not None:
+                try:
+                    _icm_r = _icm.intrinsic_reward(
+                        obs_t        = torch.tensor(_icm_prev_obs, dtype=torch.float32, device=device).reshape(1, -1),
+                        obs_t1       = torch.tensor(observation,   dtype=torch.float32, device=device).reshape(1, -1),
+                        action       = torch.tensor(action,        dtype=torch.float32, device=device).reshape(1, -1),
+                        progress_pct = float(_prog) if '_prog' in dir() else 0.0,
+                    )
+                    _icm_bonus = float(_icm_r.item())
+                    # Gate: only reward novelty when making forward progress, not reversed
+                    if float(_prog) > 0.1 and not rp.get('is_reversed', False):
+                        reward += _icm_bonus
+                except Exception:
+                    pass
+            _icm_prev_obs = observation.copy() if hasattr(observation, 'copy') else observation
+
             # v4: context-aware step tracking
             _ctx = int(agent.get_context(tensor(observation).unsqueeze(0))[0])
             ep_context_preds.append(_ctx)
@@ -2540,7 +2586,17 @@ def run(hparams):
             # v_perp to barrier: component of velocity perpendicular to track tangent
             _v_perp_barrier = _compute_crash_v_perp(_speed, _heading, _closest, _waypoints) if _waypoints else 0.0
             _v_tang_barrier = _compute_crash_v_tang(_speed, _heading, _closest, _waypoints) if _waypoints else 0.0
-            _dist_barrier = _lidar_min * max(_track_width, 0.1)  # approx metres to wall
+            # v1.4.1 FIX: geometric distance from car edge to track boundary.
+            # BEFORE: _dist_barrier = _lidar_min * track_width  → always ~1.067 (full width)
+            # AFTER:  track_half_w - |dist_from_center| = actual clearance to edge
+            # This unblocks in_brake_field=True and ep_brake_before_barrier collection.
+            # REF: Diagnosis v1.1.4 — "distbarrier=track_width not geometric boundary dist"
+            _CAR_HALF_W = 0.09  # DeepRacer 1/18 scale ~0.18m wide
+            _track_half_w_now = float(_track_width) / 2.0 if '_track_width' in dir() else 0.30
+            _geo_dist = max(0.02, _track_half_w_now - abs(float(_dist_from_center) if '_dist_from_center' in dir() else 0.0) - _CAR_HALF_W)
+            # Blend with lidar: take minimum (most conservative) when lidar is real
+            _lidar_dist = float(_lidar_min) * max(float(_track_width) if '_track_width' in dir() else 0.1, 0.1)
+            _dist_barrier = _geo_dist if (_lidar_min >= 0.99) else min(_geo_dist, _lidar_dist)
             # stopping distance: d = v_perp^2 / (2*a_max) where a_max~3.0 m/s^2
             _A_MAX_BRAKE = 3.0
             _stop_dist = (_v_perp_barrier**2) / (2*_A_MAX_BRAKE + 1e-8)
@@ -2842,8 +2898,12 @@ def run(hparams):
                         f"(1=silky, 0=oscillating)  NOTE: steering INPUT rate, not chassis jerk"
                     )
                 except Exception as _e_hm:
-                    logger.warning(f"[HM] compute_all failed: {_e_hm}")
-                    _hm_out = {k: 0.0 for k in _hm.SUCCESS_METRICS + _hm.INTERMEDIARY_METRICS} 
+                    logger.warning(f"[HM] compute_all failed: {_e_hm}", exc_info=True)
+                    # v1.4.1 FIX: use empty dict {} NOT zero-filled dict.
+                    # A zero-filled dict is truthy → `if _hm_out:` passes → all metrics silently = 0.0.
+                    # Empty dict → `.get(k, neutral_default)` in the merge block below uses correct neutrals.
+                    # race_line_adherence neutral=0.5, brake_compliance neutral=1.0 (vacuously compliant).
+                    _hm_out = {}
                 # v213: race-type tag for plot/CSV differentiation
                 _race_type_tag = {
                     'time_trial': 'tt',
@@ -2950,17 +3010,20 @@ def run(hparams):
                 }
                 # v1.1.0: merge harmonized_metrics output into bsts_metrics
                 # so avg_speed_centerline, track_progress, race_line_adherence reach BSTS EMA
-                if _hm_out:
-                    bsts_metrics.update({
-                        'avg_speed_centerline': float(_hm_out.get('avg_speed_centerline', 0.0)),
-                        'track_progress':       float(_hm_out.get('track_progress', 0.0)),
-                        'race_line_adherence':  float(_hm_out.get('race_line_adherence', 0.0)),
-                        'brake_compliance':     float(_hm_out.get('brake_compliance', 0.0)),
-                        'smoothness_steering_rate': float(_hm_out.get('smoothness_steering_rate', 0.0)),
-                        # v1.2.0: continuous compliance gradients → BSTS Kalman shaping
-                        'brake_field_compliance_gradient': float(_hm_out.get('brake_field_compliance_gradient', 1.0)),
-                        'race_line_compliance_gradient':   float(_hm_out.get('race_line_compliance_gradient',   0.5)),
-                    })
+                # v1.4.1 FIX: always merge _hm_out (even if empty {}); use neutral defaults.
+                # race_line_adherence=0.5 neutral (no data ≠ actively failing race line)
+                # brake_compliance=1.0 neutral (no brake events in field = vacuously compliant)
+                # Removed `if _hm_out:` guard — empty dict is falsy but we want neutral merge anyway.
+                bsts_metrics.update({
+                    'avg_speed_centerline': float(_hm_out.get('avg_speed_centerline', 0.0)),
+                    'track_progress':       float(_hm_out.get('track_progress', 0.0)),
+                    'race_line_adherence':  float(_hm_out.get('race_line_adherence', 0.5)),   # neutral=0.5
+                    'brake_compliance':     float(_hm_out.get('brake_compliance',    1.0)),   # neutral=1.0
+                    'smoothness_steering_rate': float(_hm_out.get('smoothness_steering_rate', 0.0)),
+                    # v1.2.0: continuous compliance gradients → BSTS Kalman shaping
+                    'brake_field_compliance_gradient': float(_hm_out.get('brake_field_compliance_gradient', 1.0)),
+                    'race_line_compliance_gradient':   float(_hm_out.get('race_line_compliance_gradient',   0.5)),
+                })
                 # v1.3.1 FIX ROOT CAUSE: always call update() unconditionally.
                 # The "v != 0.0" filter prevented 0.0 compliance observations from
                 # reaching the Kalman EMA → compliance_gradient stuck at 0.0 forever.
@@ -3182,6 +3245,12 @@ def run(hparams):
                     except Exception as _fe:
                         logger.debug(f"BSTS flush error: {_fe}")
                 _ep_step_log = []
+                _icm_prev_obs = None  # v1.4.1: flush ICM transition buffer at episode boundary
+                # v1.4.1 FIX: initialise compliance grads at episode start.
+                # `in dir()` checks global namespace → stale values from prior episode ghosted in.
+                # These are now always defined before the step loop → no stale-value aliasing.
+                _rl_compliance_grad = 0.5   # neutral: no race-line data yet
+                _bf_compliance_grad = 1.0   # vacuously compliant: no brake events yet
                 # BUG-FIX v1.3.1: one BrakeField per episode; reset() flushes step-level stats
                 _brake_field = BrakeField()
                 if _waypoints:
@@ -3443,6 +3512,26 @@ def run(hparams):
                             optimizer.step()
                             writer.add_scalar("td3sac/actor_bc_loss", _td3_actor["td3_bc_loss_val"], global_step)
                             writer.add_scalar("td3sac/q1_mean_actor", _td3_actor["td3_q1_mean"], global_step)
+
+            # v1.4.1: ICM training step — forward + inverse model update
+            if _icm is not None and len(mb_inds) >= 2:
+                try:
+                    _icm_obs_mb  = b_obs[mb_inds].float()
+                    _icm_obs_mb1 = torch.roll(_icm_obs_mb, -1, dims=0)   # t+1 observations
+                    _icm_act_mb  = b_actions[mb_inds].float()
+                    _icm_fwd, _icm_inv = _icm.loss(_icm_obs_mb[:-1], _icm_obs_mb1[:-1], _icm_act_mb[:-1])
+                    _icm_loss_total = _icm_fwd + _icm_inv
+                    _icm_optim.zero_grad()
+                    _icm_loss_total.backward()
+                    torch.nn.utils.clip_grad_norm_(_icm.parameters(), 0.5)
+                    _icm_optim.step()
+                    # Feed crash hotspots into ICM so curiosity focuses on dangerous WPs
+                    if episode_count % 10 == 0 and hasattr(sampler, 'get_failure_hotspots'):
+                        _hotspots = sampler.get_failure_hotspots() if hasattr(sampler, 'get_failure_hotspots') else []
+                        if _hotspots:
+                            _icm.update_hotspot_weights(_hotspots)
+                except Exception:
+                    pass
 
             if target_kl is not None and approx_kl > target_kl:
                 break
