@@ -713,6 +713,9 @@ class BCPilot:
             n = len(waypoints)
             p0 = waypoints[closest[0] % n]
             p1 = waypoints[closest[1] % n]
+            # v1.1.2 fix: if p0==p1 (loop-closure duplicate), advance by 1
+            if abs(p0[0]-p1[0]) < 1e-4 and abs(p0[1]-p1[1]) < 1e-4:
+                p1 = waypoints[(closest[1] + 1) % n]
             track_angle = _math.degrees(_math.atan2(p1[1] - p0[1], p1[0] - p0[0]))
             diff = heading - track_angle
             # Normalize to [-180, 180]
@@ -2338,147 +2341,149 @@ def run(hparams):
                 writer.add_scalar('charts/episodic_return', ep_return, global_step)
                 writer.add_scalar('charts/episodic_length', ep_length, global_step)
                 
-                            # v4: Periodic save of failure analysis
-                if episode_count % 25 == 0:
-                    sampler.save()
 
-                        # --- v5: BSTS JSONL metrics (per episode) ---
-                    _crashed = 1 if rp.get('is_crashed', False) else 0
-                    _min_dist = min(ep_dist_from_center) if ep_dist_from_center else 0.0
-                    _graze = 1 if (_min_dist < 0.15 * _tw and not _crashed) else 0
-                    # curvature*speed: mean(|heading_diff|)*mean(speed)
-                    _mean_hdiff = sum(abs(h) for h in ep_heading_diffs)/max(len(ep_heading_diffs),1)
-                    _mean_speed = sum(ep_speeds)/max(len(ep_speeds),1)
-                    _curv_x_spd = _mean_hdiff * _mean_speed
-                    # early-entry-late-exit: track apex timing via progress rate
-                    _prog_diffs = [ep_progress_hist[i+1]-ep_progress_hist[i] for i in range(len(ep_progress_hist)-1)] if len(ep_progress_hist)>1 else [0]
-                    _eele = max(_prog_diffs) - min(_prog_diffs) if _prog_diffs else 0.0
-                        # --- v27 harmonized metrics (success + intermediary; all up==good) ---
-                    try:
-                        _hm_track_width = float(rp.get('track_width', 1.0)) if rp else 1.0
-                        _hm_n_wp = len(rp.get('waypoints', [])) if rp else None
-                        _hm_out = _hm.compute_all(_ep_step_log, float(_prog), n_waypoints=_hm_n_wp, track_width=_hm_track_width, waypoints=_waypoints if '_waypoints' in dir() else None)  # v1.1.0: pass waypoints for arc-progress
-                    except Exception as _e_hm:
-                        _hm_out = {}
-                    # v213: race-type tag for plot/CSV differentiation
-                    _race_type_tag = {
-                        'time_trial': 'tt',
-                        'obstacle':   'oa',
-                        'h2h':        'h2h',
-                    }.get(_track_variant, _track_variant)
-                    bsts_row = {
-                        'episode': episode_count,
-                        'global_step': global_step,
-                        "variant": _track_variant,
-                        "track": _track_name, 
-                        'crash': _crashed,
-                        'graze': _graze,
-                        'curvature_x_speed': round(_curv_x_spd, 4),
-                        'early_entry_late_exit': round(_eele, 4),
-                        'progress': round(ep_progress, 2),
-                        'ep_return': round(ep_return, 4),
-                        'ep_brake_frac': round(_ep_summary.get('brake_fraction',0.0),4) if _ep_summary else 0.0,
-                        'ep_speed_mean': round(_ep_summary.get('mean_speed',0.0),4) if _ep_summary else 0.0,
-                        'ep_speed_std':  round(_ep_summary.get('speed_var',0.0)**0.5,4) if _ep_summary else 0.0,
-                                        'lap_time_sec': round(lap_time_sec,2),
-                        # v213: race-type / arc-length telemetry
-                        'race_type':             _race_type_tag,
-                        'track_arc_m':           round(ep_track_length_m, 2),
-                        'track_progress_pct':    round(ep_progress_pct, 2),
-                        'track_progress_arc_m':  round(ep_centerline_progress_m, 2),
-                'term_reason': term_reason,
-                'track_name': _track_name,
-                'track_variant': _track_variant,
-                    # v29 crash antecedent forensics
-                    'ante_brake_steps': sum(1 for r in ep_ante_buf if r.get('braking',0)),
-                    'ante_mean_accel': round(sum(r.get('accel',0) for r in ep_ante_buf)/max(len(ep_ante_buf),1),3),
-                    'ante_mean_vperp': round(sum(r.get('v_perp',0) for r in ep_ante_buf)/max(len(ep_ante_buf),1),3),
-                    'ante_final_vperp': round(ep_ante_buf[-1].get('v_perp',0),3) if ep_ante_buf else 0,
-                    'ante_final_stopdist': round(ep_ante_buf[-1].get('stop_dist',0),3) if ep_ante_buf else 0,
-                        'rl_blend':      round(_rl_blend,4),
-                        'env_signal':    round(_env_signal if '_env_signal' in dir() else 0.0,4),
-                        'avg_speed': round(_mean_speed, 4),
-                        'min_dist_from_center': round(_min_dist, 4),
-                        'offtrack_rate': round(ep_offtrack_count/max(ep_step_count,1), 4),
-                        'reversed_count': ep_reversed_count,
-                        'zero_speed_count': ep_zero_speed_count,
-                    'avg_safe_speed_ratio': round(sum(ep_safe_speed_ratios)/max(len(ep_safe_speed_ratios),1), 4),
-                    'avg_racing_line_err': round(sum(ep_racing_line_errors)/max(len(ep_racing_line_errors),1), 4),
-                    'avg_decel_penalty': round(sum(ep_decel_penalties)/max(len(ep_decel_penalties),1), 4),
-                        'recovery_steps': ep_recovery_steps,
-                    'avg_turn_entry_ratio': round(sum(ep_turn_entry_speeds)/max(len(ep_turn_entry_speeds),1), 4) if ep_turn_entry_speeds else 0.0,
-                    }
-                    bsts_row.update(_hm_out)
+                # --- v5: BSTS JSONL metrics (per episode) ---
+                # v1.1.2 ── every episode: build bsts_metrics ─────────────────────────
+                _crashed = 1 if rp.get('is_crashed', False) else 0
+                _min_dist = min(ep_dist_from_center) if ep_dist_from_center else 0.0
+                _graze = 1 if (_min_dist < 0.15 * _tw and not _crashed) else 0
+                # curvature*speed: mean(|heading_diff|)*mean(speed)
+                _mean_hdiff = sum(abs(h) for h in ep_heading_diffs)/max(len(ep_heading_diffs),1)
+                _mean_speed = sum(ep_speeds)/max(len(ep_speeds),1)
+                _curv_x_spd = _mean_hdiff * _mean_speed
+                # early-entry-late-exit: track apex timing via progress rate
+                _prog_diffs = [ep_progress_hist[i+1]-ep_progress_hist[i] for i in range(len(ep_progress_hist)-1)] if len(ep_progress_hist)>1 else [0]
+                _eele = max(_prog_diffs) - min(_prog_diffs) if _prog_diffs else 0.0
+                    # --- v27 harmonized metrics (success + intermediary; all up==good) ---
+                try:
+                    _hm_track_width = float(rp.get('track_width', 1.0)) if rp else 1.0
+                    _hm_n_wp = len(rp.get('waypoints', [])) if rp else None
+                    _hm_out = _hm.compute_all(_ep_step_log, float(_prog), n_waypoints=_hm_n_wp, track_width=_hm_track_width, waypoints=_waypoints if '_waypoints' in dir() else None)  # v1.1.0: pass waypoints for arc-progress
+                except Exception as _e_hm:
+                    _hm_out = {}
+                # v213: race-type tag for plot/CSV differentiation
+                _race_type_tag = {
+                    'time_trial': 'tt',
+                    'obstacle':   'oa',
+                    'h2h':        'h2h',
+                }.get(_track_variant, _track_variant)
+                bsts_row = {
+                    'episode': episode_count,
+                    'global_step': global_step,
+                    "variant": _track_variant,
+                    "track": _track_name, 
+                    'crash': _crashed,
+                    'graze': _graze,
+                    'curvature_x_speed': round(_curv_x_spd, 4),
+                    'early_entry_late_exit': round(_eele, 4),
+                    'progress': round(ep_progress, 2),
+                    'ep_return': round(ep_return, 4),
+                    'ep_brake_frac': round(_ep_summary.get('brake_fraction',0.0),4) if _ep_summary else 0.0,
+                    'ep_speed_mean': round(_ep_summary.get('mean_speed',0.0),4) if _ep_summary else 0.0,
+                    'ep_speed_std':  round(_ep_summary.get('speed_var',0.0)**0.5,4) if _ep_summary else 0.0,
+                                    'lap_time_sec': round(lap_time_sec,2),
+                    # v213: race-type / arc-length telemetry
+                    'race_type':             _race_type_tag,
+                    'track_arc_m':           round(ep_track_length_m, 2),
+                    'track_progress_pct':    round(ep_progress_pct, 2),
+                    'track_progress_arc_m':  round(ep_centerline_progress_m, 2),
+            'term_reason': term_reason,
+            'track_name': _track_name,
+            'track_variant': _track_variant,
+                # v29 crash antecedent forensics
+                'ante_brake_steps': sum(1 for r in ep_ante_buf if r.get('braking',0)),
+                'ante_mean_accel': round(sum(r.get('accel',0) for r in ep_ante_buf)/max(len(ep_ante_buf),1),3),
+                'ante_mean_vperp': round(sum(r.get('v_perp',0) for r in ep_ante_buf)/max(len(ep_ante_buf),1),3),
+                'ante_final_vperp': round(ep_ante_buf[-1].get('v_perp',0),3) if ep_ante_buf else 0,
+                'ante_final_stopdist': round(ep_ante_buf[-1].get('stop_dist',0),3) if ep_ante_buf else 0,
+                    'rl_blend':      round(_rl_blend,4),
+                    'env_signal':    round(_env_signal if '_env_signal' in dir() else 0.0,4),
+                    'avg_speed': round(_mean_speed, 4),
+                    'min_dist_from_center': round(_min_dist, 4),
+                    'offtrack_rate': round(ep_offtrack_count/max(ep_step_count,1), 4),
+                    'reversed_count': ep_reversed_count,
+                    'zero_speed_count': ep_zero_speed_count,
+                'avg_safe_speed_ratio': round(sum(ep_safe_speed_ratios)/max(len(ep_safe_speed_ratios),1), 4),
+                'avg_racing_line_err': round(sum(ep_racing_line_errors)/max(len(ep_racing_line_errors),1), 4),
+                'avg_decel_penalty': round(sum(ep_decel_penalties)/max(len(ep_decel_penalties),1), 4),
+                    'recovery_steps': ep_recovery_steps,
+                'avg_turn_entry_ratio': round(sum(ep_turn_entry_speeds)/max(len(ep_turn_entry_speeds),1), 4) if ep_turn_entry_speeds else 0.0,
+                }
+                bsts_row.update(_hm_out)
+
+
+
+                # --- v4: Log sub-reward breadcrumbs ---
+                if ep_step_count > 0:
+                    for comp_name, comp_vals in ep_rewards_components.items():
+                        if comp_vals:
+                            avg_val = sum(comp_vals) / len(comp_vals)
+                            writer.add_scalar(f"rewards/{comp_name}", avg_val, global_step)
+                    if ep_speeds:
+                        writer.add_scalar("behavior/avg_speed", sum(ep_speeds)/len(ep_speeds), global_step)
+                    if ep_dist_from_center:
+                        writer.add_scalar("behavior/avg_dist_from_center", sum(ep_dist_from_center)/len(ep_dist_from_center), global_step)
+                    writer.add_scalar("behavior/offtrack_rate", ep_offtrack_count / ep_step_count, global_step)
+                    writer.add_scalar("behavior/ep_steps", ep_step_count, global_step)
+                # v4: context-aware tensorboard logging
+                    # v4-bsts: compute metrics BEFORE reset
+                bsts_metrics = {
+                    'crash_rate': float(terminated),
+                    'offtrack_rate': float(ep_offtrack_count / max(ep_step_count, 1)),
+                    'avg_speed': sum(ep_speeds)/max(len(ep_speeds),1) if ep_speeds else 2.0,
+                    'corner_crash_rate': float(terminated and ep_step_count < 50),
+                'avg_safe_speed_ratio': round(sum(ep_safe_speed_ratios) / max(len(ep_safe_speed_ratios), 1), 4),
+                'avg_racing_line_err':  round(sum(ep_racing_line_errors) / max(len(ep_racing_line_errors), 1), 4),
+                'ctx_obstacle_ratio': sum(1 for h in ep_context_preds if h == 2) / max(len(ep_context_preds), 1),
+                'ctx_curb_ratio': sum(1 for h in ep_context_preds if h == 1) / max(len(ep_context_preds), 1),
+                'ctx_clear_ratio': sum(1 for h in ep_context_preds if h == 0) / max(len(ep_context_preds), 1),
+                'avg_corner_speed': sum(ep_corner_speeds) / max(len(ep_corner_speeds), 1) if ep_corner_speeds else 0.0,
+                'graze_count': ep_graze_count,
+                'crash_ctx': ep_crash_ctx if ep_crash_ctx is not None else -1,
+                'crash_speed': ep_crash_speed if ep_crash_speed is not None else 0.0,
+                'crash_lidar_min': ep_crash_lidar_min if ep_crash_lidar_min is not None else 1.0,
+
+                # v26: barrier-relative velocity at crash
+                'crash_v_perp_barrier': _compute_crash_v_perp(ep_crash_speed, ep_crash_heading, ep_crash_closest_wp, _waypoints) if ep_crash_speed is not None else 0.0,
+                'crash_v_tang_barrier': _compute_crash_v_tang(ep_crash_speed, ep_crash_heading, ep_crash_closest_wp, _waypoints) if ep_crash_speed is not None else 0.0,
+                'avg_lidar_min': sum(ep_lidar_mins)/max(len(ep_lidar_mins),1) if ep_lidar_mins else 1.0,
+                'avg_barrier_proximity': sum(ep_barrier_proximities)/max(len(ep_barrier_proximities),1) if ep_barrier_proximities else 0.0,
+                'avg_nearest_object': sum(ep_nearest_objects)/max(len(ep_nearest_objects),1) if ep_nearest_objects else 999.0,
+                # v29 crash antecedent metrics
+                'crash_ante_brake_steps': sum(1 for r in ep_ante_buf if r.get('braking',0)) if ep_ante_buf else 0,
+                'crash_ante_mean_accel': sum(r.get('accel',0) for r in ep_ante_buf)/max(len(ep_ante_buf),1),
+                'crash_ante_mean_vperp': sum(r.get('v_perp',0) for r in ep_ante_buf)/max(len(ep_ante_buf),1),
+                'crash_ante_final_vperp': ep_ante_buf[-1].get('v_perp',0) if ep_ante_buf else 0,
+                'crash_ante_final_stopdist': ep_ante_buf[-1].get('stop_dist',0) if ep_ante_buf else 0,
+                    'avg_ang_vel_centerline': (sum(ep_ang_vel_centerline)/len(ep_ang_vel_centerline)) if ('ep_ang_vel_centerline' in dir() and ep_ang_vel_centerline) else 0.0,  # v37
+                    'avg_jerk': (sum(ep_jerk_abs)/len(ep_jerk_abs)) if ('ep_jerk_abs' in dir() and ep_jerk_abs) else 0.0,  # v37
+                    'max_jerk': (max(ep_jerk_abs) if ('ep_jerk_abs' in dir() and ep_jerk_abs) else 0.0),  # v37
+                    'brake_line_compliance': (sum(ep_brake_before_barrier)/len(ep_brake_before_barrier)) if ('ep_brake_before_barrier' in dir() and ep_brake_before_barrier) else 0.0,  # v37
+                    'position_in_lap': float(ep_progress),  # v1.0.14 centerline pct
+                    'completion_pct': float(ep_progress),
+                    'track_progress_m': float(ep_centerline_progress_m),
+                    'track_length_m': float(ep_track_length_m),
+                    'lap_completed': float(lap_completed),  # v1.0.14 strict completion gate
+                }
+                # v1.1.0: merge harmonized_metrics output into bsts_metrics
+                # so avg_speed_centerline, track_progress, race_line_adherence reach BSTS EMA
+                if _hm_out:
+                    bsts_metrics.update({
+                        'avg_speed_centerline': float(_hm_out.get('avg_speed_centerline', 0.0)),
+                        'track_progress':       float(_hm_out.get('track_progress', 0.0)),
+                        'race_line_adherence':  float(_hm_out.get('race_line_adherence', 0.0)),
+                        'brake_compliance':     float(_hm_out.get('brake_compliance', 0.0)),
+                        'smoothness_jerk_rms':  float(_hm_out.get('smoothness_jerk_rms', 0.0)),
+                    })
+                bsts_feedback.update(bsts_metrics)
+                # v4: Periodic save of failure analysis 
+                # v1.1.2 moved the chunk above out of episode_count % 25 ==0
+                if episode_count % 20 == 0:
+                    sampler.save()
                     jsonl_file.write(json.dumps(bsts_row) + '\n')
                     jsonl_file.flush()
-
-
-                    # --- v4: Log sub-reward breadcrumbs ---
-                    if ep_step_count > 0:
-                        for comp_name, comp_vals in ep_rewards_components.items():
-                            if comp_vals:
-                                avg_val = sum(comp_vals) / len(comp_vals)
-                                writer.add_scalar(f"rewards/{comp_name}", avg_val, global_step)
-                        if ep_speeds:
-                            writer.add_scalar("behavior/avg_speed", sum(ep_speeds)/len(ep_speeds), global_step)
-                        if ep_dist_from_center:
-                            writer.add_scalar("behavior/avg_dist_from_center", sum(ep_dist_from_center)/len(ep_dist_from_center), global_step)
-                        writer.add_scalar("behavior/offtrack_rate", ep_offtrack_count / ep_step_count, global_step)
-                        writer.add_scalar("behavior/ep_steps", ep_step_count, global_step)
-                    # v4: context-aware tensorboard logging
-                        # v4-bsts: compute metrics BEFORE reset
-                    bsts_metrics = {
-                        'crash_rate': float(terminated),
-                        'offtrack_rate': float(ep_offtrack_count / max(ep_step_count, 1)),
-                        'avg_speed': sum(ep_speeds)/max(len(ep_speeds),1) if ep_speeds else 2.0,
-                        'corner_crash_rate': float(terminated and ep_step_count < 50),
-                    'avg_safe_speed_ratio': round(sum(ep_safe_speed_ratios) / max(len(ep_safe_speed_ratios), 1), 4),
-                    'avg_racing_line_err':  round(sum(ep_racing_line_errors) / max(len(ep_racing_line_errors), 1), 4),
-                    'ctx_obstacle_ratio': sum(1 for h in ep_context_preds if h == 2) / max(len(ep_context_preds), 1),
-                    'ctx_curb_ratio': sum(1 for h in ep_context_preds if h == 1) / max(len(ep_context_preds), 1),
-                    'ctx_clear_ratio': sum(1 for h in ep_context_preds if h == 0) / max(len(ep_context_preds), 1),
-                    'avg_corner_speed': sum(ep_corner_speeds) / max(len(ep_corner_speeds), 1) if ep_corner_speeds else 0.0,
-                    'graze_count': ep_graze_count,
-                    'crash_ctx': ep_crash_ctx if ep_crash_ctx is not None else -1,
-                    'crash_speed': ep_crash_speed if ep_crash_speed is not None else 0.0,
-                    'crash_lidar_min': ep_crash_lidar_min if ep_crash_lidar_min is not None else 1.0,
-
-                    # v26: barrier-relative velocity at crash
-                    'crash_v_perp_barrier': _compute_crash_v_perp(ep_crash_speed, ep_crash_heading, ep_crash_closest_wp, _waypoints) if ep_crash_speed is not None else 0.0,
-                    'crash_v_tang_barrier': _compute_crash_v_tang(ep_crash_speed, ep_crash_heading, ep_crash_closest_wp, _waypoints) if ep_crash_speed is not None else 0.0,
-                    'avg_lidar_min': sum(ep_lidar_mins)/max(len(ep_lidar_mins),1) if ep_lidar_mins else 1.0,
-                    'avg_barrier_proximity': sum(ep_barrier_proximities)/max(len(ep_barrier_proximities),1) if ep_barrier_proximities else 0.0,
-                    'avg_nearest_object': sum(ep_nearest_objects)/max(len(ep_nearest_objects),1) if ep_nearest_objects else 999.0,
-                    # v29 crash antecedent metrics
-                    'crash_ante_brake_steps': sum(1 for r in ep_ante_buf if r.get('braking',0)) if ep_ante_buf else 0,
-                    'crash_ante_mean_accel': sum(r.get('accel',0) for r in ep_ante_buf)/max(len(ep_ante_buf),1),
-                    'crash_ante_mean_vperp': sum(r.get('v_perp',0) for r in ep_ante_buf)/max(len(ep_ante_buf),1),
-                    'crash_ante_final_vperp': ep_ante_buf[-1].get('v_perp',0) if ep_ante_buf else 0,
-                    'crash_ante_final_stopdist': ep_ante_buf[-1].get('stop_dist',0) if ep_ante_buf else 0,
-                        'avg_ang_vel_centerline': (sum(ep_ang_vel_centerline)/len(ep_ang_vel_centerline)) if ('ep_ang_vel_centerline' in dir() and ep_ang_vel_centerline) else 0.0,  # v37
-                        'avg_jerk': (sum(ep_jerk_abs)/len(ep_jerk_abs)) if ('ep_jerk_abs' in dir() and ep_jerk_abs) else 0.0,  # v37
-                        'max_jerk': (max(ep_jerk_abs) if ('ep_jerk_abs' in dir() and ep_jerk_abs) else 0.0),  # v37
-                        'brake_line_compliance': (sum(ep_brake_before_barrier)/len(ep_brake_before_barrier)) if ('ep_brake_before_barrier' in dir() and ep_brake_before_barrier) else 0.0,  # v37
-                        'position_in_lap': float(ep_progress),  # v1.0.14 centerline pct
-                        'completion_pct': float(ep_progress),
-                        'track_progress_m': float(ep_centerline_progress_m),
-                        'track_length_m': float(ep_track_length_m),
-                        'lap_completed': float(lap_completed),  # v1.0.14 strict completion gate
-                    }
-                    # v1.1.0: merge harmonized_metrics output into bsts_metrics
-                    # so avg_speed_centerline, track_progress, race_line_adherence reach BSTS EMA
-                    if _hm_out:
-                        bsts_metrics.update({
-                            'avg_speed_centerline': float(_hm_out.get('avg_speed_centerline', 0.0)),
-                            'track_progress':       float(_hm_out.get('track_progress', 0.0)),
-                            'race_line_adherence':  float(_hm_out.get('race_line_adherence', 0.0)),
-                            'brake_compliance':     float(_hm_out.get('brake_compliance', 0.0)),
-                            'smoothness_jerk_rms':  float(_hm_out.get('smoothness_jerk_rms', 0.0)),
-                        })
-                    bsts_feedback.update(bsts_metrics)
-                    if episode_count % 10 == 0:
-                        print(f"[KALMAN_CHECK] n_kfs={len(bsts_feedback._kf_instances)}, "
-                            f"kf_trends={dict(list(bsts_feedback.kf_trends.items())[:3])}")
+                    print(f"[KALMAN_CHECK] n_kfs={len(bsts_feedback._kf_instances)}, "
+                        f"kf_trends={dict(list(bsts_feedback.kf_trends.items())[:3])}")
                 # --- Compute BSTS-adjusted reward weights ---
                 # v1.1.1: skip BSTS weight adjustment during bootstrap.
                 # BSTS was overwriting bootstrap progress weights -> rw_adj:prog collapsed 0.127->0.026.
