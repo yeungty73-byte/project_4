@@ -479,6 +479,42 @@ class BSTSFeedback:
         return out
 
     # ------------------------------------------------------------------
+    def _apply_curriculum_phase_gate(self, w):
+        """
+        v1.1.5d PATCH-Q: Phase A/B/C curriculum weight gate.
+        REF: almakhayita2025curriculum — progress-first then line-following.
+             Designed divergence brake_compliance >> race_line_compliance in Phase B.
+             almakhayita2025curriculum note: 'Low jerk with notable acceleration
+             changes near corners is Phase1 target. Convergence of brake-field
+             and race-line compliance signals Phase2 onset.'
+        avg_track_progress is EMA of (ep_centerline_progress_m / ep_track_length_m)
+        populated by PATCH-V in run.py bsts_feedback.update().
+        """
+        import math
+        avg_tp = float(self.ema.get('avg_track_progress', 0.0))
+        if not math.isfinite(avg_tp):
+            avg_tp = 0.0
+
+        if avg_tp < 0.50:
+            # Phase A: Survival — creep forward, minimise rl/speed pressure
+            w['progress']    = max(w.get('progress', 0.0), 0.45)
+            w['braking']     = max(w.get('braking', 0.0), 0.12)
+            w['racing_line'] = min(w.get('racing_line', 0.99), 0.04)
+            w['curv_speed']  = min(w.get('curv_speed', 0.99), 0.02)
+            w['min_speed']   = min(w.get('min_speed', 0.99), 0.04)
+        elif avg_tp < 0.90:
+            # Phase B: Divergence — brake weight intentionally > raceline
+            # Creates designed gap between brake_compliance and race_line_compliance
+            _frac = (avg_tp - 0.50) / 0.40   # 0.0 at Phase B entry, 1.0 at exit
+            _brk_floor = 0.18 * (1 - _frac) + 0.12 * _frac
+            _rl_floor  = 0.04 * (1 - _frac) + 0.10 * _frac
+            _spd_floor = 0.02 * (1 - _frac) + 0.08 * _frac
+            w['braking']     = max(w.get('braking', 0.0), _brk_floor)
+            w['racing_line'] = max(w.get('racing_line', 0.0), _rl_floor)
+            w['curv_speed']  = max(w.get('curv_speed', 0.0), _spd_floor)
+        # Phase C (>=0.90): no clamp — weights evolve freely toward convergence
+        return w
+
     def adjust_weights(self, base_weights, *, race_type_filter=None) -> dict:
         """Return re-normalised reward weights adjusted by BSTS+Kalman feedback.
 
