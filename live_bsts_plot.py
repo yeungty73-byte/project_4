@@ -46,23 +46,29 @@ except Exception:
 # Tuples: (key, label, units, bound, color, direction)
 # direction: +1 means "up is good" (all operationalized this way, per spec)
 
+# v1.3.0: Keys synced to harmonized_metrics canonical list.
+# SUCCESS keys: brake_field_compliance_gradient + race_line_compliance_gradient added.
+# INTERMEDIARY keys: smoothness_steering_rate (was jerk_rms/smoothness_jerk_rms),
+#   waypoint_lookahead (was waypoint_coverage), htm_composite added.
+# Direction: all +1 (trend-up = good).
 SUCCESS_METRICS = [
-    ("progress",                      "Track Progress",          "frac",  (0, 1), "#8B7FBF", +1),
-    ("avg_speed_centerline",          "Avg Speed (centerline-w.)", "m/s", None,   "#7FBFBF", +1),
-    ("race_line_gradient_compliance", "Race-Line Gradient Comp.", "ratio", (0, 1), "#BF8B7F", +1),
+    ("avg_speed_centerline",               "Avg Speed (centerline-w.)", "m/s", None,   "#7FBFBF", +1),
+    ("track_progress",                     "Track Progress",            "frac", (0,1),  "#8B7FBF", +1),
+    ("brake_field_compliance_gradient",    "Brake-Field Compliance",    "ratio",(0,1),  "#1D8A50", +1),
+    ("race_line_compliance_gradient",      "Race-Line Compliance",      "ratio",(0,1),  "#BF8B7F", +1),
 ]
 
 INTERMEDIARY_METRICS = [
-    ("brake_field_compliance",      "Brake-Field Compliance",      "ratio", (0, 1), "#1D8A50", +1),
-    ("jerk_rms",                    "Smoothness (1-Jerk RMS)",     "1-rms", (0, 1), "#C53C97", +1),
-    ("speed_mean",                  "Speed (mean)",                "m/s", None,  "#BF8B7F", +1),
-    ("steer_activity",              "Steer Activity (RMS)",        "rad", None,  "#7FBF8B", -1),
-    ("waypoint_coverage",           "Waypoint Coverage",           "frac", (0, 1), "#BFBF7F", +1),
-    ("gg_ellipse_utilisation",      "GG Ellipse Utilisation",      "ratio", (0, 1), "#BF7FBF", +1),
-    ("trail_braking_quality",       "Trail Braking Quality",       "ratio", (0, 1), "#7FB5BF", +1),
-    ("velocity_profile_compliance", "Velocity Profile Compliance", "ratio", (0, 1), "#BFA07F", +1),
-    ("curvature_anticipation",      "Curvature Anticipation",      "ratio", (0, 1), "#9FBF7F", +1),
+    ("race_line_adherence",         "Race-Line Adherence",         "ratio", (0, 1), "#BF8B7F", +1),
+    ("brake_compliance",            "Brake Compliance",            "ratio", (0, 1), "#1D8A50", +1),
+    ("corner_speed_error",          "Corner Speed Error",          "ratio", (0, 1), "#C53C97", +1),
     ("heading_alignment_mean",      "Heading Alignment",           "ratio", (0, 1), "#7F9FBF", +1),
+    ("smoothness_steering_rate",    "Steering Smoothness",         "ratio", (0, 1), "#BF7FBF", +1),
+    ("waypoint_lookahead",          "Waypoint Lookahead",          "frac",  (0, 1), "#BFBF7F", +1),
+    ("gg_ellipse_utilisation",      "GG Ellipse Utilisation",      "ratio", (0, 1), "#BFA07F", +1),
+    ("velocity_profile_compliance", "Velocity Profile Compliance", "ratio", (0, 1), "#9FBF7F", +1),
+    ("curvature_anticipation",      "Curvature Anticipation",      "ratio", (0, 1), "#7FB5BF", +1),
+    ("htm_composite",               "HTM Composite",               "ratio", (0, 1), "#7FBF8B", +1),
 ]
 
 ALL_METRICS = SUCCESS_METRICS + INTERMEDIARY_METRICS

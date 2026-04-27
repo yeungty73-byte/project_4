@@ -88,24 +88,15 @@ def load_bsts_csv(log_dir: str) -> List[dict]:
 # II. Intermediary Time-Series Metrics Extraction
 # ============================================================
 # --- harmonized v3.0 metric keys (sourced from harmonized_metrics.compute_all) ---
-from harmonized_metrics import compute_all as _ha_compute_all  # noqa: F401
-SUCCESS_METRICS = [
-        "avg_speed_centerline",   # THE VIF-free success proxy 
-        "track_progress",
-        "success",
-    ]
-INTERMEDIARY_METRICS = [
-        "race_line_adherence",
-        "brake_compliance",
-        "corner_speed_error",
-        "heading_alignment_mean",
-        "smoothness_jerk_rms",
-        "gg_ellipse_utilisation",
-        "trail_braking_quality",
-        "velocity_profile_compliance",
-        "curvature_anticipation",
-        "waypoint_coverage",
-    ]
+from harmonized_metrics import compute_all as _ha_compute_all, compute_intermediary, compute_success  # noqa: F401
+# v1.3.0: Canonical list — mirrors harmonized_metrics.py exactly.
+# Do NOT edit here without editing harmonized_metrics.py.
+# 'success' and diverged keys ('trail_braking_quality', 'waypoint_coverage',
+#  'smoothness_jerk_rms') removed to fix BSTS Kalman always-0.0 bug.
+from harmonized_metrics import (
+    SUCCESS_METRICS,        # noqa: F401 re-export
+    INTERMEDIARY_METRICS,   # noqa: F401 re-export
+)
 
 def extract_intermediary_metrics(ep: dict) -> dict:
     """Compute harmonized v3.0 intermediary time-series metrics for an episode.

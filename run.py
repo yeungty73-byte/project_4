@@ -1159,22 +1159,16 @@ def run(hparams):
         # REF: Garlick, S. & Bradley, A. (2022). Real-time optimal trajectory planning for autonomous vehicles. Vehicle System Dynamics, 60(12).
     race_engine = None  # v18: lazy-init after waypoints available
 
-    # v16: BSTS Seasonal tracker (season=lap position, trend=epoch)
-    bsts_feedback = BSTSFeedback(
-        ema_alpha=0.05,
-        feedback_strength=0.15,
-        race_type=_track_variant,   # race-type tagging live from init
-    )
-    # v1.1.0: replace _NullModel stub with real BSTSSeasonal instance
-    # bsts_feedback.model() returns _NullModel (backward-compat only) — record_step()/_flush_episode()
-    # were silently no-ops, so BSTS-Kalman trends stayed 0.0 forever.
+    # v1.3.0: BSTSFeedback is instantiated inside the episode loop (per-episode reset).
+    # The pre-loop instantiation was a duplicate that crashed with TypeError before
+    # the loop even started. BSTSSeasonal is still instantiated here for lap-cycle tracking.
     try:
         from bsts_seasonal import BSTSSeasonal as _BSTSSeasonal
         bsts_season = _BSTSSeasonal(n_segments=12, save_dir=os.path.join("results", run_name), alpha=0.02)
         logger.info("[BSTS] BSTSSeasonal instantiated — record_step/_flush_episode now active")
     except Exception as _e_bsts:
-        bsts_season = bsts_feedback.model("ep_return", period=100)  # fallback to null
-        logger.warning(f"[BSTS] BSTSSeasonal import failed, using NullModel: {_e_bsts}") 
+        bsts_season = None
+        logger.warning(f"[BSTS] BSTSSeasonal import failed: {_e_bsts}") 
 
     # v16: Race-line blend factor: starts at 0.0 (all rigid), anneals to 1.0 (all race-line)
     _rl_blend = 0.0
@@ -1890,15 +1884,42 @@ def run(hparams):
                         _bf_barrier_dist  = float(_dist_barrier) if '_dist_barrier' in dir() else 5.0
                         _bf_barrier_angle = float(_barrier_angle_rad) if '_barrier_angle_rad' in dir() else 0.0
                         _bf_actual_decel  = float(ep_prev_speed - _speed) if ep_prev_speed > 0 else 0.0
+                        # v1.3.0: CombinedBrakeField.step() — per-class vector fields
+                        # Pass full context; obs_flat_np drives SwinUNetPP 4-class perception.
+                        _bf_obs_raw = obs if obs is not None and hasattr(obs, '__len__') and len(obs) >= 19200 else None
                         _bf_step          = _brake_field.step(
-                            wp_idx        = _closest[0] if _closest else 0,
-                            speed         = _speed,
-                            heading_rad   = float(_heading) if '_heading' in dir() else 0.0,
-                            is_braking    = _is_braking_now,
-                            actual_decel  = _bf_actual_decel,
-                            barrier_dist  = _bf_barrier_dist,
-                            barrier_angle = _bf_barrier_angle,
-                            swin_clearance= _bf_swin,
+                            wp_idx          = _closest[0] if _closest else 0,
+                            speed           = _speed,
+                            heading_rad     = float(_heading) if '_heading' in dir() else 0.0,
+                            car_x           = float(rp.get('x', 0.0)),
+                            car_y           = float(rp.get('y', 0.0)),
+                            is_braking      = _is_braking_now,
+                            actual_decel    = _bf_actual_decel,
+                            # Barrier / curb geometry (from params or lidar)
+                            barrier_dist    = _bf_barrier_dist,
+                            barrier_angle   = _bf_barrier_angle,
+                            curb_dist       = float(_dist_barrier) if '_dist_barrier' in dir() else 5.0,
+                            curb_angle      = float(_barrier_angle_rad) if '_barrier_angle_rad' in dir() else 0.0,
+                            # Static obstacle geometry
+                            obs_dist        = float(_nearest_obj) if '_nearest_obj' in dir() else 5.0,
+                            obs_angle       = float(_barrier_angle_rad) if '_barrier_angle_rad' in dir() else 0.0,
+                            obs_visible_deg = float(rp.get('objects_distance', [{}])[-1].get('visible_angle', 20.0))
+                                             if rp.get('objects_distance') else 20.0,
+                            # Bot geometry (dynamic opponent)
+                            bot_x           = float(rp.get('objects_location', [{}])[-1].get('x', 0.0))
+                                             if rp.get('objects_location') else 0.0,
+                            bot_y           = float(rp.get('objects_location', [{}])[-1].get('y', 0.0))
+                                             if rp.get('objects_location') else 0.0,
+                            bot_heading     = float(rp.get('objects_heading', [0.0])[-1])
+                                             if rp.get('objects_heading') else 0.0,
+                            bot_speed       = float(rp.get('objects_speed', [0.0])[-1])
+                                             if rp.get('objects_speed') else 0.0,
+                            # Center line offset
+                            car_lat_offset  = float(_dist_from_center) * (1 if rp.get('is_left_of_center') else -1)
+                                             if '_dist_from_center' in dir() else 0.0,
+                            track_half_w    = float(_track_width) / 2.0 if '_track_width' in dir() else 0.30,
+                            # SwinUNetPP full obs for 4-class perception
+                            obs_flat_np     = _bf_obs_raw,
                         )
                         _in_brake_field     = _bf_step['in_brake_field']
                         _brake_potential    = _bf_step['brake_potential']
@@ -2238,6 +2259,14 @@ def run(hparams):
                     'speed':     float(_speed),
                     'steering':  float(abs(_steer)),
                     'reward':    float(reward),
+                    # v1.3.0: compliance gradients at step level so BSTS EMA
+                    # sees them every step, not just at episode end.
+                    'brake_field_compliance_gradient':
+                        float(_bf_compliance_grad) if '_bf_compliance_grad' in dir() else 1.0,
+                    'race_line_compliance_gradient':
+                        float(_rl_compliance_grad) if '_rl_compliance_grad' in dir() else 0.5,
+                    'compliance_gradient':
+                        float(_bf_compliance_grad) if '_bf_compliance_grad' in dir() else 1.0,
                 },
                 step=global_step,
                 race_type_tag=_track_variant,
