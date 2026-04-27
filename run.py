@@ -1489,6 +1489,11 @@ def run(hparams):
     global_step = 0
     episode_count = 0
     observation, info = env.reset()
+    # v1.3.1: detect spawn reversal and log heading for debugging
+    _reset_info_rp = info.get('reward_params', {}) if isinstance(info, dict) else {}
+    _spawn_hdg = float(_reset_info_rp.get('heading', 0.0))
+    if bool(_reset_info_rp.get('is_reversed', False)):
+        logger.info(f'[SPAWN] is_reversed=True ep={episode_count} heading={_spawn_hdg:.1f} -- sim always spawns at 4.0 m/s')
     _episode_progress_state = reset_episode_centerline_progress(info.get('reward_params', {}) 
                                                                 if isinstance(info, dict) else {}, 
                                                                 _track_progress_cache)
@@ -2636,9 +2641,13 @@ def run(hparams):
                         'brake_field_compliance_gradient': float(_hm_out.get('brake_field_compliance_gradient', 1.0)),
                         'race_line_compliance_gradient':   float(_hm_out.get('race_line_compliance_gradient',   0.5)),
                     })
-                if {k: v for k, v in bsts_metrics.items()
-                 if isinstance(v, (int, float)) and v != 0.0}: # v1.1.2: only pass metrics that have actual signal:
-                    bsts_feedback.update(bsts_metrics)
+                # v1.3.1 FIX ROOT CAUSE: always call update() unconditionally.
+                # The "v != 0.0" filter prevented 0.0 compliance observations from
+                # reaching the Kalman EMA → compliance_gradient stuck at 0.0 forever.
+                # 0.0 IS a valid observation: "car is off race-line / not in brake-field".
+                # When ALL bsts_metrics values were 0.0, the filter dict was empty {}
+                # → falsy → bsts_feedback.update() was never called → EMA never updated.
+                bsts_feedback.update(bsts_metrics)
                 # v4: Periodic save of failure analysis 
                 # v1.1.2 moved the chunk above out of episode_count % 25 ==0
                 if episode_count % 20 == 0:
@@ -2900,6 +2909,11 @@ def run(hparams):
                 for _rtry in range(3):
                     try:
                         observation, info = env.reset()
+                        # v1.3.1: detect spawn reversal and log heading for debugging
+                        _reset_info_rp = info.get('reward_params', {}) if isinstance(info, dict) else {}
+                        _spawn_hdg = float(_reset_info_rp.get('heading', 0.0))
+                        if bool(_reset_info_rp.get('is_reversed', False)):
+                            logger.info(f'[SPAWN] is_reversed=True ep={episode_count} heading={_spawn_hdg:.1f}')
                         # v1.0.14: init arc-progress state for NEW episode spawn position
                         _new_rp = info.get("reward_params", {}) if isinstance(info, dict) else {}
                         _episode_progress_state = reset_episode_centerline_progress(

@@ -1,4 +1,4 @@
-"""harmonized_metrics.py — v1.2.0
+"""harmonized_metrics.py — v1.3.1
 Compliance metrics are CONTINUOUS gradients [0,1], not binary flags.
 brake_field_compliance_gradient and race_line_compliance_gradient added to
 SUCCESS_METRICS so BSTS Kalman shapes them directly.
@@ -69,7 +69,10 @@ def _track_progress(steps, waypoints=None, track_length_m=None):
     wpts     = np.array([[w[0], w[1]] for w in waypoints], dtype=np.float64)
     n        = len(wpts)
     seg_lens = np.linalg.norm(np.diff(np.vstack([wpts, wpts[0:1]]), axis=0), axis=1)
-    total    = float(track_length_m or np.sum(seg_lens)) or 1.0
+    # v1.3.1 FIX: use provided track_length_m only if it is a real measurement (>1.0).
+    # ep_track_length_m=100.0 is the reset default and must NOT mask the actual arc.
+    total    = float(track_length_m) if (track_length_m and float(track_length_m) > 1.0 and float(track_length_m) < 99.0) else float(np.sum(seg_lens))
+    total    = max(total, 1.0)
     visited  = [s.get("closest_waypoint") for s in steps if s.get("closest_waypoint") is not None]
     if not visited:
         return min(_safe(steps[-1].get("progress", 0)) / 100.0, 1.0)
@@ -142,12 +145,20 @@ def _heading_alignment(steps):
 
 
 def _smoothness_steering_rate(steps):
-    # BUG-FIX v1.3.1: accept 'steering_angle' (run.py step_log key) OR 'steering' (legacy)
-    steers = [_safe(s.get("steering_angle", s.get("steering", 0))) for s in steps]
+    """v1.3.1 FIX: ep_step_log writes 'steering_angle' (actor output). 'steering' is
+    a v1.3.1 alias in run.py. Uses RMS + sigmoid so the metric is scale-invariant.
+    """
+    steers = []
+    for s in steps:
+        val = s.get('steering_angle')
+        if val is None:
+            val = s.get('steering')
+        steers.append(_safe(val, 0.0))
     if len(steers) < 2:
         return 1.0
     diffs = [abs(steers[i] - steers[i - 1]) for i in range(1, len(steers))]
-    return float(np.clip(1.0 - np.mean(diffs) / 30.0, 0.0, 1.0))
+    rms = float(np.sqrt(np.mean(np.array(diffs) ** 2)))
+    return float(1.0 / (1.0 + rms))  # sigmoid: smooth=1.0 at rms=0, jerky→0
 
 
 def _waypoint_lookahead(steps, n_waypoints):
@@ -163,7 +174,9 @@ def _gg_utilisation(steps):
     for s in steps:
         spd   = _safe(s.get("speed", 0))
         decel = _safe(s.get("accel", 0))
-        steer = _safe(s.get("steering", 0))
+        steer_v = s.get('steering_angle')  # v1.3.1: prefer steering_angle
+        if steer_v is None: steer_v = s.get('steering', 0)
+        steer = _safe(steer_v, 0)
         lat   = (spd ** 2) * math.sin(math.radians(abs(steer))) / max(spd, 0.1)
         g_use = math.sqrt(lat ** 2 + abs(decel) ** 2) / 9.81
         utils.append(min(g_use, 1.5))
@@ -178,7 +191,7 @@ def _vprofile_compliance(steps):
         # BUG-FIX v1.3.1: count all steps where a speed target is set (in_corner not required)
         if tgt > 0 and tgt != spd:  # tgt != spd avoids default-passthrough steps
             total += 1
-            if abs(spd - tgt) / tgt < 0.20:
+            if abs(spd - tgt) / max(tgt, 0.01) < 0.20:  # v1.3.1: guard div-by-zero
                 ok += 1
     return float(ok / max(total, 1))
 
@@ -209,6 +222,10 @@ def compute_all(steps, final_progress=0.0, n_waypoints=120, track_width=0.6,
                 waypoints=None, track_length_m=None, phase_id=-1, bc_seeded=0):
     """Always returns complete dict with SUCCESS_METRICS + INTERMEDIARY_METRICS.
     Never raises. All values finite floats.
+
+    v1.3.1: track_length_m is passed through correctly.
+    reInvent2019_wide = 16.635m (confirmed from log rp["track_length"]).
+    ep_track_length_m=100.0 is reset default; values 1.0<x<99.0 are treated as real arc.
     """
     if not steps:
         return {k: 0.0 for k in SUCCESS_METRICS + INTERMEDIARY_METRICS}
