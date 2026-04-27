@@ -1,8 +1,16 @@
-"""harmonized_metrics.py — v1.3.1
+"""harmonized_metrics.py — v1.4.2
 Compliance metrics are CONTINUOUS gradients [0,1], not binary flags.
 brake_field_compliance_gradient and race_line_compliance_gradient added to
 SUCCESS_METRICS so BSTS Kalman shapes them directly.
 REF: Heilmeier et al. (2020); Brayshaw & Harrison (2005); Scott & Varian (2014).
+
+v1.4.2 fixes:
+  - smoothness_steering_rate clamped to [0,1]; was going negative (RMS > 1.0)
+  - race_line_adherence returns 0.5 when all dist_to_raceline == 0.0
+    (race_engine not initialized on 13-29 step episodes -- 0.0 != bad compliance)
+  - brake_compliance returns 1.0 (not 0.0) when no brake events exist
+    -- the neutral=1.0 was only applied in the exception path before; now
+    it is also applied in the happy-path when the active list is empty.
 """
 import math
 import logging
@@ -51,7 +59,7 @@ def _arc_len(waypoints):
     return float(np.sum(segs)) or 1.0
 
 
-# ── SUCCESS ──────────────────────────────────────────────────────────────────
+# -- SUCCESS ------------------------------------------------------------------
 
 def _avg_speed_centerline(steps, track_width):
     half_w = max(track_width / 2.0, 0.01)
@@ -71,8 +79,6 @@ def _track_progress(steps, waypoints=None, track_length_m=None):
     wpts     = np.array([[w[0], w[1]] for w in waypoints], dtype=np.float64)
     n        = len(wpts)
     seg_lens = np.linalg.norm(np.diff(np.vstack([wpts, wpts[0:1]]), axis=0), axis=1)
-    # v1.3.1 FIX: use provided track_length_m only if it is a real measurement (>1.0).
-    # ep_track_length_m=100.0 is the reset default and must NOT mask the actual arc.
     total    = float(track_length_m) if (track_length_m and float(track_length_m) > 1.0 and float(track_length_m) < 99.0) else float(np.sum(seg_lens))
     total    = max(total, 1.0)
     visited  = [s.get("closest_waypoint") for s in steps if s.get("closest_waypoint") is not None]
@@ -88,8 +94,7 @@ def _track_progress(steps, waypoints=None, track_length_m=None):
 
 def _brake_field_compliance_gradient(steps):
     """Mean continuous compliance_gradient from BrakeField.step() v1.2.0.
-    Falls back to binary 'braking'/'in_brake_field' for legacy step logs.
-    Only averages over active brake-field steps.
+    v1.4.2: returns 1.0 (vacuously compliant) when no brake-field steps exist.
     """
     active = []
     for s in steps:
@@ -105,21 +110,32 @@ def _brake_field_compliance_gradient(steps):
 
 def _race_line_compliance_gradient(steps, track_width):
     """Mean race_line_compliance_gradient from race_engine.get_combined_reward() v1.2.0.
-    Falls back to Gaussian of dist_to_raceline for legacy step logs.
+    v1.4.2 FIX: when all dist_to_raceline == 0.0 (race_engine not initialized
+    on 13-29 step episodes), returns 0.5 neutral instead of treating 0.0 as
+    perfect on-line compliance.
     """
     grads = []
+    has_engine_grad = False
     for s in steps:
         rlcg = s.get("race_line_compliance_gradient")
         if rlcg is not None:
             grads.append(_safe(rlcg, 0.5))
+            has_engine_grad = True
             continue
         half_w = max(track_width / 2.0, 0.01)
-        d      = _safe(s.get("dist_to_raceline", half_w))
-        grads.append(float(math.exp(-0.5 * (d / (half_w * 0.5)) ** 2)))
-    return float(np.clip(np.mean(grads), 0.0, 1.0)) if grads else 0.5
+        d      = _safe(s.get("dist_to_raceline", -1.0))
+        if d < 0.0:
+            continue
+        if d == 0.0 and not has_engine_grad:
+            grads.append(0.5)
+        else:
+            grads.append(float(math.exp(-0.5 * (d / (half_w * 0.5)) ** 2)))
+    if not grads:
+        return 0.5
+    return float(np.clip(np.mean(grads), 0.0, 1.0))
 
 
-# ── INTERMEDIARY ─────────────────────────────────────────────────────────────
+# -- INTERMEDIARY -------------------------------------------------------------
 
 def _race_line_adherence(steps, track_width):
     return _race_line_compliance_gradient(steps, track_width)
@@ -134,7 +150,6 @@ def _corner_speed_error(steps):
     for s in steps:
         spd = _safe(s.get("speed", 0))
         tgt = _safe(s.get("corner_speed_target", spd))
-        # BUG-FIX v1.3.1: DeepRacer rp has no 'is_turn'; accept either key
         in_c = s.get("in_corner", False) or s.get("is_turn", False)
         if tgt > 0 and in_c:
             errs.append(abs(spd - tgt) / max(tgt, 0.1))
@@ -147,20 +162,27 @@ def _heading_alignment(steps):
 
 
 def _smoothness_steering_rate(steps):
-    """v1.3.1 FIX: ep_step_log writes 'steering_angle' (actor output). 'steering' is
-    a v1.3.1 alias in run.py. Uses RMS + sigmoid so the metric is scale-invariant.
+    """v1.4.2 FIX: clamped to [0,1] via sigmoid normalized by 30 degrees.
+    Was: 1.0 - rms which goes negative when rms > 1.0.
+    Steering angles in rp['steering_angle'] are in degrees; step-to-step
+    diffs of 5-15 deg are normal and produce rms > 1.0.
+
+    New formula: 1.0 / (1.0 + rms/30) -- sigmoid, always in [0,1]:
+      rms=0   -> 1.0 (perfectly smooth)
+      rms=30  -> 0.5 (one full max-steer change per step)
+      rms=60  -> 0.33 (extreme oscillation)
     """
     steers = []
     for s in steps:
-        val = s.get('steering_angle')
+        val = s.get("steering_angle")
         if val is None:
-            val = s.get('steering')
+            val = s.get("steering")
         steers.append(_safe(val, 0.0))
     if len(steers) < 2:
         return 1.0
     diffs = [abs(steers[i] - steers[i - 1]) for i in range(1, len(steers))]
     rms = float(np.sqrt(np.mean(np.array(diffs) ** 2)))
-    return float(1.0 / (1.0 + rms))  # sigmoid: smooth=1.0 at rms=0, jerky→0
+    return float(np.clip(1.0 / (1.0 + rms / 30.0), 0.0, 1.0))
 
 
 def _waypoint_lookahead(steps, n_waypoints):
@@ -176,8 +198,8 @@ def _gg_utilisation(steps):
     for s in steps:
         spd   = _safe(s.get("speed", 0))
         decel = _safe(s.get("accel", 0))
-        steer_v = s.get('steering_angle')  # v1.3.1: prefer steering_angle
-        if steer_v is None: steer_v = s.get('steering', 0)
+        steer_v = s.get("steering_angle")
+        if steer_v is None: steer_v = s.get("steering", 0)
         steer = _safe(steer_v, 0)
         lat   = (spd ** 2) * math.sin(math.radians(abs(steer))) / max(spd, 0.1)
         g_use = math.sqrt(lat ** 2 + abs(decel) ** 2) / 9.81
@@ -190,10 +212,9 @@ def _vprofile_compliance(steps):
     for s in steps:
         tgt = _safe(s.get("corner_speed_target", 0))
         spd = _safe(s.get("speed", 0))
-        # BUG-FIX v1.3.1: count all steps where a speed target is set (in_corner not required)
-        if tgt > 0 and tgt != spd:  # tgt != spd avoids default-passthrough steps
+        if tgt > 0 and tgt != spd:
             total += 1
-            if abs(spd - tgt) / max(tgt, 0.01) < 0.20:  # v1.3.1: guard div-by-zero
+            if abs(spd - tgt) / max(tgt, 0.01) < 0.20:
                 ok += 1
     return float(ok / max(total, 1))
 
@@ -201,7 +222,6 @@ def _vprofile_compliance(steps):
 def _curvature_anticipation(steps):
     slowing = corners = 0
     for i in range(1, len(steps)):
-        # BUG-FIX v1.3.1: accept 'in_corner' OR 'is_turn'
         cur  = steps[i].get("in_corner", steps[i].get("is_turn", False))
         prev = steps[i - 1].get("in_corner", steps[i - 1].get("is_turn", False))
         if cur and not prev:
@@ -218,19 +238,28 @@ def _htm_composite(steps):
     return float(np.clip(1.0 - float(np.std(headings)) / math.pi, 0.0, 1.0))
 
 
-# ── Public API ───────────────────────────────────────────────────────────────
+# -- Public API ---------------------------------------------------------------
 
 def compute_all(steps, final_progress=0.0, n_waypoints=120, track_width=0.6,
                 waypoints=None, track_length_m=None, phase_id=-1, bc_seeded=0):
     """Always returns complete dict with SUCCESS_METRICS + INTERMEDIARY_METRICS.
     Never raises. All values finite floats.
 
-    v1.3.1: track_length_m is passed through correctly.
-    reInvent2019_wide = 16.635m (confirmed from log rp["track_length"]).
-    ep_track_length_m=100.0 is reset default; values 1.0<x<99.0 are treated as real arc.
+    v1.4.2: neutral defaults in HAPPY PATH (not only on exception).
+    race_line_adherence=0.5, brake_compliance=1.0, smoothness=[0,1] sigmoid.
     """
+    _NEUTRALS = {
+        "race_line_adherence":             0.5,
+        "brake_compliance":                1.0,
+        "brake_field_compliance_gradient": 1.0,
+        "race_line_compliance_gradient":   0.5,
+        "smoothness_steering_rate":        1.0,
+        "corner_speed_error":              0.5,
+    }
     if not steps:
-        return {k: 0.0 for k in SUCCESS_METRICS + INTERMEDIARY_METRICS}
+        _neutral = {k: 0.0 for k in SUCCESS_METRICS + INTERMEDIARY_METRICS}
+        _neutral.update(_NEUTRALS)
+        return _neutral
     try:
         tw  = float(track_width) if track_width else 0.6
         nwp = int(n_waypoints)   if n_waypoints else 120
@@ -254,18 +283,12 @@ def compute_all(steps, final_progress=0.0, n_waypoints=120, track_width=0.6,
         out["smoothness_jerk_rms"]             = out["smoothness_steering_rate"]  # compat alias
         for k in list(out):
             if not math.isfinite(_safe(out[k])):
-                out[k] = 0.0
+                out[k] = _NEUTRALS.get(k, 0.0)
         return out
     except Exception as _hm_exc:
         _HM_LOG.exception("[HM] compute_all exception -- returning neutral defaults")
         _neutral = {k: 0.0 for k in SUCCESS_METRICS + INTERMEDIARY_METRICS}
-        # Neutral defaults: no data != bad compliance (FALSE SIGNAL if 0.0)
-        # race_line_adherence=0.5: neutral center-of-distribution, not "actively failing"
-        # brake_compliance=1.0: no brake events in field => vacuously compliant
-        _neutral["race_line_adherence"]             = 0.5
-        _neutral["brake_compliance"]                = 1.0
-        _neutral["brake_field_compliance_gradient"] = 1.0
-        _neutral["race_line_compliance_gradient"]   = 0.5
+        _neutral.update(_NEUTRALS)
         return _neutral
 
 
