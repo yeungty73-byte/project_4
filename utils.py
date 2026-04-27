@@ -16,7 +16,7 @@ except ImportError:
     class _DummyManager:
         def counter(self, *a, **kw): return _DummyCounter()
         def status_bar(self, *a, **kw): return _DummyStatusBar()
-    enlighten = type('module', (), {'get_manager': lambda: _DummyManager(), 'Justify': type('Justify', (), {'CENTER': 'center'})})()
+    enlighten = type('module', (), {'get_manager': lambda: _DummyManager(), 'Justify': type('Justify', (), {'CENTER': 'center'})})(  )
 import subprocess
 import numpy as np
 import pandas as pd
@@ -44,7 +44,6 @@ FS_LABEL: int = 18
 PLOT_DPI: int=1200
 PLOT_FORMAT: str='pdf'
 RC_PARAMS: dict = {
-    # Set background and border settings
     'axes.facecolor': 'white',
     'axes.edgecolor': 'black',
     'axes.linewidth': 2,
@@ -61,22 +60,12 @@ SEED: int=42
 
 
 def set_seed(seed: int=SEED):
-    '''
-    set seed for reproducability
-    '''
+    '''set seed for reproducibility'''
     random.seed(seed)
-
     np.random.seed(seed)
-    
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
-    
-    # uncomment this for better reproducibility; slows torch
-    # torch.backends.cudnn.deterministic = True
-    # torch.backends.cudnn.benchmark = False
-    
     os.environ['PYTHONHASHSEED'] = str(seed)
-    
     logger.info(f'Random seed set as {seed}.')
 
 
@@ -87,26 +76,36 @@ def device():
         device = 'mps'
     else:
         device = 'cpu'
-    
     if ONLY_CPU:
         device = 'cpu'
-    
     logger.info(f'Using {device} device.')
     return torch.device(device)
 
 
 def make_environment(
-        environment_name: str=ENVIRONMENT_NAME,
-        seed: int=SEED,
+        environment_name: str = ENVIRONMENT_NAME,
+        seed: int = SEED,
+        reward_function=None,
         **kwargs
     ):
-    environment = gym.make(environment_name, **kwargs)
-    
+    """Create and wrap the DeepRacer gym environment.
+
+    v1.1.2 FIX: reward_function defaults to _identity_reward (returns 1.0)
+    so that run.py's AnnealingScheduler-shaped reward is the sole signal
+    and there is no dual-reward contamination from the gym env.
+
+    Pass a callable explicitly to override for standalone eval / demo runs.
+    """
+    from configs.reward_function import _identity_reward
+
+    _rf = _identity_reward if reward_function is None else reward_function
+
+    environment = gym.make(environment_name, reward_function=_rf, **kwargs)
+
     environment = RecordEpisodeStatistics(
         FlattenObservation(environment)
     )
-    
-    # environment.seed(seed)
+
     environment.action_space.seed(seed)
     environment.observation_space.seed(seed)
 
@@ -118,45 +117,65 @@ def get_world_name(
     ):
     with open(environment_params_path, 'r') as f:
         environment_params = yaml.safe_load(f)
-    
     if 'WORLD_NAME' not in environment_params:
         raise ValueError(
             f'WORLD_NAME not defined in {environment_params_path}'
         )
-    
     return environment_params['WORLD_NAME']
 
 
 def get_race_type(
-    environment_params_path: str=ENVIRONMENT_PARAMS_PATH
+    environment_params_path: str = ENVIRONMENT_PARAMS_PATH
     ):
+    """Return 'time_trial' | 'obstacle_avoidance' | 'head_to_bot'.
+
+    v1.1.2 FIX: prefers the RACE_TYPE string key when present in the YAML
+    (authoritative).  Falls back to NUMBER_OF_OBSTACLES / NUMBER_OF_BOT_CARS
+    count-based logic for backwards compatibility.
+
+    Original code silently ignored RACE_TYPE and would raise ValueError for
+    any bot-car count other than exactly 3 — crashing eval for h2b.yaml
+    which had NUMBER_OF_BOT_CARS: 4.
+    """
     with open(environment_params_path, 'r') as f:
-        environment_params = yaml.safe_load(f)
-    
-    obstacles = int(environment_params['NUMBER_OF_OBSTACLES'])
-    bots = int(environment_params['NUMBER_OF_BOT_CARS'])
-    if (
-        obstacles == 0 and bots == 0
-    ):
+        ep = yaml.safe_load(f)
+
+    # Primary: explicit RACE_TYPE string in YAML (most configs now have this)
+    _race_type_map = {
+        'TIME_TRIAL':        'time_trial',
+        'OBJECT_AVOIDANCE':  'obstacle_avoidance',
+        'HEAD_TO_BOT':       'head_to_bot',
+    }
+    if 'RACE_TYPE' in ep:
+        rt = str(ep['RACE_TYPE']).upper().strip()
+        if rt in _race_type_map:
+            return _race_type_map[rt]
+        logger.warning(
+            f"get_race_type: unrecognised RACE_TYPE='{ep['RACE_TYPE']}' in "
+            f"{environment_params_path}; falling back to count-based logic."
+        )
+
+    # Fallback: count-based (original logic, extended to bots >= 1)
+    obstacles = int(ep.get('NUMBER_OF_OBSTACLES', 0))
+    bots      = int(ep.get('NUMBER_OF_BOT_CARS', 0))
+    if obstacles == 0 and bots == 0:
         return 'time_trial'
-    elif (
-        obstacles == 6 and bots == 0
-    ):
+    elif obstacles == 6 and bots == 0:
         return 'obstacle_avoidance'
-    elif (
-        obstacles == 0 and bots == 3
-    ):
+    elif obstacles == 0 and bots >= 1:
         return 'head_to_bot'
     else:
         raise ValueError(
-            f'Incorrect configuration for NUMBER_OF_OBSTACLES or NUMBER_OF_BOT_CARS.'
+            f'Cannot determine race type: NUMBER_OF_OBSTACLES={obstacles}, '
+            f'NUMBER_OF_BOT_CARS={bots} in {environment_params_path}. '
+            f'Add a RACE_TYPE key to the YAML.'
         )
 
 
 def demo(
         agent: Agent,
         environment_name: str=ENVIRONMENT_NAME,
-        directory: str='./demos'               # directory to save videos
+        directory: str='./demos'
     ):
     race_type = get_race_type(
         environment_params_path=ENVIRONMENT_PARAMS_PATH
@@ -169,12 +188,10 @@ def demo(
     agent.eval().to(demo_device)
     os.makedirs(directory, exist_ok=True)
 
-    # create environment with proper render_mode
     demo_environment = make_environment(
         environment_name, render_mode='rgb_array'
     )
 
-    # apply video recording wrapper
     demo_environment = RecordVideo(
         demo_environment,
         video_folder=directory,
@@ -189,70 +206,44 @@ def demo(
         total=MAX_DEMO_STEPS, desc=f'{world_name} {race_type} demo', unit='steps', leave=False
     )
     for t in range(MAX_DEMO_STEPS):
-        # get action from policy
         action = agent.get_action(torch.Tensor(observation)[None, :])
-        
         if not isinstance(action, np.ndarray) and torch.is_tensor(action):
             action = action.cpu().detach().numpy()
-        
         if isinstance(demo_environment.action_space, spaces.Discrete):
             action = action.item()
-        
-        # execute the action, get observation
-        observation, _, terminated, truncated, _ = demo_environment.step(
-            action
-        )
+        observation, _, terminated, truncated, _ = demo_environment.step(action)
         demo_progress.update()
         demo_progress.refresh()
-        
         if terminated or truncated:
             break
-    
+
     demo_environment.close()
     demo_progress.close()
-    
-    # The RecordVideo wrapper names the file automatically with the prefix + step info
-    # We'll grab the latest video with our given prefix
-    # e.g. 'agent_rl-video-episode-0.mp4' or similar
+
     filtered_videos = sorted(
         f for f in os.listdir(directory)
         if (
             f.endswith('.mp4')
-            and
-            agent.name in f
-            and
-            world_name in f
-            and
-            race_type in f
+            and agent.name in f
+            and world_name in f
+            and race_type in f
         )
     )
     if len(filtered_videos) == 0:
         logger.warning('No videos found!')
         return
 
-    # display the latest video
-    video_path = os.path.join(
-        directory, filtered_videos[-1]
-    )
-
+    video_path = os.path.join(directory, filtered_videos[-1])
     clear_output(wait=True)
-    display(
-        Video(video_path, embed=True)
-    )
+    display(Video(video_path, embed=True))
 
 
 def command_exists(command: str) -> bool:
-    '''
-    Check if a command exists and is executable in the system's PATH.
-    '''
     return shutil.which(command) is not None
 
 
-def run_command(command):    
-    result=subprocess.run(
-        command, capture_output=True, text=True
-    )
-    
+def run_command(command):
+    result=subprocess.run(command, capture_output=True, text=True)
     logger.info(result.stdout)
     if result.returncode:
         logger.error(result.stderr)
@@ -261,127 +252,90 @@ def run_command(command):
 
 
 def evaluate_track(
-# REF: Sutton, R. S. & Barto, A. G. (2018). Reinforcement Learning: An Introduction (2nd ed.). MIT Press.
         agent: Agent,
         world_name: str,
         environment_name: str=ENVIRONMENT_NAME,
-        directory: str='./evaluations'               # directory to save eval data
+        directory: str='./evaluations'
     ):
     race_type = get_race_type(
         environment_params_path=ENVIRONMENT_PARAMS_PATH
     )
+    logger.info(f'Starting {race_type} evaluation on {world_name} track.')
 
-    logger.info(
-        f'Starting {race_type} evaluation on {world_name} track.'
-    )
-
-    # restart the simulation in evaluation mode
     run_command([
         '/bin/bash',
         './scripts/restart_deepracer.sh',
-        '-E', 'true',           # evaluation mode
-        '-W', world_name,       # specify WORLD_NAME
+        '-E', 'true',
+        '-W', world_name,
     ])
 
     eval_device = torch.device('cpu')
     agent.eval().to(eval_device)
     os.makedirs(directory, exist_ok=True)
 
-    # create environment with proper render_mode
-    eval_environment = make_environment(
-        ENVIRONMENT_NAME
-    )
+    eval_environment = make_environment(ENVIRONMENT_NAME)
     observation, _ = eval_environment.reset()
 
-    eval_metrics = {
-        'progress': [],
-        'lap_time': [],
-    }
+    eval_metrics = {'progress': [], 'lap_time': []}
     if PROGRESS_MANAGER is not None:
         evaluation_progress = PROGRESS_MANAGER.counter(
         total=EVAL_EPISODES, desc=f'Evaluating {world_name}', unit='episodes'
     )
     for episode in range(EVAL_EPISODES):
-        
         if PROGRESS_MANAGER is not None:
             episode_progress = PROGRESS_MANAGER.counter(
             total=MAX_EVAL_STEPS, desc=f'Episode {episode}', unit='steps', leave=False
         )
         for t in range(MAX_EVAL_STEPS):
-
             action = agent.get_action(torch.Tensor(observation)[None, :])
-            
             if not isinstance(action, np.ndarray) and torch.is_tensor(action):
                 action = action.cpu().detach().numpy()
-            
             if isinstance(eval_environment.action_space, spaces.Discrete):
                 action = action.item()
-
-            observation, reward, terminated, truncated, info = eval_environment.step(
-                action
-            )
-
+            observation, reward, terminated, truncated, info = eval_environment.step(action)
             episode_progress.update()
             episode_progress.refresh()
-
             done = terminated or truncated
             if done or t == MAX_EVAL_STEPS - 1:
                 progress = info.get('reward_params', {}).get('progress', 0.0)
                 lap = lap_time(info)
-
-                eval_metrics['progress'].append(
-                    progress
-                )
-                eval_metrics['lap_time'].append(
-                    lap
-                )
-
-                logger.info(
-                    f'Episode {episode}:\t progress: {progress}\t lap_time: {lap}'
-                )
-
+                eval_metrics['progress'].append(progress)
+                eval_metrics['lap_time'].append(lap)
+                logger.info(f'Episode {episode}:\t progress: {progress}\t lap_time: {lap}')
                 observation, info = eval_environment.reset()
-                
                 break
-
         episode_progress.close()
-        
         evaluation_progress.update()
         evaluation_progress.refresh()
     evaluation_progress.close()
     eval_environment.close()
-    
+
     try:
         with open(f'{directory}/{race_type}-{agent.name}.json', '+r') as f:
             all_metrics = json.load(f)
     except:
         all_metrics = {}
-    
-    all_metrics.update({
-        world_name: eval_metrics
-    })
+
+    all_metrics.update({world_name: eval_metrics})
     with open(f'{directory}/{race_type}-{agent.name}.json', '+w') as f:
         json.dump(all_metrics, f)
-    
+
     return eval_metrics
 
 
 def evaluate(
-# REF: Amazon Web Services. (2020). AWS DeepRacer developer documentation.
         agent: Agent,
         environment_name: str=ENVIRONMENT_NAME,
-        directory: str='./evaluations'               # directory to save eval data
+        directory: str='./evaluations'
     ):
-    race_type = get_race_type(
-        environment_params_path=ENVIRONMENT_PARAMS_PATH
-    )
-    
+    race_type = get_race_type(environment_params_path=ENVIRONMENT_PARAMS_PATH)
+
     eval_world_names = ([
-        'reInvent2019_wide',    # A to Z Speedway
-        'reInvent2019_track',   # Smile Speedway
-        'Vegas_track',          # AWS Summit Raceway
+        'reInvent2019_wide',
+        'reInvent2019_track',
+        'Vegas_track',
     ])
-    
+
     eval_device = torch.device('cpu')
     agent.eval().to(eval_device)
     os.makedirs(directory, exist_ok=True)
@@ -404,16 +358,11 @@ def evaluate(
             directory=directory
         )
     status.close()
-    
+
     with open(f'{directory}/{race_type}-{agent.name}.json', '+w') as f:
         json.dump(eval_metrics, f)
-    
-    # restart the simulation with specified parameters
-    run_command([
-        '/bin/bash',
-        './scripts/restart_deepracer.sh'
-    ])
 
+    run_command(['/bin/bash', './scripts/restart_deepracer.sh'])
     return eval_metrics
 
 
@@ -426,15 +375,12 @@ def plot_metrics(
     """Publication-quality metric visualisation with STL decomposition.
 
     Renders a 4-panel figure per metric key in *data*:
-      Panel 1 - Observed series with EMA overlay + 95% bootstrap CI band
+      Panel 1 - Observed series with EMA overlay + 95% Bayesian credible interval
       Panel 2 - STL trend component (LOESS-extracted)
       Panel 3 - STL seasonal/cyclic component
       Panel 4 - Residual with +/- 2-sigma control limits
 
-    If *bsts_report* is supplied (from analyze_logs.bsts_compliance_report),
-    a fifth panel shows Kalman-filtered level + regression driver heatmap.
-
-    Uses denim_theme throughout for unified aesthetics.
+    If *bsts_report* is supplied, a fifth panel shows Kalman-filtered level.
 
     References:
         Cleveland et al. (1990) STL decomposition
@@ -481,14 +427,6 @@ def plot_metrics(
 
     def bayesian_credible_interval(y, span=20, ci=0.95):
         """Bayesian credible interval via conjugate Normal-InverseGamma posterior.
-
-        Models y_t ~ N(mu_t, sigma^2) with a rolling window. Uses the
-        conjugate NIG posterior to produce exact credible bands rather
-        than frequentist bootstrap confidence intervals.
-
-        Prior: mu ~ N(mu_0, sigma^2/kappa_0), sigma^2 ~ IG(alpha_0, beta_0)
-        Posterior after n obs: closed-form Student-t predictive.
-
         References:
             Murphy (2007) Conjugate Bayesian analysis of the Gaussian distribution
             Gelman et al. (2013) Bayesian Data Analysis, 3rd ed., Ch. 2-3
@@ -497,7 +435,6 @@ def plot_metrics(
         n = len(y)
         lo = np.empty(n)
         hi = np.empty(n)
-        # Weakly informative NIG prior
         mu_0 = np.mean(y[:min(10, n)])
         kappa_0 = 1.0
         alpha_0 = 2.0
@@ -508,13 +445,11 @@ def plot_metrics(
             nw = len(window)
             y_bar = np.mean(window)
             s2 = np.var(window, ddof=1) if nw > 1 else beta_0
-            # Posterior parameters
             kappa_n = kappa_0 + nw
             mu_n = (kappa_0 * mu_0 + nw * y_bar) / kappa_n
             alpha_n = alpha_0 + nw / 2.0
             beta_n = (beta_0 + 0.5 * nw * s2
                       + 0.5 * kappa_0 * nw * (y_bar - mu_0)**2 / kappa_n)
-            # Predictive distribution: Student-t
             df = 2 * alpha_n
             scale = np.sqrt(beta_n * (kappa_n + 1) / (alpha_n * kappa_n))
             lo[t] = sp_stats.t.ppf(half_alpha, df, loc=mu_n, scale=scale)
@@ -545,7 +480,6 @@ def plot_metrics(
         ema_line = ema(series)
         lo, hi = bayesian_credible_interval(series)
 
-        # --- Apply ggplot style with denim overrides ---
         plt.style.use('ggplot')
         plt.rcParams.update({
             'figure.facecolor': BG_DARK,
@@ -560,32 +494,22 @@ def plot_metrics(
             'font.family': 'serif',
         })
 
-        # --- Panel 0: Observed + EMA + CI ---
         ax = axes[0]
         ax.fill_between(x, lo, hi, alpha=0.18, color=DENIM_BRIGHT,
                         label="95% Bayesian credible interval")
-        ax.plot(x, series, linewidth=0.4, alpha=0.45, color=MUTED_GRAY,
-                label="raw")
-        ax.plot(x, ema_line, linewidth=1.8, color=DENIM_BRIGHT,
-                label="EMA-20")
+        ax.plot(x, series, linewidth=0.4, alpha=0.45, color=MUTED_GRAY, label="raw")
+        ax.plot(x, ema_line, linewidth=1.8, color=DENIM_BRIGHT, label="EMA-20")
         ax.set_title(f"{key}  (observed)", fontsize=11, fontweight="bold")
         ax.legend(loc="upper left", fontsize=7, framealpha=0.6)
 
-        # Stat annotations: Mann-Kendall trend test + effect size
         try:
             from scipy import stats as sp_stats
             half = n // 2
-            first_half = series[:half]
-            second_half = series[half:]
-            t_stat, p_val = sp_stats.ttest_ind(first_half, second_half,
-                                                equal_var=False)
-            cohens_d = ((np.mean(second_half) - np.mean(first_half))
-                        / np.sqrt((np.var(first_half) + np.var(second_half)) / 2 + 1e-12))
-            # Mann-Kendall trend
-            s_mk = sum(1 for i in range(n) for j in range(i+1, n)
-                       if series[j] > series[i])
-            s_mk -= sum(1 for i in range(n) for j in range(i+1, n)
-                        if series[j] < series[i])
+            t_stat, p_val = sp_stats.ttest_ind(series[:half], series[half:], equal_var=False)
+            cohens_d = ((np.mean(series[half:]) - np.mean(series[:half]))
+                        / np.sqrt((np.var(series[:half]) + np.var(series[half:])) / 2 + 1e-12))
+            s_mk = sum(1 for i in range(n) for j in range(i+1, n) if series[j] > series[i])
+            s_mk -= sum(1 for i in range(n) for j in range(i+1, n) if series[j] < series[i])
             tau = 2.0 * s_mk / (n * (n - 1)) if n > 1 else 0
             sig_str = '***' if p_val < 0.001 else '**' if p_val < 0.01 else '*' if p_val < 0.05 else 'ns'
             ax.annotate(
@@ -597,7 +521,6 @@ def plot_metrics(
             pass
         ax.set_ylabel(key, fontsize=9)
 
-        # --- Panels 1-3: STL decomposition ---
         if _HAS_STL and n >= 14:
             period = min(max(2, n // 5), n // 2)
             if period % 2 == 0:
@@ -605,9 +528,7 @@ def plot_metrics(
             try:
                 stl = STL(series, period=period, robust=True)
                 res = stl.fit()
-                trend_c = res.trend
-                seasonal_c = res.seasonal
-                resid_c = res.resid
+                trend_c, seasonal_c, resid_c = res.trend, res.seasonal, res.resid
             except Exception:
                 trend_c = ema_line
                 seasonal_c = np.zeros(n)
@@ -619,15 +540,13 @@ def plot_metrics(
 
         ax1 = axes[1]
         ax1.plot(x, trend_c, linewidth=1.6, color=AMBER, label="trend")
-        ax1.fill_between(x, trend_c - np.std(resid_c),
-                         trend_c + np.std(resid_c),
+        ax1.fill_between(x, trend_c - np.std(resid_c), trend_c + np.std(resid_c),
                          alpha=0.12, color=AMBER)
         ax1.set_title("Trend (LOESS)", fontsize=10)
         ax1.set_ylabel("level", fontsize=8)
 
         ax2 = axes[2]
-        ax2.bar(x, seasonal_c, width=1.0, color=SAGE_GREEN, alpha=0.6,
-                label="seasonal")
+        ax2.bar(x, seasonal_c, width=1.0, color=SAGE_GREEN, alpha=0.6, label="seasonal")
         ax2.axhline(0, color=MUTED_GRAY, linewidth=0.5, linestyle="--")
         ax2.set_title("Seasonal / Cyclic Component", fontsize=10)
         ax2.set_ylabel("deviation", fontsize=8)
@@ -635,31 +554,25 @@ def plot_metrics(
         ax3 = axes[3]
         sigma2 = np.std(resid_c) * 2
         ax3.plot(x, resid_c, linewidth=0.6, color=TERRA_COTTA, alpha=0.7)
-        ax3.axhline(sigma2, color=MUTED_PURPLE, linewidth=0.8,
-                    linestyle=":", label="+2σ")
-        ax3.axhline(-sigma2, color=MUTED_PURPLE, linewidth=0.8,
-                    linestyle=":")
+        ax3.axhline(sigma2, color=MUTED_PURPLE, linewidth=0.8, linestyle=":", label="+2σ")
+        ax3.axhline(-sigma2, color=MUTED_PURPLE, linewidth=0.8, linestyle=":")
         ax3.axhline(0, color=MUTED_GRAY, linewidth=0.5, linestyle="--")
         ax3.fill_between(x, -sigma2, sigma2, alpha=0.06, color=MUTED_PURPLE)
         ax3.set_title("Residual + Control Limits", fontsize=10)
         ax3.set_ylabel("residual", fontsize=8)
         ax3.legend(loc="upper right", fontsize=7)
 
-        # --- Panel 4 (optional): BSTS Kalman level + driver heatmap ---
         if has_bsts:
             dec = bsts_report["decompositions"][key]
             ax4 = axes[4]
             lvl = np.asarray(dec["levels"])
             pred = np.asarray(dec["predictions"])
-            ax4.plot(x[:len(lvl)], lvl, linewidth=1.4, color=GOLD_WARM,
-                     label="Kalman level")
+            ax4.plot(x[:len(lvl)], lvl, linewidth=1.4, color=GOLD_WARM, label="Kalman level")
             ax4.plot(x[:len(pred)], pred, linewidth=0.9, color=DENIM_MID,
                      linestyle="--", label="BSTS prediction")
             ax4.set_title("BSTS Kalman Decomposition", fontsize=10)
             ax4.legend(loc="upper left", fontsize=7)
             ax4.set_ylabel("level", fontsize=8)
-
-            # Annotate top drivers
             drivers = bsts_report.get("intermediary_drivers", {}).get(key, [])
             if drivers:
                 driver_txt = "  ".join(
@@ -672,15 +585,13 @@ def plot_metrics(
                              bbox=dict(boxstyle="round,pad=0.3",
                                        fc=DENIM_DARK, alpha=0.7))
 
-        # Apply denim theme
         apply_theme(fig, axes)
         for a in axes:
             a.set_xlim(0, n)
             a.tick_params(labelsize=7)
         axes[-1].set_xlabel("Episode", fontsize=9)
-
-        fig.suptitle(f"{title} :: {key}", fontsize=13,
-                     fontweight="bold", y=0.995, color=DENIM_BRIGHT)
+        fig.suptitle(f"{title} :: {key}", fontsize=13, fontweight="bold",
+                     y=0.995, color=DENIM_BRIGHT)
         clear_output(wait=True)
         plt.tight_layout(rect=[0, 0, 1, 0.98])
         safe_key = re.sub(r"[^a-zA-Z0-9_]", "_", key)
@@ -694,21 +605,14 @@ def plot_metrics(
 def lap_time(info):
     if info.get('reward_params', {}).get('progress', 0) >= 100:
         if isinstance(info['episode']['t'], np.ndarray):
-            # for vectorized environments
             return info['episode']['t'].mean()
         else:
             return info['episode']['t']
     else:
-        # using in place of float('-inf') for better tensorboard visualizaiton
         return np.nan
 
 
-
 class BSTSLogger:
-    # Best-Speed-Time-Score logger
-    # REF: AWS (2020)TheRayG (2020)
-    # _bsts.record(time_sec, ep_return, reason)  <- called per episode
-    # _bsts.summary()                             <- returns str
     METRIC_KEYS = ["time_sec", "ep_return", "reason",
                    "avg_return", "avg_time", "bsts_score"]
 
@@ -726,7 +630,6 @@ class BSTSLogger:
             self._w.writerow(["episode"] + self.METRIC_KEYS)
 
     def record(self, time_sec, ep_return, reason):
-        # Store episode; compute rolling BSTS = avg_reward / avg_time
         ep = len(self._episodes) + 1
         self._episodes.append((time_sec, ep_return, reason))
         self._returns.append(ep_return)
@@ -752,21 +655,6 @@ class BSTSLogger:
 
 
 class EpisodeMetricsAccumulator:
-    # Accumulates per-step dicts; produces episode summary.
-    # REF: Coulom (2002)Hettiarachchi et al. (2024)
-    #
-    # Physics of braking-distance / perpendicular velocity:
-    #   The agent needs time t_stop = v_perp / a_brake to zero out
-    #   its velocity component perpendicular to the curb/bot/obstacle.
-    #   If t_stop > d_perp / v_perp the agent will collide;
-    #   the reward shaping encodes this as a penalty so the agent
-    #   learns to slow before corners and tight gaps.
-    #
-    # Call sites in run_v5.py:
-    #   sampler.record_step({x,y,heading,speed,...})  <- per step
-    #   sampler.end_episode(progress, ep_return,
-    #                       ep_len, terminated_reason=reason)
-
     def __init__(self):
         self.reset()
 
@@ -800,18 +688,17 @@ class EpisodeMetricsAccumulator:
 
 
 # =============================================================================
-# Integrated from research_modules.py (phased out)
+# Integrated from research_modules.py
 # =============================================================================
 
 from collections import deque
 import random as _random
 
 
-# REF: Fujimoto, S., van Hoof, H., & Meger, D. (2018). Addressing function
-#      approximation error in actor-critic methods. In Proceedings of the
-#      35th International Conference on Machine Learning (ICML) (pp. 1587-1596).
 class ReplayBuffer:
-    """Experience replay buffer for off-policy correction."""
+    """Experience replay buffer for off-policy correction.
+    REF: Fujimoto et al. (2018) TD3. ICML.
+    """
     def __init__(self, cap=200000):
         self.buf = deque(maxlen=cap)
 
@@ -826,10 +713,6 @@ class ReplayBuffer:
         return len(self.buf)
 
 
-# REF: AWS. (2020). DeepRacer log analysis: Bayesian stuck-point tracking.
-#      Amazon Web Services DeepRacer documentation.
-# REF: Kolter, J. Z., & Ng, A. Y. (2009). Near-Bayesian exploration in
-#      polynomial time. In Proceedings of the 26th ICML (pp. 513-520).
 class BSTSTracker:
     """Bayesian Structural Time Series tracker for episode diagnostics."""
     def __init__(self, win=50):
@@ -860,4 +743,3 @@ class BSTSTracker:
             trend=self.trend(),
             events=len(self.events),
         )
-
