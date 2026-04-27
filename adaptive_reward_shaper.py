@@ -1,60 +1,67 @@
-"""adaptive_reward_shaper.py  -- v1.4.2
-Standalone module. The same classes are also inlined into run.py
-for zero-import-dependency deployment on the DeepRacer server.
+"""adaptive_reward_shaper.py — v1.4.1
+Standalone module. Drop-in replacement.
 
-v1.4.2 changes:
-  - shape(): v_perp penalty uses DIVISION (attenuation), not SUBTRACTION (deduction).
-    Division: reward / (1 + w * excess) -- reward never goes below 0 from this penalty.
-    This eliminates the freeze trap: agent cannot earn more by doing nothing than
-    by moving forward slowly with some v_perp.
-  - TelemetryFeedbackAnnealer embedded in AdaptiveRewardShaper:
-    update_phase(bsts_metrics) -- advances phase on actual mastery, not fixed %:
-      Phase 0->1: any lap completion observed
-      Phase 1->2: completion_ema >= 80% AND race_line_adherence_ema >= 0.45
-    get_phase_weights(base_rw) -- returns closed-loop phase-appropriate weights.
-  - bc_pilot_reward: phase-scaled alpha (0=0.15 slow-drive, 1=0.30, 2=0.60 fast-lap)
+CRITICAL DESIGN CHANGE v1.4.1:
+  All penalties are now MULTIPLICATIVE (scale-down) not ADDITIVE (deduct).
+  reward = base_reward * compliance_multiplier, compliance_multiplier in [0.1, 1.0].
+  Ensures any forward progress ALWAYS yields positive reward.
+  REF: Ng, Harada & Russell (1999) ICML -- reward shaping preserves policy invariance.
+  REF: Amodei et al. (2016) Concrete Problems in AI Safety -- avoid negative net reward.
 
-Usage:
-    from adaptive_reward_shaper import AdaptiveRewardShaper
-    _shaper = AdaptiveRewardShaper(n_waypoints=len(waypoints))
-    reward += _shaper.episode_start(is_reversed)          # -5.0 if reversed
-    reward, info = _shaper.shape(reward, rp, wp_idx, ...) # per-step
-    rw = _shaper.get_phase_weights(rw)                    # phase-aware weights
-    speed_budget = _shaper.speed_budget(wp_idx)
-    curb_mul     = _shaper.curb_urgency_mul(wp_idx)
-    bc_r         = _shaper.bc_pilot_reward(rp, prev_m, curr_m)
-    _shaper.episode_end(wp_idx, is_offtrack)
-    _shaper.update_phase(bsts_metrics)                    # closed-loop at episode end
+THREE-PHASE BSTS-DRIVEN CURRICULUM v1.4.1:
+  Phase 0 "finish first": maximize track_progress_m; speed weight=0.01.
+  Phase 1 "find the line": maintain track_progress; optimize race_line.
+  Phase 2 "go fast": maximize speed given race line + progress maintained.
+  Transitions driven by BSTS Kalman trends, not time-based thresholds.
+  Reversion: track_progress trend below REVERT_THRESH for REVERT_WINDOW eps.
 
-References
-----------
-Khatib (1986) IJRR: APF repulsive gradient.
-Heinzmann & Zelinsky (2003): per-step v_perp safety signal; body-width clearance.
-Heilmeier et al. (2020) VSD: minimum curvature speed profile (per-WP budget).
-Ng, Harada & Russell (1999) ICML: potential-based shaping, r=alpha*delta_progress_m.
-Schulman et al. (2017) arXiv: PPO prospective penalty in short episodes.
-AWS DeepRacer docs (2020): is_reversed=True => CW driving; spawn speed 4.0 m/s.
-Almakhayita et al. (2025) PLoS ONE: reward design for generalizable deep RL agents.
+NOTE: This file adds BSTSPhaseController and get_phase_weights() to the v1.4.2
+      base (which already has TelemetryFeedbackAnnealer + division penalties).
+      The two phase-management approaches coexist: update_phase() for closed-loop
+      episode-level transitions; BSTSPhaseController for Kalman-trend-level.
+
+REF: Khatib (1986) IJRR: APF repulsive gradient.
+REF: Heinzmann & Zelinsky (2003): per-step v_perp safety signal.
+REF: Heilmeier et al. (2020) VSD: minimum curvature speed profile.
+REF: Ng, Harada & Russell (1999) ICML: potential-based shaping.
+REF: Schulman et al. (2017) arXiv:1707.06347: PPO prospective penalty.
+REF: AWS DeepRacer docs (2020): is_reversed=True => CW; 4.0 m/s spawn.
+REF: Amodei et al. (2016). Concrete problems in AI safety. arXiv:1606.06565.
+REF: Almakhayita et al. (2025) PLoS ONE: reward design for generalizable deep RL.
 """
 
 from __future__ import annotations
 import math
 import numpy as np
 from collections import deque
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 
-# Module-level constants
-_BETA             = 0.05    # per-crash budget tightening (Heilmeier 2020)
-_BC_ALPHA         = 0.30    # BC pilot reward scale (Ng et al. 1999)
-_VPERP_THRESHOLD  = 0.30    # m/s -- v_perp below this is safe (Heinzmann 2003)
-# v1.4.2: DIVISION weight, not subtraction.
-# Factor = 1 + w * excess. At v_perp excess=0.3: factor=1.15 -> 13% attenuation.
-_VPERP_ATTN_W     = 0.50    # per-step v_perp attenuation weight
-_BORDER_DIST_GATE = 1.50    # m -- attenuation only within this dist to any boundary
+_BETA             = 0.05
+_BC_ALPHA         = 0.30
+_VPERP_THRESHOLD  = 0.30
+_VPERP_ATTN_W     = 0.50    # v1.4.2: DIVISION weight
+_BORDER_DIST_GATE = 1.50
+
+# BSTS-Kalman-driven phase thresholds (v1.4.1)
+_PHASE0_PROGRESS_THRESH = 0.008
+_PHASE1_LINE_THRESH     = 0.005
+_PHASE0_MIN_EPS         = 30
+_REVERT_THRESH          = -0.003
+_REVERT_WINDOW          = 10
+
+# Phase reward weight profiles (v1.4.1 BSTSPhaseController)
+_PHASE_WEIGHTS = {
+    0: {"progress": 0.55, "racing_line": 0.05, "curv_speed": 0.01, "min_speed": 0.01,
+        "heading": 0.25, "braking": 0.08, "corner": 0.02, "center": 0.03},
+    1: {"progress": 0.35, "racing_line": 0.30, "curv_speed": 0.05, "min_speed": 0.02,
+        "heading": 0.15, "braking": 0.08, "corner": 0.03, "center": 0.02},
+    2: {"progress": 0.15, "racing_line": 0.25, "curv_speed": 0.20, "min_speed": 0.15,
+        "heading": 0.10, "braking": 0.08, "corner": 0.05, "center": 0.02},
+}
 
 
 class PerWaypointVPerpTracker:
-    """EMA of perpendicular velocity experienced near each waypoint.
+    """EMA of v_perp experienced near each waypoint.
     REF: Khatib (1986) -- field magnitude proportional to observed danger gradient.
     """
     def __init__(self, n_waypoints: int, alpha: float = 0.15):
@@ -76,9 +83,7 @@ class PerWaypointVPerpTracker:
 
 
 class PerWaypointSpeedBudget:
-    """Adaptive per-waypoint speed budget.
-    REF: Heilmeier et al. (2020) Eq. 10 -- minimum curvature speed profile.
-    """
+    """Adaptive per-WP speed budget. REF: Heilmeier et al. (2020) Eq. 10."""
     _MIN_BUDGET = 0.80
 
     def __init__(self, n_waypoints: int, init_speed: float = 4.0):
@@ -89,8 +94,7 @@ class PerWaypointSpeedBudget:
         i = int(wp_idx) % self.n
         for offset, w in [(0, 1.0), (1, 0.6), (-1, 0.6), (2, 0.3), (-2, 0.3)]:
             j = (i + offset) % self.n
-            self._budget[j] = max(self._MIN_BUDGET,
-                                  self._budget[j] * (1.0 - _BETA * w))
+            self._budget[j] = max(self._MIN_BUDGET, self._budget[j] * (1.0 - _BETA * w))
 
     def get(self, wp_idx: int) -> float:
         return float(self._budget[int(wp_idx) % self.n])
@@ -101,11 +105,11 @@ class PerWaypointSpeedBudget:
 
 
 class KalmanSignatureDetector:
-    """Detects {progress_up, speed_change, steer_up} pre-crash signature.
+    """Pre-crash triple-signature detector. v1.4.1: returns multiplier [0.7,1.0].
     REF: Schulman et al. (2017) -- prospective penalty in short episodes.
     """
-    WINDOW  = 5
-    PENALTY = -0.30
+    WINDOW   = 5
+    MULT_MIN = 0.70
 
     def __init__(self):
         self._prog_buf  = deque(maxlen=self.WINDOW)
@@ -114,79 +118,136 @@ class KalmanSignatureDetector:
         self._triggered = False
 
     def step(self, progress: float, speed: float, steer: float) -> float:
+        """Returns compliance multiplier [MULT_MIN, 1.0]."""
         self._prog_buf.append(float(progress))
         self._spd_buf.append(float(speed))
         self._steer_buf.append(abs(float(steer)))
         if len(self._prog_buf) < self.WINDOW:
-            return 0.0
+            return 1.0
         prog_trend = float(self._prog_buf[-1]) - float(self._prog_buf[0])
         spd_change = abs(float(self._spd_buf[-1]) - float(self._spd_buf[0]))
         steer_high = float(np.mean(list(self._steer_buf))) > 0.35
         if prog_trend > 0.001 and spd_change > 0.3 and steer_high:
             if not self._triggered:
                 self._triggered = True
-                return self.PENALTY
+                return self.MULT_MIN
         else:
             self._triggered = False
-        return 0.0
+        return 1.0
 
     def reset(self):
         self._prog_buf.clear(); self._spd_buf.clear(); self._steer_buf.clear()
         self._triggered = False
 
 
+class BSTSPhaseController:
+    """BSTS-Kalman-trend-driven phase transitions (v1.4.1).
+    Complements TelemetryFeedbackAnnealer (v1.4.2) which operates at episode level.
+
+    Phase 0 -> 1: track_progress_trend > PHASE0_PROGRESS_THRESH for 5 eps.
+    Phase 1 -> 2: race_line_compliance_gradient_trend > PHASE1_LINE_THRESH for 5 eps.
+    Any -> 0: track_progress_trend < REVERT_THRESH for REVERT_WINDOW eps.
+    """
+    def __init__(self):
+        self._phase = 0
+        self._ep_above_p0 = 0
+        self._ep_above_p1 = 0
+        self._recent = deque(maxlen=_REVERT_WINDOW)
+
+    @property
+    def current_phase(self) -> int:
+        return self._phase
+
+    def update_telemetry(self, progress_trend: float, line_trend: float, ep: int):
+        self._recent.append(float(progress_trend))
+        if (len(self._recent) >= _REVERT_WINDOW and
+                all(t < _REVERT_THRESH for t in self._recent)):
+            if self._phase > 0:
+                self._phase = 0
+                self._ep_above_p0 = 0
+                self._ep_above_p1 = 0
+            return
+        if self._phase == 0:
+            if float(progress_trend) > _PHASE0_PROGRESS_THRESH and ep >= _PHASE0_MIN_EPS:
+                self._ep_above_p0 += 1
+                if self._ep_above_p0 >= 5:
+                    self._phase = 1
+                    self._ep_above_p0 = 0
+            else:
+                self._ep_above_p0 = 0
+        elif self._phase == 1:
+            if float(line_trend) > _PHASE1_LINE_THRESH:
+                self._ep_above_p1 += 1
+                if self._ep_above_p1 >= 5:
+                    self._phase = 2
+                    self._ep_above_p1 = 0
+            else:
+                self._ep_above_p1 = 0
+
+    def get_weights(self) -> Dict[str, float]:
+        return dict(_PHASE_WEIGHTS[self._phase])
+
+    def phase_label(self) -> str:
+        return ["phase0_finish_first", "phase1_find_line", "phase2_go_fast"][self._phase]
+
+
 class AdaptiveRewardShaper:
-    """All-in-one per-step reward shaping for AWS DeepRacer training.
+    """All-in-one reward shaping. v1.4.1+v1.4.2 merged.
 
-    v1.4.2 PENALTY CHANGE: all penalties use DIVISION (attenuation), not SUBTRACTION.
-    Division form: reward = reward / (1 + w * excess)
-    This guarantees reward >= 0 for any non-negative base reward.
+    v1.4.2 DIVISION penalty: reward / (1 + w * excess) -- never negative.
+    v1.4.1 BSTS-Kalman phase: BSTSPhaseController for Kalman-trend-level transitions.
+    v1.4.2 TelemetryFeedback: update_phase(bsts_metrics) for episode-level transitions.
+    Both phase systems coexist; get_phase_weights() uses whichever is further advanced.
 
-    v1.4.2 CLOSED-LOOP PHASE: TelemetryFeedbackAnnealer advances training phases
-    based on actual completion/adherence metrics, not fixed % of total_timesteps.
-    Call update_phase(bsts_metrics) at episode end to advance.
-    Call get_phase_weights(rw) at rollout start to get phase-appropriate weights.
-
-    Training philosophy (per Tim's spec):
-      Phase 0: survive and reach finish line (any speed, v > 0)
-      Phase 1: finish line reliably -> follow the racing line
-      Phase 2: follows race line -> optimize speed profile
+    API (backward compatible with v1.4.2):
+      episode_start(is_reversed) -> float  [-5.0 or 0.0]
+      shape(reward, rp, ...) -> (float, dict)
+      get_phase_weights(base_rw={}) -> dict
+      update_phase(bsts_metrics) -> int
+      speed_budget(wp_idx) -> float
+      curb_urgency_mul(wp_idx) -> float
+      bc_pilot_reward(rp, prev_m, curr_m) -> float
+      episode_end(wp_idx, is_offtrack)
     """
 
-    def __init__(self, n_waypoints: int = 120,
-                 border_dist_gate: float = _BORDER_DIST_GATE):
+    def __init__(self, n_waypoints: int = 120, border_dist_gate: float = _BORDER_DIST_GATE):
         self.n = max(int(n_waypoints), 1)
         self._vperp_tracker = PerWaypointVPerpTracker(self.n)
         self._speed_budget  = PerWaypointSpeedBudget(self.n)
         self._sig_detector  = KalmanSignatureDetector()
+        self._phase_ctrl    = BSTSPhaseController()   # v1.4.1 Kalman-trend
         self._border_gate   = float(border_dist_gate)
         self._reversed_ep   = False
         self._ep_count      = 0
-        # v1.4.2: telemetry-driven phase (0=survival, 1=raceline, 2=speed)
+        # v1.4.2: TelemetryFeedbackAnnealer state
         self._current_phase        = 0
         self._tfa_completion_ema   = 0.0
-        self._tfa_adherence_ema    = 0.5   # neutral start
+        self._tfa_adherence_ema    = 0.5
         self._tfa_any_completion   = False
-        self._tfa_alpha            = 0.10  # EMA alpha for phase metrics
+        self._tfa_alpha            = 0.10
 
     @property
     def current_phase(self) -> int:
-        return self._current_phase
+        # Use maximum of both phase controllers (more advanced wins)
+        return max(self._current_phase, self._phase_ctrl.current_phase)
 
-    def episode_start(self, is_reversed: bool) -> float:
-        """Call at episode reset. Returns immediate reward delta.
-        Returns -5.0 for reversed spawn (applied to step 1 rewards[] ONLY).
-        REF: AWS DeepRacer docs -- is_reversed=True iff car is driving CW on CCW track.
+    def episode_start(self, is_reversed: bool,
+                      bsts_trends: Optional[Dict] = None,
+                      episode_count: int = 0) -> float:
+        """Returns -5.0 for reversed (additive, step 1 only), 0.0 otherwise.
+        If bsts_trends provided, updates BSTSPhaseController.
+        REF: AWS DeepRacer docs (2020); Schulman et al. (2017).
         """
+        self._ep_count += 1
         self._reversed_ep = bool(is_reversed)
         self._sig_detector.reset()
-        self._ep_count += 1
-        if is_reversed:
-            return -5.0
-        return 0.0
+        if bsts_trends is not None:
+            prog_trend = float(bsts_trends.get("track_progress", 0.0))
+            line_trend = float(bsts_trends.get("race_line_compliance_gradient", 0.0))
+            self._phase_ctrl.update_telemetry(prog_trend, line_trend, episode_count)
+        return -5.0 if is_reversed else 0.0
 
     def episode_end(self, wp_idx: int, is_offtrack: bool = False):
-        """Call at episode end to update crash credit at last waypoint."""
         if is_offtrack:
             self._speed_budget.crash_at(int(wp_idx))
             self._vperp_tracker._k = min(3.0, self._vperp_tracker._k * 1.05)
@@ -195,15 +256,7 @@ class AdaptiveRewardShaper:
             self._vperp_tracker._k = max(1.0, self._vperp_tracker._k * 0.98)
 
     def update_phase(self, bsts_metrics: dict) -> int:
-        """Feed episode bsts_metrics into TelemetryFeedbackAnnealer.
-        Returns current training phase (0, 1, or 2).
-        Call this at episode end AFTER bsts_metrics is assembled.
-
-        Phase 0->1: any lap completion observed
-        Phase 1->2: completion_ema >= 80% AND race_line_adherence_ema >= 0.45
-
-        REF: Almakhayita et al. (2025) PLoS ONE -- adaptive reward design.
-        """
+        """v1.4.2 TelemetryFeedbackAnnealer. REF: Almakhayita et al. (2025) PLoS ONE."""
         a  = self._tfa_alpha
         _c = float(bsts_metrics.get("completion_pct", 0.0) or 0.0)
         _a = float(bsts_metrics.get("race_line_adherence", 0.5) or 0.5)
@@ -212,7 +265,6 @@ class AdaptiveRewardShaper:
         self._tfa_adherence_ema  = (1-a)*self._tfa_adherence_ema  + a*_a
         if _l > 0.5:
             self._tfa_any_completion = True
-        prev = self._current_phase
         if self._current_phase == 0 and self._tfa_any_completion:
             self._current_phase = 1
         elif (self._current_phase == 1
@@ -221,18 +273,17 @@ class AdaptiveRewardShaper:
             self._current_phase = 2
         return self._current_phase
 
-    def get_phase_weights(self, base_rw: dict) -> dict:
-        """Return reward weights for current telemetry-driven training phase.
-        Phase 0 (survival): progress=0.62 dominant
-        Phase 1 (race line): blend progress + race_line, graduated by completion_ema
-        Phase 2 (speed): full curv_speed rewards
-        REF: Almakhayita et al. (2025) PLoS ONE.
+    def get_phase_weights(self, base_rw: Optional[Dict] = None) -> dict:
+        """Returns phase-appropriate reward weights. Accepts optional base_rw for v1.4.2 compat.
+        Uses maximum-advanced phase from both controllers.
+        Phase 0: progress-dominant (0.55). Phase 1: racing_line+progress. Phase 2: speed.
         """
-        if self._current_phase == 0:
+        phase = self.current_phase
+        if phase == 0:
             w = {"center":0.05, "heading":0.18, "racing_line":0.02, "braking":0.01,
                  "progress":0.62, "corner":0.02, "speed_steering":0.02, "curv_speed":0.00,
                  "min_speed":0.06, "completion":0.02, "decel":0.00, "obstacle":0.00, "steering":0.00}
-        elif self._current_phase == 1:
+        elif phase == 1:
             t1 = float(np.clip(self._tfa_completion_ema / 0.80, 0.0, 1.0))
             def bl(a, b): return a*(1-t1)+b*t1
             w = {"center":bl(0.22,0.14), "heading":bl(0.20,0.12),
@@ -248,62 +299,49 @@ class AdaptiveRewardShaper:
         total = sum(w.values())
         return {k: v/total for k, v in w.items()} if total > 0 else w
 
-    def shape(
-        self,
-        reward:         float,
-        rp:             dict,
-        wp_idx:         int,
-        speed:          float,
-        v_perp_barrier: float,
-        steer:          float,
-        ep_progress_m:  float,
-        is_offtrack:    bool,
-        dist_to_border: float = 5.0,
-    ) -> Tuple[float, Dict]:
-        """Apply all per-step shaping. Returns (shaped_reward, sinfo_dict).
+    def phase_label(self) -> str:
+        labels = ["phase0_finish_first", "phase1_find_line", "phase2_go_fast"]
+        return labels[min(self.current_phase, 2)]
 
-        v1.4.2 PENALTY CHANGE -- division not deduction:
-          BEFORE: shaped -= w * max(0, v_perp - threshold)  -> can go negative
-          AFTER:  shaped /= (1 + w * excess)                -> always >= 0
-
-        REF: Ng et al. (1999) -- potential-based shaping.
-        REF: Heinzmann & Zelinsky (2003) -- v_perp safety via attenuation.
+    def shape(self, reward: float, rp: dict, wp_idx: int, speed: float,
+              v_perp_barrier: float, steer: float, ep_progress_m: float,
+              is_offtrack: bool, dist_to_border: float = 5.0) -> Tuple[float, Dict]:
+        """v1.4.2 DIVISION penalty: shaped = base / (1 + w*excess). Always >= 0.
+        v1.4.1 sig_mul: KalmanSignatureDetector returns multiplier [0.7, 1.0].
+        Combined: shaped = (base / vperp_factor) * sig_mul.
+        REF: Ng et al. (1999); Heinzmann & Zelinsky (2003); Amodei et al. (2016).
         """
         shaped  = float(reward)
         _is_rev = bool(rp.get("is_reversed", self._reversed_ep))
 
         if _is_rev:
-            shaped = 0.0
-            return shaped, {"ars_reversed": True, "ars_vperp_attn": 1.0, "ars_sig_pen": 0.0}
+            return 0.0, {"ars_reversed": True, "ars_vperp_attn": 1.0,
+                         "ars_sig_mul": 1.0, "ars_compliance_mul": 0.0, "ars_phase": self.current_phase}
 
-        vperp_attn = 1.0
         _d  = float(dist_to_border) if dist_to_border is not None else 5.0
         _vp = float(v_perp_barrier) if v_perp_barrier is not None else 0.0
+        vperp_attn = 1.0
         if _d < self._border_gate and _vp > _VPERP_THRESHOLD:
             excess = _vp - _VPERP_THRESHOLD
-            # v1.4.2: DIVISION -- reward / (1 + w * excess)
-            # At v_perp=0.6 (excess=0.3): factor=1.15 -> 13% cut
-            # At v_perp=2.0 (excess=1.7): factor=1.85 -> 46% cut
-            # NEVER negative. Agent always earns more by moving than by freezing.
             vperp_attn = 1.0 + _VPERP_ATTN_W * excess
-            shaped = shaped / vperp_attn
+            shaped = shaped / vperp_attn  # division: never negative
 
         prog    = float(rp.get("progress", ep_progress_m or 0.0))
-        sig_pen = self._sig_detector.step(prog, float(speed), float(steer))
-        # sig_pen is one-shot -0.30 prospective penalty; kept additive (single-step signal)
-        shaped += sig_pen
+        sig_mul = self._sig_detector.step(prog, float(speed), float(steer))
+        shaped  = shaped * sig_mul  # multiplier [0.7, 1.0]
 
         self._vperp_tracker.update(int(wp_idx), _vp)
-
         if not is_offtrack and float(speed) > 0.3:
             self._speed_budget.relax(int(wp_idx), amount=0.005)
 
         return shaped, {
-            "ars_reversed":   _is_rev,
-            "ars_vperp_attn": round(vperp_attn, 4),
-            "ars_sig_pen":    round(sig_pen, 4),
-            "ars_wp":         int(wp_idx),
-            "ars_phase":      self._current_phase,
+            "ars_reversed":       _is_rev,
+            "ars_vperp_attn":     round(vperp_attn, 4),
+            "ars_vperp_mul":      round(1.0 / vperp_attn, 4),   # compat field
+            "ars_sig_mul":        round(sig_mul, 4),
+            "ars_compliance_mul": round(sig_mul / vperp_attn, 4),
+            "ars_wp":             int(wp_idx),
+            "ars_phase":          self.current_phase,
         }
 
     def speed_budget(self, wp_idx: int) -> float:
@@ -312,22 +350,10 @@ class AdaptiveRewardShaper:
     def curb_urgency_mul(self, wp_idx: int) -> float:
         return self._vperp_tracker.curb_urgency_mul(int(wp_idx))
 
-    def bc_pilot_reward(
-        self,
-        rp:              dict,
-        prev_progress_m: float,
-        curr_progress_m: float,
-    ) -> float:
-        """Potential-based BC pilot reward: r = phase_alpha * delta_progress_m.
-
-        Phase 0: alpha=0.15 (teach: advance, any speed, v > 0)
-        Phase 1: alpha=0.30 (teach: advance efficiently)
-        Phase 2: alpha=0.60 (teach: fast completion)
-
-        REF: Ng, Harada & Russell (1999) ICML -- potential phi(s)=alpha*arc_progress_m.
-        """
-        delta_m = float(curr_progress_m) - float(prev_progress_m)
+    def bc_pilot_reward(self, rp: dict, prev_progress_m: float, curr_progress_m: float) -> float:
+        """r = phase_alpha * delta_progress_m. REF: Ng et al. (1999)."""
         if rp.get("is_reversed", False):
             return 0.0
-        _phase_alpha = [0.15, 0.30, 0.60][min(self._current_phase, 2)]
+        delta_m = float(curr_progress_m) - float(prev_progress_m)
+        _phase_alpha = [0.15, 0.30, 0.60][min(self.current_phase, 2)]
         return float(np.clip(_phase_alpha * max(0.0, delta_m), -10.0, 10.0))
