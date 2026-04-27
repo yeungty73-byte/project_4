@@ -1,83 +1,78 @@
 """
-Unified reward function for DeepRacer P4.
-Works across time-trial, obstacle-avoidance, and head-to-bot.
-Params reference: https://docs.aws.amazon.com/deepracer/latest/developerguide/deepracer-reward-function-reference.html
+configs/reward_function.py
+Default reward function for DeepRacer P4 — passed as DEFAULT_REWARD_FUNCTION
+into DeepracerGymEnv.  This fires INSIDE env.step() via the gym adapter.
+
+IMPORTANT (v1.1.2 audit):
+  run.py computes its own shaped reward independently (AnnealingScheduler +
+  compute_reward()).  To avoid a dual-reward signal, make_environment() in
+  utils.py now passes reward_function=_identity_reward so that env.step()
+  returns reward=1.0 (neutral) and run.py's shaped reward is the ONLY signal.
+
+  This file is kept as reference / fallback for standalone eval runs that do
+  NOT go through run.py (e.g. jupyter notebooks, demo()).
+
+Params reference:
+  https://docs.aws.amazon.com/deepracer/latest/developerguide/deepracer-reward-function-reference.html
 """
 
-def reward_function(params):
-    # ---- unpack ----
-    track_width      = params["track_width"]
-    distance_center  = params["distance_from_center"]
-    all_wheels_on    = params["all_wheels_on_track"]
-    speed            = params["speed"]
-    steering_abs     = abs(params["steering_angle"])
-    progress         = params["progress"]
-    steps            = params["steps"]
-    is_offtrack      = params["is_offtrack"]
-    is_crashed       = params["is_crashed"]
-    is_reversed      = params["is_reversed"]
 
-    # ---- terminal penalties ----
+def reward_function(params):
+    """Unified reward: TT / OA / H2B compatible."""
+    track_width     = params["track_width"]
+    distance_center = params["distance_from_center"]
+    all_wheels_on   = params["all_wheels_on_track"]
+    speed           = params["speed"]
+    steering_abs    = abs(params["steering_angle"])
+    progress        = params["progress"]
+    steps           = params["steps"]
+    is_offtrack     = params["is_offtrack"]
+    is_crashed      = params["is_crashed"]
+
     if is_offtrack or is_crashed:
         return 1e-3
 
-    # ---- centerline reward (Gaussian) ----
-    marker_1 = 0.1 * track_width
-    marker_2 = 0.25 * track_width
-    marker_3 = 0.5 * track_width
-    if distance_center <= marker_1:
+    # Centerline (Gaussian bands)
+    m1, m2, m3 = 0.1 * track_width, 0.25 * track_width, 0.5 * track_width
+    if distance_center <= m1:
         center_reward = 1.0
-    elif distance_center <= marker_2:
+    elif distance_center <= m2:
         center_reward = 0.5
-    elif distance_center <= marker_3:
+    elif distance_center <= m3:
         center_reward = 0.1
     else:
         center_reward = 1e-3
 
-    # ---- speed reward (encourage fast driving) ----
-    SPEED_THRESHOLD_LOW = 1.0
-    SPEED_THRESHOLD_HIGH = 3.0
-    if speed < SPEED_THRESHOLD_LOW:
+    # Speed
+    if speed < 1.0:
         speed_reward = 0.5
-    elif speed < SPEED_THRESHOLD_HIGH:
-        speed_reward = 0.5 + 0.5 * (speed - SPEED_THRESHOLD_LOW) / (SPEED_THRESHOLD_HIGH - SPEED_THRESHOLD_LOW)
+    elif speed < 3.0:
+        speed_reward = 0.5 + 0.5 * (speed - 1.0) / 2.0
     else:
         speed_reward = 1.0
 
-    # ---- steering penalty (high speed + high steer = bad) ----
-    if steering_abs > 15.0:
-        steer_penalty = 0.8
-    else:
-        steer_penalty = 1.0
+    # Steering penalty
+    steer_penalty = 0.8 if steering_abs > 15.0 else 1.0
 
-    # ---- progress bonus (scaled by efficiency) ----
-    if steps > 0:
-        progress_bonus = (progress / 100.0) * 2.0
-    else:
-        progress_bonus = 0.0
-
-    # ---- lap completion bonus ----
+    # Progress
+    progress_bonus = (progress / 100.0) * 2.0 if steps > 0 else 0.0
     if progress >= 99.9:
         progress_bonus += 10.0
 
-    # ---- heading alignment (smooth cornering) ----
-    heading_reward = 1.0 - (steering_abs / 30.0)
-    heading_reward = max(heading_reward, 0.0)
+    # Heading alignment
+    heading_reward = max(1.0 - (steering_abs / 30.0), 0.0)
 
-    # ---- obstacle / bot awareness via LIDAR (if present) ----
-    # The reward function doesn't directly receive LIDAR,
-    # but closest_objects and objects_* params exist for obstacles
+    # Obstacle/bot proximity
     obstacle_bonus = 0.0
-    if "objects_distance" in params and params.get("objects_distance"):
-        closest_dist = min(params["objects_distance"]) if params["objects_distance"] else 999
+    if params.get("objects_distance"):
+        closest_dist = min(params["objects_distance"])
         if closest_dist < 0.5:
-            obstacle_bonus = -0.5  # too close
+            obstacle_bonus = -0.5
         elif closest_dist < 1.0:
-            obstacle_bonus = 0.0   # caution zone
+            obstacle_bonus = 0.0
         else:
-            obstacle_bonus = 0.2   # safe margin
+            obstacle_bonus = 0.2
 
-    # ---- combine ----
     reward = (
         center_reward * 1.5
         + speed_reward * 1.0
@@ -86,5 +81,11 @@ def reward_function(params):
         + progress_bonus
         + obstacle_bonus
     )
-
     return float(max(reward, 1e-3))
+
+
+def _identity_reward(params):  # noqa: N802
+    """Neutral pass-through — used by make_environment() in training mode.
+    run.py computes its own shaped reward; the gym env just needs to return
+    something non-zero so RecordEpisodeStatistics doesn't NaN."""
+    return 1.0
