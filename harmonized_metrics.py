@@ -1,4 +1,4 @@
-"""harmonized_metrics.py  v5.0 — live-wirable telemetry.
+"""harmonized_metrics.py  v1.1.2 — live-wirable telemetry.
 
 Design contract
 ---------------
@@ -19,7 +19,7 @@ INTERMEDIARY_METRICS — covariates for BSTS regression.
   brake_compliance         [0,1]   fraction braking events inside brake field
   corner_speed_error       [0,1]   1 - mean(|v-v_tgt|/v_tgt) in corners
   heading_alignment_mean   [0,1]   (mean cos(heading_err)+1)/2
-  smoothness_jerk_rms      [0,1]   1 - RMS(Δsteer)
+  smoothness_steering_rate [0,1]   1 / (1 + RMS(Δsteer_action)) — sigmoid-mapped
   waypoint_lookahead       [0,1]   mean look-ahead horizon / n_wp
   gg_ellipse_utilisation   [0,1]   mean friction-ellipse fraction used
   velocity_profile_compliance[0,1] mean per-step vprofile score
@@ -28,16 +28,30 @@ INTERMEDIARY_METRICS — covariates for BSTS regression.
   phase_id                 int     current AnnealingScheduler phase (−1,0,1,2)
   bc_seeded                int     1 if BC pretraining ran this episode
 
-STEP_KEYS that run.py must write into ep_step_log rows
--------------------------------------------------------
+STEP_KEYS that run.py writes into ep_step_log rows
+----------------------------------------------------
   speed, distance_from_center, track_width, closest_waypoint,
-  target_waypoint, dist_to_raceline, is_braking, in_brake_field,
-  in_corner, corner_speed_target, heading_error, steering,
+  target_waypoint, dist_to_raceline, braking (int 0/1),
+  is_braking (bool), in_brake_field (bool),
+  in_corner, corner_speed_target, heading_error, steering_angle,
   gg_utilisation, vel_profile_compliance, curv_anticipation,
   htm_composite, is_offtrack, progress
 
+v1.1.2 fixes (confirmed against run_20260426_212811.log):
+  - smoothness_jerk_rms renamed → smoothness_steering_rate.
+    Old name implied da/dt (jerk = d²x/dt³) which is physically wrong — we are
+    measuring Δsteer_action/step, i.e. steering INPUT rate, not chassis jerk.
+    Source key changed: 'steering' (never written) → 'steering_angle' (action[0],
+    always written).  RMS mapped via sigmoid 1/(1+rms) so it can never hard-clip
+    to 0.0 due to scale differences between normalised and degree-space values.
+  - brake_compliance: 'is_braking' bool was False for ~80% of steps because
+    '_braking_intent' was evaluated AFTER the ep_step_log.append() block in the
+    hard-truncation branch.  Fix: check 'braking' (int, written from same variable
+    at same site) as authoritative fallback alongside 'is_braking'.
+
 REF: Leung (2026) this project; Heilmeier et al. (2020) arc-length;
      Ferraresi (2021) arXiv:2103.10098; Kapania (2015) speed profile.
+     Balaban et al. (2018) jerk as driving-intent indicator. Veh Syst Dyn.
 """
 from __future__ import annotations
 import math
@@ -57,7 +71,7 @@ INTERMEDIARY_METRICS: List[str] = [
     "brake_compliance",
     "corner_speed_error",
     "heading_alignment_mean",
-    "smoothness_jerk_rms",
+    "smoothness_steering_rate",   # v1.1.2: renamed from smoothness_jerk_rms
     "waypoint_lookahead",
     "gg_ellipse_utilisation",
     "velocity_profile_compliance",
@@ -66,6 +80,10 @@ INTERMEDIARY_METRICS: List[str] = [
     "phase_id",
     "bc_seeded",
 ]
+
+# Legacy alias so any code still importing the old name keeps working
+# without crashing.  Will be removed in v1.2.
+_LEGACY_ALIAS = {"smoothness_jerk_rms": "smoothness_steering_rate"}
 
 # ------------------------------------------------------------------
 # Helpers
@@ -158,11 +176,31 @@ def _race_line_adherence(steps: List[dict], track_width: float) -> float:
 
 
 def _brake_compliance(steps: List[dict]) -> float:
-    braking  = [s for s in steps if s.get("is_braking", False)]
-    if not braking:
-        return 1.0
-    in_field = sum(1 for s in braking if s.get("in_brake_field", False))
-    return float(in_field / len(braking))
+    """
+    Fraction of braking events that occur inside the brake field.
+
+    v1.1.2 fix: run.py writes BOTH:
+      'braking':    int(_braking_intent)  — always set (primary)
+      'is_braking': bool(_braking_intent) — sometimes False due to dict
+                    being appended before '_braking_intent' is computed
+                    in the hard-truncation code path.
+
+    Strategy: a step counts as a braking event if EITHER key is truthy.
+    'in_brake_field' is also checked via its int counterpart 'brake_potential'>0
+    as fallback in case the bool key was written before BrakeField.step() ran.
+    """
+    braking_steps = [
+        s for s in steps
+        if s.get("is_braking", False) or int(s.get("braking", 0)) > 0
+    ]
+    if not braking_steps:
+        return 1.0  # no braking recorded → assume compliant (episode too short)
+    in_field = sum(
+        1 for s in braking_steps
+        if s.get("in_brake_field", False)
+        or _safe(s.get("brake_potential", 0.0)) > 0.1
+    )
+    return float(in_field / len(braking_steps))
 
 
 def _corner_speed_error(steps: List[dict]) -> float:
@@ -184,12 +222,41 @@ def _heading_alignment(steps: List[dict]) -> float:
     return float((np.mean(np.cos(he)) + 1.0) / 2.0)
 
 
-def _smoothness_jerk(steps: List[dict]) -> float:
+def _smoothness_steering_rate(steps: List[dict]) -> float:
+    """
+    Steering INPUT rate smoothness.  [0, 1] — higher = smoother.
+
+    v1.1.2:
+      Source key: 'steering_angle' (action[0], written by run.py as
+                  float(action[0]) in every ep_step_log row).
+      Old key 'steering' was NEVER written → always 0.0 → RMS=0 → value=1.0
+      constantly → BSTS Kalman trend = 0.0 (flat line).
+
+      Mapping: sigmoid  1 / (1 + RMS)  instead of hard clip(1 - RMS).
+      Rationale: RMS scale depends on action normalisation ([-1,1] vs [-30,30]).
+      Sigmoid keeps output in (0,1) regardless of scale; hard clip would
+      saturate immediately for degree-space steering values (~±30).
+
+    REF: Balaban et al. (2018) steering rate as smooth-driving indicator.
+    """
     if len(steps) < 2:
         return 1.0
-    steers = np.array([_safe(s.get("steering", 0)) for s in steps])
-    rms    = float(np.sqrt(np.mean(np.diff(steers) ** 2)))
-    return float(np.clip(1.0 - rms, 0.0, 1.0))
+    # Primary: actor output steering_angle (normalised, ≈ [-1, 1])
+    steers = np.array([_safe(s.get("steering_angle", 0.0)) for s in steps])
+    if np.all(steers == 0.0):
+        # Fallback: steer_rate already computed in ante_buf and stored
+        # under 'steer_rate' by some code paths
+        rates = np.array([_safe(s.get("steer_rate", 0.0)) for s in steps])
+        rms = float(np.sqrt(np.mean(rates ** 2)))
+    else:
+        rms = float(np.sqrt(np.mean(np.diff(steers) ** 2)))
+    # Sigmoid mapping: smooth (rms→0) → 1.0; jerky (rms→∞) → 0.0
+    return float(1.0 / (1.0 + rms))
+
+
+# Legacy name — identical implementation, kept for backward compat
+def _smoothness_jerk(steps: List[dict]) -> float:
+    return _smoothness_steering_rate(steps)
 
 
 def _waypoint_lookahead(steps: List[dict], n_waypoints: int) -> float:
@@ -269,18 +336,22 @@ def compute_all(
         out["track_progress"]       = _track_progress(steps, waypoints, track_length_m)
 
         # --- INTERMEDIARY ---
-        out["race_line_adherence"]        = _race_line_adherence(steps, tw)
-        out["brake_compliance"]           = _brake_compliance(steps)
-        out["corner_speed_error"]         = _corner_speed_error(steps)
-        out["heading_alignment_mean"]     = _heading_alignment(steps)
-        out["smoothness_jerk_rms"]        = _smoothness_jerk(steps)
-        out["waypoint_lookahead"]         = _waypoint_lookahead(steps, nwp)
-        out["gg_ellipse_utilisation"]     = _gg_utilisation(steps)
-        out["velocity_profile_compliance"]= _vprofile_compliance(steps)
-        out["curvature_anticipation"]     = _curvature_anticipation(steps)
-        out["htm_composite"]              = _htm_composite(steps)
-        out["phase_id"]                   = float(phase_id)
-        out["bc_seeded"]                  = float(bc_seeded)
+        out["race_line_adherence"]         = _race_line_adherence(steps, tw)
+        out["brake_compliance"]            = _brake_compliance(steps)
+        out["corner_speed_error"]          = _corner_speed_error(steps)
+        out["heading_alignment_mean"]      = _heading_alignment(steps)
+        out["smoothness_steering_rate"]    = _smoothness_steering_rate(steps)  # v1.1.2
+        out["waypoint_lookahead"]          = _waypoint_lookahead(steps, nwp)
+        out["gg_ellipse_utilisation"]      = _gg_utilisation(steps)
+        out["velocity_profile_compliance"] = _vprofile_compliance(steps)
+        out["curvature_anticipation"]      = _curvature_anticipation(steps)
+        out["htm_composite"]               = _htm_composite(steps)
+        out["phase_id"]                    = float(phase_id)
+        out["bc_seeded"]                   = float(bc_seeded)
+
+        # v1.1.2: backward-compat alias so old BSTS logs / analyze_logs.py
+        # that still reference 'smoothness_jerk_rms' don't KeyError.
+        out["smoothness_jerk_rms"] = out["smoothness_steering_rate"]
 
         # Guarantee all keys finite
         for k in list(out):
