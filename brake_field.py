@@ -55,6 +55,8 @@ from config_loader import CFG
 
 # ── physical constants ────────────────────────────────────────────────────────
 _MU_DEFAULT    = 0.7   # tyre–surface friction coefficient (DeepRacer urethane on carpet)
+_CAR_HALF_W    = 0.09  # DeepRacer 1/18 scale: ~0.18m wide; half-width for clearance subtraction
+                       # REF: Heinzmann & Zelinsky (2003) -- safety envelope uses body dimensions
 _G             = 9.81  # m s⁻²
 _SAFETY        = 1.20  # extra stopping margin factor
 _DT_BOT_PROJ   = 1.50  # seconds ahead to project bot position (object permanence)
@@ -607,6 +609,10 @@ class CombinedBrakeField:
         track_half_w:     float         = 0.30,
         # SwinUNetPP raw obs (optional)
         obs_flat_np:      Optional[np.ndarray] = None,
+        # AdaptiveRewardShaper curb urgency multiplier [1.0, 3.0]
+        # Feeds per-WP EMA v_perp danger signal into curb field distance scaling.
+        # REF: Khatib (1986) APF -- repulsive potential scales with observed danger.
+        curb_urgency_mul: float                = 1.0,
     ) -> Dict:
         """Run all four per-class vector fields and combine.
 
@@ -627,7 +633,18 @@ class CombinedBrakeField:
 
             # ── Curb field ────────────────────────────────────────────────────
             # Effective curb dist: use barrier_dist if curb_dist not provided
-            eff_curb_dist = min(curb_dist, barrier_dist) if curb_dist < 4.0 else barrier_dist
+            # Subtract car half-width for physics-accurate clearance
+            # Without this, "0.30m to curb" means car edge is 0.30-0.09=0.21m from barrier
+            # REF: Heinzmann & Zelinsky (2003) -- safety envelope must account for body width
+            _raw_curb = min(curb_dist, barrier_dist) if curb_dist < 4.0 else barrier_dist
+            eff_curb_dist = max(0.05, _raw_curb - _CAR_HALF_W)
+
+            # Apply curb_urgency_mul from AdaptiveRewardShaper (per-WP EMA v_perp scaling)
+            # curb_urgency_mul > 1.0 shrinks effective distance -> field activates earlier
+            # REF: Khatib (1986) APF -- repulsive field magnitude = k / d^2; scaling d is equivalent
+            _curb_urgency_scaled = float(curb_urgency_mul)
+            if _curb_urgency_scaled > 1.0:
+                eff_curb_dist = max(0.05, eff_curb_dist / _curb_urgency_scaled)
             swin_curb_prob = float(np.mean([
                 swin["mask16"][s] for s in range(16)
                 if swin["sector_class16"][s] == self._CLS_CURB
@@ -644,9 +661,11 @@ class CombinedBrakeField:
                 swin["mask16"][s] for s in range(16)
                 if swin["sector_class16"][s] == self._CLS_OBSTACLE
             ] or [0.0]))
+            # Apply car half-width to obstacle distance too
+            _eff_obs_dist = max(0.05, float(obs_dist) - _CAR_HALF_W)
             r_obs = self._obs_field.step(
                 speed=speed, heading_rad=heading_rad,
-                obs_dist=obs_dist, obs_angle_rad=obs_angle,
+                obs_dist=_eff_obs_dist, obs_angle_rad=obs_angle,
                 obs_visible_angle_rad=math.radians(max(obs_visible_deg, 5.0)),
                 obs_dim_w=obs_dim_w, obs_dim_h=obs_dim_h,
                 is_braking=is_braking, actual_decel=actual_decel,
