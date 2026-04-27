@@ -6,6 +6,15 @@ BSTSKalmanFilter -- Local-linear-trend 2-state Kalman filter (NEW v1.1.1)
 BSTSFeedback     -- EMA-smoothed, Kalman-informed, race_type-aware reward-weight adjuster.
 BSTSSeasonal     -- Batch BSTS decomposition + live per-step buffer for run.py integration.
 
+v1.3.1 changes (2026-04-27)
+----------------------------
+  - BSTSKalmanFilter.update(): NaN/Inf GUARD.
+    Skip non-finite observations instead of poisoning state.
+    After posterior update, recover with np.nan_to_num if state leaked nan.
+    REF: measurement-gating in Thrun, Burgard & Fox (2005) Probabilistic Robotics.
+  - BSTSFeedback.update(): Skip non-finite metric values in EMA loop.
+    Prevents nan EMAs from propagating into _run_kalmans().
+
 v1.1.1 changes
 --------------
   - BSTSKalmanFilter: proper 2-state (level+slope) Kalman with diffuse P prior,
@@ -161,8 +170,23 @@ class BSTSKalmanFilter:
 
     # ------------------------------------------------------------------
     def update(self, observation: float) -> None:
-        """Ingest one scalar observation and update posterior."""
+        """Ingest one scalar observation and update posterior.
+
+        v1.3.1 NaN/Inf guard:
+          - Non-finite observations (nan, ±inf) are SKIPPED entirely.
+            A single nan would poison the entire state vector forever:
+            innov = nan → K@[[nan]] = nan → x = [nan, nan] → slope = nan.
+            Skipping is equivalent to measurement-gating (Thrun et al. 2005).
+          - After the posterior update, any nan/inf that leaked through
+            numerical edge cases is recovered with np.nan_to_num(0.0).
+        REF: Thrun, Burgard & Fox (2005) Probabilistic Robotics §3.4
+             measurement gating — reject outlier/corrupt observations.
+        """
         z = float(observation)
+
+        # v1.3.1: skip non-finite observations — do NOT poison Kalman state
+        if not math.isfinite(z):
+            return
 
         if not self._initialized:
             self.x[0] = z          # seed level with first obs
@@ -192,6 +216,12 @@ class BSTSKalmanFilter:
         # --- Posterior update ---
         self.x = x_pred + (K @ np.array([[innov]])).squeeze()
         self.P = (np.eye(2) - K @ self.H) @ P_pred
+
+        # v1.3.1: recover nan/inf that may have leaked through numerical edge cases
+        if not np.all(np.isfinite(self.x)):
+            self.x = np.nan_to_num(self.x, nan=0.0, posinf=0.0, neginf=0.0)
+        if not np.all(np.isfinite(self.P)):
+            self.P = np.nan_to_num(self.P, nan=1e4, posinf=1e4, neginf=0.0)
 
         if self.p > 0:
             self.state[:2] = self.x
@@ -257,6 +287,11 @@ class BSTSKalmanFilter:
 # ===========================================================================
 class BSTSFeedback:
     """EMA-smoothed, Kalman-informed reward-weight adjuster.
+
+    v1.3.1 (2026-04-27): NaN guard in update().
+      Non-finite metric values (nan/inf) are now skipped in the EMA loop.
+      Previously a nan reward EMA would propagate into _run_kalmans() and
+      poison all downstream Kalman slopes to nan.
 
     v1.3.0 (2026-04-27): Per-class compliance signals integrated.
       Recognises brake_field_compliance_gradient and race_line_compliance_gradient
@@ -327,7 +362,12 @@ class BSTSFeedback:
 
     # ------------------------------------------------------------------
     def update(self, metrics_dict: dict, *, step=None, race_type_tag=None) -> None:
-        """Feed new scalar metrics into EMA state and run Kalman update."""
+        """Feed new scalar metrics into EMA state and run Kalman update.
+
+        v1.3.1: Non-finite values (nan/inf) are skipped in the EMA loop.
+        A single nan metric (e.g., reward=nan from 0/0 ep_return) would
+        otherwise propagate into _run_kalmans() and poison the Kalman state.
+        """
         if race_type_tag is not None:
             self.race_type = _norm_race_type(str(race_type_tag))
 
@@ -335,6 +375,9 @@ class BSTSFeedback:
             if not isinstance(v, (int, float)):
                 continue
             v = float(v)
+            # v1.3.1: skip non-finite values — do not let nan/inf enter EMA or Kalman
+            if not math.isfinite(v):
+                continue
             if k not in self.ema:
                 self.ema[k] = v
             else:
