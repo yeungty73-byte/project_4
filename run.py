@@ -2060,6 +2060,7 @@ def run(hparams):
                         'dist_to_raceline':   float(_racing_line_err) if '_racing_line_err' in dir() else 0.0,  # v1.1.0: was missing → race_line_adherence=0
                         # v1.1.0: fields _translate_step() / extract_intermediary_metrics() need
                         'braking':              int(_braking_intent) if '_braking_intent' in dir() else 0,
+                        'is_braking':           bool(_braking_intent) if '_braking_intent' in dir() else False,  # v1.1.2
                         'is_offtrack':          bool(_offtrack),
                         'progress':             float(_prog),
                         'heading_diff':         float(ep_heading_diffs[-1]) if ep_heading_diffs else 0.0,
