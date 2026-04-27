@@ -109,10 +109,21 @@ def _brake_field_compliance_gradient(steps):
 
 
 def _race_line_compliance_gradient(steps, track_width):
-    """Mean race_line_compliance_gradient from race_engine.get_combined_reward() v1.2.0.
-    v1.4.2 FIX: when all dist_to_raceline == 0.0 (race_engine not initialized
-    on 13-29 step episodes), returns 0.5 neutral instead of treating 0.0 as
-    perfect on-line compliance.
+    """Mean race_line_compliance_gradient from race_engine.get_combined_reward() v1.4.3.
+
+    Priority resolution per step:
+      1. If 'race_line_compliance_gradient' key present (engine running): use it directly.
+      2. If dist_to_raceline == 0.0 AND engine NOT running: neutral 0.5
+         (race_engine not initialized on 13-29 step episodes — 0 ≠ perfect compliance).
+      3. If dist_to_raceline == 0.0 AND engine IS running: 1.0 (car is on the line).
+      4. If dist_to_raceline > 0.0: Gaussian penalty exp(-0.5*(d/sigma)^2).
+      5. If dist_to_raceline < 0.0 (sentinel/missing): append 0.5 neutral.
+         PREVIOUS BUG: `continue` silently DROPPED these steps from grads[],
+         shrinking the denominator and inflating the mean toward the remaining steps.
+         FIX v1.4.3: append 0.5 neutral so every step contributes to the mean.
+
+    REF: Heilmeier et al. (2020) -- race-line compliance as continuous gradient.
+    REF: AWS DeepRacer docs -- dist_to_raceline not available until race_engine init.
     """
     grads = []
     has_engine_grad = False
@@ -125,9 +136,13 @@ def _race_line_compliance_gradient(steps, track_width):
         half_w = max(track_width / 2.0, 0.01)
         d      = _safe(s.get("dist_to_raceline", -1.0))
         if d < 0.0:
-            continue
-        if d == 0.0 and not has_engine_grad:
+            # v1.4.3 FIX: missing/sentinel dist → neutral 0.5, NOT silently dropped.
+            # Dropping shrank the denominator and inflated mean toward remaining steps.
             grads.append(0.5)
+        elif d == 0.0:
+            # v1.4.3: d==0 with engine running = car is exactly on line → 1.0.
+            # d==0 without engine (all zeros from uninit) → neutral 0.5.
+            grads.append(1.0 if has_engine_grad else 0.5)
         else:
             grads.append(float(math.exp(-0.5 * (d / (half_w * 0.5)) ** 2)))
     if not grads:
@@ -253,6 +268,9 @@ def compute_all(steps, final_progress=0.0, n_waypoints=120, track_width=0.6,
         "brake_compliance":                1.0,
         "brake_field_compliance_gradient": 1.0,
         "race_line_compliance_gradient":   0.5,
+        # v1.1.4c: combined neutral = 0.5*1.0 + 0.5*0.5 = 0.75
+        # (vacuously compliant brake field + neutral race line)
+        "compliance_gradient":             0.75,
         "smoothness_steering_rate":        1.0,
         "corner_speed_error":              0.5,
     }
@@ -270,6 +288,13 @@ def compute_all(steps, final_progress=0.0, n_waypoints=120, track_width=0.6,
         out["race_line_compliance_gradient"]   = _race_line_compliance_gradient(steps, tw)
         out["race_line_adherence"]             = _race_line_adherence(steps, tw)
         out["brake_compliance"]                = _brake_compliance(steps)
+        # v1.1.4c FIX-5: compute combined compliance_gradient here so
+        # harmonized_metrics itself produces the key that bsts_metrics.update() expects.
+        # Formula must match per-step formula in run.py (L2627) and episode-end (L3082).
+        out["compliance_gradient"]             = float(
+            0.5 * out["brake_field_compliance_gradient"]
+            + 0.5 * out["race_line_compliance_gradient"]
+        )
         out["corner_speed_error"]              = _corner_speed_error(steps)
         out["heading_alignment_mean"]          = _heading_alignment(steps)
         out["smoothness_steering_rate"]        = _smoothness_steering_rate(steps)

@@ -2624,8 +2624,16 @@ def run(hparams):
                         float(_bf_compliance_grad) if '_bf_compliance_grad' in dir() else 1.0,
                     'race_line_compliance_gradient':
                         float(_rl_compliance_grad) if '_rl_compliance_grad' in dir() else 0.5,
-                    'compliance_gradient':
-                        float(_bf_compliance_grad) if '_bf_compliance_grad' in dir() else 1.0,
+                    # v1.1.4c FIX-1: compliance_gradient = harmonic avg of both sub-gradients.
+                    # Previously only _bf_compliance_grad; rl path was silently dropped.
+                    # harmonized_metrics._brake_field_compliance_gradient() reads 'compliance_gradient'
+                    # and _race_line_compliance_gradient() reads 'race_line_compliance_gradient'.
+                    # The combined scalar must reflect BOTH so BSTS Kalman sees correct signal.
+                    # REF: Ng et al. (1999) -- all per-step signals must reach the gradient path.
+                    'compliance_gradient': float(
+                        0.5 * (float(_bf_compliance_grad) if '_bf_compliance_grad' in dir() else 1.0)
+                        + 0.5 * (float(_rl_compliance_grad) if '_rl_compliance_grad' in dir() else 0.5)
+                    ),
                 },
                 step=global_step,
                 race_type_tag=_track_variant,
@@ -3084,10 +3092,19 @@ def run(hparams):
                     'track_progress':       float(_hm_out.get('track_progress', 0.0)),
                     'race_line_adherence':  float(_hm_out.get('race_line_adherence', 0.5)),   # neutral=0.5
                     'brake_compliance':     float(_hm_out.get('brake_compliance',    1.0)),   # neutral=1.0
-                    'smoothness_steering_rate': float(_hm_out.get('smoothness_steering_rate', 1.0)),   # v1.4.3: neutral=1.0 (no data = perfectly smooth, not oscillating)
+                    'smoothness_steering_rate': float(_hm_out.get('smoothness_steering_rate', 1.0)),
                     # v1.2.0: continuous compliance gradients → BSTS Kalman shaping
                     'brake_field_compliance_gradient': float(_hm_out.get('brake_field_compliance_gradient', 1.0)),
                     'race_line_compliance_gradient':   float(_hm_out.get('race_line_compliance_gradient',   0.5)),
+                    # v1.1.4c FIX-2: combined compliance_gradient at episode end.
+                    # Per-step path (L2627) and episode-end path must use SAME formula.
+                    # 0.5*bf + 0.5*rl — equal weight because both are on [0,1] with
+                    # same neutral semantics (1.0 = fully compliant, 0.0 = zero compliance).
+                    # REF: Heilmeier et al. (2020) -- brake + race-line compliance equally weighted.
+                    'compliance_gradient': float(
+                        0.5 * float(_hm_out.get('brake_field_compliance_gradient', 1.0))
+                        + 0.5 * float(_hm_out.get('race_line_compliance_gradient',   0.5))
+                    ),
                 })
                 # v1.3.1 FIX ROOT CAUSE: always call update() unconditionally.
                 # The "v != 0.0" filter prevented 0.0 compliance observations from
@@ -3339,13 +3356,26 @@ def run(hparams):
                         # seasonal component is internal to the Kalman RLS inside BSTSFeedback.model()
                         # — not separately extractable; set to 0.0 here
                         seasonal = 0.0
+                        # v1.1.4c FIX-3: guard ep_return against nan (0/0 on ep_step_count=0).
+                        # Also add compliance_gradient to this second update() call so Kalman
+                        # for 'compliance_gradient' fires on BOTH update paths, not just L3098.
+                        _ep_return_safe = float(ep_return) if (ep_return is not None and ep_return != float('-inf') and ep_return == ep_return) else 0.0
+                        _cg_ep = float(
+                            0.5 * float(bsts_metrics.get('brake_field_compliance_gradient', 1.0))
+                            + 0.5 * float(bsts_metrics.get('race_line_compliance_gradient', 0.5))
+                        )
                         m = {
-                            'ep_return':    ep_return,
-                            'trend':        trend,
-                            'seasonal':     seasonal,
-                            'episode':      episode_count,
-                            'crash_rate':   ep_offtrack_count / max(ep_step_count, 1),
-                            'avg_speed':    float(np.mean(ep_speeds)) if ep_speeds else 0.0,
+                            'ep_return':           _ep_return_safe,
+                            'trend':               trend,
+                            'seasonal':            seasonal,
+                            'episode':             episode_count,
+                            'crash_rate':          ep_offtrack_count / max(ep_step_count, 1),
+                            'avg_speed':           float(np.mean(ep_speeds)) if ep_speeds else 0.0,
+                            'compliance_gradient':            _cg_ep,
+                            'brake_field_compliance_gradient': float(bsts_metrics.get('brake_field_compliance_gradient', 1.0)),
+                            'race_line_compliance_gradient':   float(bsts_metrics.get('race_line_compliance_gradient', 0.5)),
+                            'race_line_adherence':             float(bsts_metrics.get('race_line_adherence', 0.5)),
+                            'brake_compliance':                float(bsts_metrics.get('brake_compliance', 1.0)),
                         }
                         bsts_feedback.update(m, step=global_step, race_type_tag=_track_variant)
                         if hasattr(bsts_feedback, 'adjust_weights'):

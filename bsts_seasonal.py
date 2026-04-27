@@ -390,9 +390,22 @@ class BSTSFeedback:
         self._run_kalmans()
         
     # ------------------------------------------------------------------
+    # v1.1.4c: Episode-level-only metrics (computed once/ep, not per-step).
+    # These use a slower KF (lower level_noise) because their signal is smoother
+    # — one observation per episode vs tens of per-step observations for others.
+    # Without this, the KF for race_line_adherence over-reacts to each single
+    # episode observation, producing noisy slopes.
+    _EP_LEVEL_METRICS = frozenset({
+        'race_line_adherence', 'brake_compliance',
+        'compliance_gradient', 'brake_field_compliance_gradient',
+        'race_line_compliance_gradient', 'track_progress',
+        'avg_speed_centerline', 'smoothness_steering_rate',
+    })
+
     def _run_kalmans(self) -> None:
         """Update one KF per EMA metric; populate kf_trends/kf_betas.
 
+        v1.1.4c: Episode-level metrics use slower KF (level_noise/10).
         v1.1.1: Called at the end of every update(). Previously kf_trends/kf_betas
         were only populated by run.py's analyze_logs pipeline (once per episode,
         inside a try-block with n=1 buffer → meaningless slopes).
@@ -402,10 +415,18 @@ class BSTSFeedback:
         """
         for metric, val in self.ema.items():
             if metric not in self._kf_instances:
+                # v1.1.4c: episode-level metrics need slower KF to avoid
+                # over-reacting to single-episode observations.
+                if metric in self._EP_LEVEL_METRICS:
+                    _ln = self._KF_LEVEL_NOISE * 0.1   # 10x slower adaptation
+                    _sn = self._KF_SLOPE_NOISE * 0.1
+                else:
+                    _ln = self._KF_LEVEL_NOISE
+                    _sn = self._KF_SLOPE_NOISE
                 self._kf_instances[metric] = BSTSKalmanFilter(
                     obs_noise=self._KF_OBS_NOISE,
-                    level_noise=self._KF_LEVEL_NOISE,
-                    slope_noise=self._KF_SLOPE_NOISE,
+                    level_noise=_ln,
+                    slope_noise=_sn,
                 )
             self._kf_instances[metric].update(float(val))
             self.kf_trends[metric] = self._kf_instances[metric].slope
@@ -420,11 +441,21 @@ class BSTSFeedback:
         
     # ------------------------------------------------------------------
     def get_trend_vector(self, race_type_filter=None) -> dict:
-        """Return {metric: linear_slope} over last 5 history observations."""
+        """Return {metric: linear_slope} over last 5 history observations.
+
+        v1.1.4c NaN guards:
+          1. n < 2: return 0.0 (np.diff of 1-element = empty → np.mean([]) = nan).
+          2. Filter non-finite values from arr before polyfit.
+             A single nan in the history window poisons np.polyfit → nan slope.
+          3. polyfit result checked: if not finite → 0.0.
+        REF: Welch & Bishop (2006) Kalman filter — measurement gating skips nan.
+        """
         out = {}
         window = 5
         for k, dq in self._history.items():
             arr = list(dq)[-window:]
+            # v1.1.4c: strip non-finite values before regression
+            arr = [v for v in arr if v == v and v not in (float('inf'), float('-inf'))]
             n   = len(arr)
             if n < 2:
                 out[k] = 0.0
@@ -432,6 +463,8 @@ class BSTSFeedback:
             x = np.arange(n, dtype=float)
             try:
                 slope = float(np.polyfit(x, arr, 1)[0])
+                if not math.isfinite(slope):
+                    slope = 0.0
             except Exception:
                 slope = 0.0
             out[k] = slope
