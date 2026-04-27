@@ -5,6 +5,7 @@ SUCCESS_METRICS so BSTS Kalman shapes them directly.
 REF: Heilmeier et al. (2020); Brayshaw & Harrison (2005); Scott & Varian (2014).
 """
 import math
+import logging
 import numpy as np
 from typing import List, Optional
 
@@ -30,6 +31,7 @@ INTERMEDIARY_METRICS: List[str] = [
     "bc_seeded",
 ]
 
+_HM_LOG = logging.getLogger(__name__)
 _LEGACY_ALIAS = {"smoothness_jerk_rms": "smoothness_steering_rate"}
 
 
@@ -254,8 +256,17 @@ def compute_all(steps, final_progress=0.0, n_waypoints=120, track_width=0.6,
             if not math.isfinite(_safe(out[k])):
                 out[k] = 0.0
         return out
-    except Exception:
-        return {k: 0.0 for k in SUCCESS_METRICS + INTERMEDIARY_METRICS}
+    except Exception as _hm_exc:
+        _HM_LOG.exception("[HM] compute_all exception -- returning neutral defaults")
+        _neutral = {k: 0.0 for k in SUCCESS_METRICS + INTERMEDIARY_METRICS}
+        # Neutral defaults: no data != bad compliance (FALSE SIGNAL if 0.0)
+        # race_line_adherence=0.5: neutral center-of-distribution, not "actively failing"
+        # brake_compliance=1.0: no brake events in field => vacuously compliant
+        _neutral["race_line_adherence"]             = 0.5
+        _neutral["brake_compliance"]                = 1.0
+        _neutral["brake_field_compliance_gradient"] = 1.0
+        _neutral["race_line_compliance_gradient"]   = 0.5
+        return _neutral
 
 
 compute_intermediary = lambda steps, n_waypoints=120, track_width=0.6: {

@@ -402,6 +402,7 @@ class MultiRaceLineEngine:
         car_x: float = 0.0,
         car_y: float = 0.0,
         swin_clearance: np.ndarray = None,   # v1.1.0: [front,left,right,rear]
+        wp_speed_budget: float = None,           # v1.4.0: per-WP adaptive speed budget
     ) -> Tuple[float, Dict]:
         if not self._initialized or not self._lines:
             return 0.0, {}
@@ -444,6 +445,7 @@ class MultiRaceLineEngine:
     def get_target_speed(
         self, wp_idx: int, context: int,
         brake_safe_speed: float = None,   # v1.3.0: max speed from CombinedBrakeField
+        wp_speed_budget:  float = None,   # v1.4.0: per-WP adaptive budget from AdaptiveRewardShaper
     ) -> float:
         """Returns optimal speed at wp_idx, clamped to brake_safe_speed if provided.
         brake_safe_speed = CombinedBrakeField.race_line_safe_speed(...).
@@ -451,12 +453,20 @@ class MultiRaceLineEngine:
         REF: Heilmeier et al. (2020) §4 — speed profile as constraint on race line.
         """
         if not self._initialized or self.LINE_TIME_TRIAL not in self._lines:
-            return 2.0 if brake_safe_speed is None else float(min(2.0, brake_safe_speed))
+            _spd_init = 2.0 if brake_safe_speed is None else float(min(2.0, brake_safe_speed))
+            if wp_speed_budget is not None:
+                _spd_init = float(min(_spd_init, max(float(wp_speed_budget), 0.5)))
+            return _spd_init
         line = (self._lines.get(self.LINE_OBSTACLE, self._lines[self.LINE_TIME_TRIAL])
                 if context in (1, 2, 3) else self._lines[self.LINE_TIME_TRIAL])
         spd = float(line.speeds[wp_idx % self.n])
         if brake_safe_speed is not None:
             spd = float(min(spd, max(brake_safe_speed, 0.5)))
+        # v1.4.0: Apply per-WP adaptive speed budget from AdaptiveRewardShaper
+        # Budget tightens after repeated crashes near this WP (beta=0.05 per crash)
+        # REF: Heilmeier et al. (2020) Eq. 10 -- speed must respect crash history
+        if wp_speed_budget is not None:
+            spd = float(min(spd, max(float(wp_speed_budget), 0.5)))
         return spd
 
     def reset(self):
