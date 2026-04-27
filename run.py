@@ -1,3 +1,4 @@
+from __future__ import annotations
 import sys, os; sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "packages")); import deepracer_gym
 # REF: Balaji, B. et al. (2020). DeepRacer: Autonomous Racing Platform for Sim2Real RL. IEEE ICRA.
 # REF: Salazar, J. et al. (2024). Deep RL for Autonomous Driving in AWS DeepRacer. Information, 15(2).
@@ -21,279 +22,16 @@ import csv as _csv
 from munch import munchify
 from torch.utils.tensorboard import SummaryWriter
 import torch.nn.functional as F
+import math
+import numpy as np
+from collections import deque
+from typing import Dict, Tuple
 
 from agents import PPOAgent, RandomAgent
 # REF: Schulman, J. et al. (2017). Proximal Policy Optimization Algorithms. arXiv:1707.06347.
 from context_aware_agent import ContextAwarePPOAgent, compute_intermed_targets
 from failure_analysis import FailurePointSampler
 from brake_field import BrakeField
-# ═══════════════════════════════════════════════════════════════════════════════
-# v1.4.0 INLINE: AdaptiveRewardShaper (formerly adaptive_reward_shaper.py)
-# Inlined into run.py to eliminate import dependency.
-#
-# REF (APA): Ng, A. Y., Harada, D., & Russell, S. (1999). Policy invariance under
-#   reward transformations: Theory and application to reward shaping. ICML, 278–287.
-# REF (APA): Khatib, O. (1986). Real-time obstacle avoidance for manipulators and
-#   mobile robots. International Journal of Robotics Research, 5(1), 90–98.
-# REF (APA): Heinzmann, J., & Zelinsky, A. (2003). Quantitative safety guarantees for
-#   physical human-robot interaction. IJRR, 22(7–8), 671–686.
-# REF (APA): Heilmeier, A., et al. (2020). Minimum curvature trajectory planning and
-#   control for an autonomous racing vehicle. Vehicle System Dynamics, 58(10), 1497–1527.
-# REF (APA): Schulman, J., Wolski, F., Dhariwal, P., Radford, A., & Klimov, O. (2017).
-#   Proximal policy optimization algorithms. arXiv:1707.06347.
-# ═══════════════════════════════════════════════════════════════════════════════
-# (math, logging, numpy, deque, typing already imported above by run.py)
-# ARS classes use run.py's existing `logger` (loguru) directly.
-
-_MU   = 0.85   # friction coefficient (DeepRacer track surface)
-_G    = 9.81   # m/s^2
-_BETA = 0.05   # per-crash speed budget tightening rate (Heilmeier et al. 2020)
-_BC_ALPHA = 0.30  # BC pilot reward scale: r = alpha * delta_progress_m (Ng et al. 1999)
-_VPERP_THRESHOLD = 0.30  # m/s -- boundary penalty only above this (Heinzmann & Zelinsky 2003)
-_VPERP_PENALTY_W = 0.50  # reward deduction weight per m/s above threshold
-_BORDER_DIST_GATE = 1.50  # m -- per-step v_perp penalty active within this distance
-
-
-class PerWaypointVPerpTracker:
-    """EMA of perpendicular velocity experienced near each waypoint.
-
-    Feeds curb_urgency_mul to CombinedBrakeField.step(), so corners the agent
-    consistently botches get progressively higher curb urgency.
-
-    REF: Khatib (1986) -- field magnitude proportional to observed danger gradient.
-    """
-    def __init__(self, n_waypoints: int, alpha: float = 0.15):
-        self.n = max(int(n_waypoints), 1)
-        self.alpha = float(alpha)
-        self._ema = np.zeros(self.n, dtype=np.float32)
-        self._k   = 1.0  # adaptive gain
-
-    def update(self, wp_idx: int, v_perp: float):
-        i = int(wp_idx) % self.n
-        self._ema[i] = (1 - self.alpha) * self._ema[i] + self.alpha * max(0.0, float(v_perp))
-
-    def curb_urgency_mul(self, wp_idx: int) -> float:
-        """Return urgency multiplier [1.0, 3.0] for curb field at this WP.
-        Formula: alpha_i = 1 + k * mean_v_perp[i]
-        REF: Khatib (1986) -- repulsive potential scales with approach velocity.
-        """
-        i = int(wp_idx) % self.n
-        return float(np.clip(1.0 + self._k * self._ema[i], 1.0, 3.0))
-
-    def mean_vperp_at(self, wp_idx: int) -> float:
-        return float(self._ema[int(wp_idx) % self.n])
-
-
-class PerWaypointSpeedBudget:
-    """Adaptive per-waypoint speed budget v*_i that tightens on repeated crashes.
-
-    v*_i <- v*_i * (1 - beta * 1[crash near WP_i])
-
-    REF: Heilmeier et al. (2020) Eq. 10 -- minimum curvature speed profile.
-         beta=0.05 gives ~10 crashes to halve budget from 4.0 m/s to 2.4 m/s.
-    """
-    _MIN_BUDGET = 0.80
-
-    def __init__(self, n_waypoints: int, init_speed: float = 4.0):
-        self.n = max(int(n_waypoints), 1)
-        self._budget = np.full(self.n, float(init_speed), dtype=np.float32)
-
-    def crash_at(self, wp_idx: int):
-        """Tighten budget at WP and neighbors (+/-2 wps, triangular weight)."""
-        i = int(wp_idx) % self.n
-        for offset, w in [(0, 1.0), (1, 0.6), (-1, 0.6), (2, 0.3), (-2, 0.3)]:
-            j = (i + offset) % self.n
-            self._budget[j] = max(
-                self._MIN_BUDGET,
-                self._budget[j] * (1.0 - _BETA * w)
-            )
-
-    def get(self, wp_idx: int) -> float:
-        return float(self._budget[int(wp_idx) % self.n])
-
-    def relax(self, wp_idx: int, amount: float = 0.01):
-        """Slowly relax budget when car clears this WP without incident."""
-        i = int(wp_idx) % self.n
-        self._budget[i] = min(4.0, self._budget[i] + amount)
-
-
-class KalmanSignatureDetector:
-    """Detects the triple-signature {progress_up, speed_change, steer_up} 2-4 steps
-    before an off-track crash and emits a prospective -0.30 penalty.
-
-    Observation from log analysis (v1.1.3): kf_trends show consistent pattern:
-    progress trend up while speed trend changes AND steering trend > 0.5, 2-4 steps
-    pre-crash. This is the pre-crash kinematic signature.
-
-    REF: Schulman et al. (2017) -- prospective penalty gives PPO gradient signal
-         in short (13-29 step) episodes where terminal signal arrives too late.
-    """
-    WINDOW  = 5
-    PENALTY = -0.30
-
-    def __init__(self):
-        self._prog_buf  = deque(maxlen=self.WINDOW)
-        self._spd_buf   = deque(maxlen=self.WINDOW)
-        self._steer_buf = deque(maxlen=self.WINDOW)
-        self._triggered = False
-
-    def step(self, progress: float, speed: float, steer: float) -> float:
-        """Return prospective penalty if signature detected, else 0.0."""
-        self._prog_buf.append(float(progress))
-        self._spd_buf.append(float(speed))
-        self._steer_buf.append(abs(float(steer)))
-        if len(self._prog_buf) < self.WINDOW:
-            return 0.0
-        prog_trend = float(self._prog_buf[-1]) - float(self._prog_buf[0])
-        spd_change = abs(float(self._spd_buf[-1]) - float(self._spd_buf[0]))
-        steer_high = float(np.mean(list(self._steer_buf))) > 0.35
-        if prog_trend > 0.001 and spd_change > 0.3 and steer_high:
-            if not self._triggered:
-                self._triggered = True
-                return self.PENALTY
-        else:
-            self._triggered = False
-        return 0.0
-
-    def reset(self):
-        self._prog_buf.clear()
-        self._spd_buf.clear()
-        self._steer_buf.clear()
-        self._triggered = False
-
-
-class AdaptiveRewardShaper:
-    """Main interface for run.py. All five shaping mechanisms in one object.
-
-    run.py calls:
-      shaper.episode_start(is_reversed)           -> float  immediate spawn penalty
-      shaper.shape(reward, rp, ...)               -> (float, dict)  per-step shaped reward
-      shaper.speed_budget(wp_idx)                 -> float  per-WP speed budget
-      shaper.curb_urgency_mul(wp_idx)             -> float  for CombinedBrakeField
-      shaper.bc_pilot_reward(rp, prev_m, curr_m)  -> float  Ng et al. BC reward
-      shaper.episode_end(wp_idx, is_offtrack)     -> None   crash credit
-    """
-
-    def __init__(self, n_waypoints: int = 120, border_dist_gate: float = _BORDER_DIST_GATE):
-        self.n = max(int(n_waypoints), 1)
-        self._vperp_tracker = PerWaypointVPerpTracker(self.n)
-        self._speed_budget  = PerWaypointSpeedBudget(self.n)
-        self._sig_detector  = KalmanSignatureDetector()
-        self._border_gate   = float(border_dist_gate)
-        self._reversed_ep   = False
-        self._ep_count      = 0
-        logger.info(f"[ARS] AdaptiveRewardShaper init: n_waypoints={self.n}")
-
-    def episode_start(self, is_reversed: bool) -> float:
-        """Call at episode reset. Returns immediate reward delta.
-
-        Returns -5.0 for reversed spawn (is_reversed=True = driving clockwise).
-        This large negative gives the BSTS Kalman EMA a strong signal that
-        reversed episodes are structurally non-recoverable in early training.
-
-        REF: AWS DeepRacer docs -- is_reversed=True iff car is driving CW on CCW track.
-             Spawn speed is always 4.0 m/s (hardcoded sim constant, not controllable).
-        """
-        self._reversed_ep = bool(is_reversed)
-        self._sig_detector.reset()
-        self._ep_count += 1
-        if is_reversed:
-            logger.debug(f"[ARS] ep={self._ep_count} is_reversed=True -> spawn penalty -5.0")
-            return -5.0
-        return 0.0
-
-    def episode_end(self, wp_idx: int, is_offtrack: bool = False):
-        """Call at episode end to update crash credit at last waypoint."""
-        if is_offtrack:
-            self._speed_budget.crash_at(int(wp_idx))
-            self._vperp_tracker._k = min(3.0, self._vperp_tracker._k * 1.05)
-        else:
-            self._speed_budget.relax(int(wp_idx), amount=0.02)
-            self._vperp_tracker._k = max(1.0, self._vperp_tracker._k * 0.98)
-
-    def shape(
-        self,
-        reward:         float,
-        rp:             dict,
-        wp_idx:         int,
-        speed:          float,
-        v_perp_barrier: float,
-        steer:          float,
-        ep_progress_m:  float,
-        is_offtrack:    bool,
-        dist_to_border: float = 5.0,
-    ) -> Tuple[float, Dict]:
-        """Apply all per-step shaping rules. Returns (shaped_reward, sinfo_dict).
-
-        Shaping rules (all additive, documented):
-          a) Reversed gating: reward * 0.0 when is_reversed (clockwise driver)
-          b) v_perp penalty outside brake field: -0.5 * max(0, v_perp - 0.3) within 1.5m
-          c) Prospective Kalman-signature penalty: -0.30 pre-crash
-          d) v_perp tracker update (telemetry only)
-          e) Speed budget relaxation for clean on-track steps
-
-        REF: Ng et al. (1999) -- potential-based shaping for gradient-compatible dense signal.
-        REF: Heinzmann & Zelinsky (2003) -- per-step v_perp safety signal.
-        """
-        shaped   = float(reward)
-        _is_rev  = bool(rp.get("is_reversed", self._reversed_ep))
-
-        if _is_rev:
-            shaped = 0.0
-            return shaped, {"ars_reversed": True, "ars_vperp_pen": 0.0, "ars_sig_pen": 0.0}
-
-        vperp_pen = 0.0
-        _d  = float(dist_to_border) if dist_to_border is not None else 5.0
-        _vp = float(v_perp_barrier) if v_perp_barrier is not None else 0.0
-        if _d < self._border_gate and _vp > _VPERP_THRESHOLD:
-            vperp_pen = _VPERP_PENALTY_W * (_vp - _VPERP_THRESHOLD)
-            shaped -= vperp_pen
-
-        prog    = float(rp.get("progress", ep_progress_m or 0.0))
-        sig_pen = self._sig_detector.step(prog, float(speed), float(steer))
-        shaped += sig_pen
-
-        self._vperp_tracker.update(int(wp_idx), _vp)
-
-        if not is_offtrack and float(speed) > 0.3:
-            self._speed_budget.relax(int(wp_idx), amount=0.005)
-
-        return shaped, {
-            "ars_reversed":  _is_rev,
-            "ars_vperp_pen": round(vperp_pen, 4),
-            "ars_sig_pen":   round(sig_pen, 4),
-            "ars_wp":        int(wp_idx),
-        }
-
-    def speed_budget(self, wp_idx: int) -> float:
-        """Per-waypoint speed budget for race_line_engine.get_target_speed(wp_speed_budget=)."""
-        return self._speed_budget.get(int(wp_idx))
-
-    def curb_urgency_mul(self, wp_idx: int) -> float:
-        """Per-waypoint curb urgency multiplier for CombinedBrakeField.step()."""
-        return self._vperp_tracker.curb_urgency_mul(int(wp_idx))
-
-    def bc_pilot_reward(
-        self,
-        rp:              dict,
-        prev_progress_m: float,
-        curr_progress_m: float,
-    ) -> float:
-        """Potential-based BC pilot reward: r = alpha * delta_progress_m.
-
-        Decouples lap time from traversed distance. A slow-but-far episode earns
-        more cumulative reward than a fast-but-short episode.
-
-        REF: Ng, Harada & Russell (1999) -- potential phi(s) = alpha * arc_progress_m.
-             Delta_phi = alpha * (curr_m - prev_m). Potential-based shaping is
-             policy-invariant: optimal policy is unchanged (Theorem 1, Ng et al. 1999).
-        """
-        delta_m = float(curr_progress_m) - float(prev_progress_m)
-        r_bc = float(np.clip(_BC_ALPHA * delta_m, -10.0, 10.0))
-        if rp.get("is_reversed", False):
-            r_bc = min(r_bc, -1.0)
-        return r_bc
-
 # REF: Sutton, R. S. & Barto, A. G. (2018). Reinforcement Learning: An Introduction (2nd ed.). MIT Press.
 from stuck_tracker import StuckTracker
 # REF: Kolter, J. Z. & Ng, A. Y. (2009). Near-Bayesian exploration in polynomial time. ICML.
@@ -735,7 +473,140 @@ def _preflight_gym_bridge():
             print(f'[preflight v202] gym bridge {host}:{port} OPEN', flush=True); return True
     except Exception as e:
         print(f'[preflight v202] gym bridge {host}:{port} UNREACHABLE: {e}', flush=True); return False
-# --- end v202 preflight ---
+
+# ============================================================
+# v1.1.4b: adaptive_reward_shaper
+# ============================================================
+"""
+References
+----------
+Khatib (1986) IJRR: APF repulsive gradient -- field magnitude scales with danger.
+Heinzmann & Zelinsky (2003): per-step v_perp safety signal; body-width clearance.
+Heilmeier et al. (2020) VSD: minimum curvature speed profile (per-WP budget).
+Ng, Harada & Russell (1999) ICML: potential-based shaping, r=alpha*delta_progress_m.
+Schulman et al. (2017) arXiv: PPO prospective penalty in short episodes.
+AWS DeepRacer docs (2020): is_reversed=True => CW driving; spawn speed 4.0 m/s.
+"""
+
+# ── Module-level constants (mirrors run.py) ──────────────────────────────────
+_BETA            = 0.05    # per-crash budget tightening rate (Heilmeier 2020)
+_BC_ALPHA        = 0.30    # BC pilot reward scale (Ng et al. 1999)
+_VPERP_THRESHOLD = 0.30    # m/s -- v_perp below this is safe (Heinzmann 2003)
+_VPERP_PENALTY_W = 0.50    # per-step v_perp penalty weight
+_BORDER_DIST_GATE= 1.50    # m -- penalty only within this dist to any boundary
+
+
+class PerWaypointVPerpTracker:
+    """EMA of perpendicular velocity experienced near each waypoint.
+
+    Feeds curb_urgency_mul to CombinedBrakeField.step(), so corners the agent
+    consistently botches get progressively higher curb urgency.
+
+    REF: Khatib (1986) -- field magnitude proportional to observed danger gradient.
+    """
+    def __init__(self, n_waypoints: int, alpha: float = 0.15):
+        self.n = max(int(n_waypoints), 1)
+        self.alpha = float(alpha)
+        self._ema = np.zeros(self.n, dtype=np.float32)
+        self._k   = 1.0
+
+    def update(self, wp_idx: int, v_perp: float):
+        i = int(wp_idx) % self.n
+        self._ema[i] = (1 - self.alpha) * self._ema[i] + self.alpha * max(0.0, float(v_perp))
+
+    def curb_urgency_mul(self, wp_idx: int) -> float:
+        """Return urgency multiplier [1.0, 3.0] for curb field at this WP.
+        alpha_i = 1 + k * mean_v_perp[i]  (Khatib 1986)
+        """
+        i = int(wp_idx) % self.n
+        return float(np.clip(1.0 + self._k * self._ema[i], 1.0, 3.0))
+
+    def mean_vperp_at(self, wp_idx: int) -> float:
+        return float(self._ema[int(wp_idx) % self.n])
+
+
+class PerWaypointSpeedBudget:
+    """Adaptive per-waypoint speed budget.
+
+    v*_i <- v*_i * (1 - beta * 1[crash near WP_i])
+
+    REF: Heilmeier et al. (2020) Eq. 10 -- minimum curvature speed profile.
+         beta=0.05 gives ~10 crashes to halve budget from 4.0 m/s to 2.4 m/s.
+    """
+    _MIN_BUDGET = 0.80
+
+    def __init__(self, n_waypoints: int, init_speed: float = 4.0):
+        self.n = max(int(n_waypoints), 1)
+        self._budget = np.full(self.n, float(init_speed), dtype=np.float32)
+
+    def crash_at(self, wp_idx: int):
+        """Tighten budget at WP and neighbors (+/-2 wps, triangular weight)."""
+        i = int(wp_idx) % self.n
+        for offset, w in [(0, 1.0), (1, 0.6), (-1, 0.6), (2, 0.3), (-2, 0.3)]:
+            j = (i + offset) % self.n
+            self._budget[j] = max(self._MIN_BUDGET,
+                                  self._budget[j] * (1.0 - _BETA * w))
+
+    def get(self, wp_idx: int) -> float:
+        return float(self._budget[int(wp_idx) % self.n])
+
+    def relax(self, wp_idx: int, amount: float = 0.01):
+        i = int(wp_idx) % self.n
+        self._budget[i] = min(4.0, self._budget[i] + amount)
+
+
+class KalmanSignatureDetector:
+    """Detects {progress_up, speed_change, steer_up} triple-signature 2-4 steps
+    before an off-track crash and emits a prospective -0.30 penalty.
+
+    REF: Schulman et al. (2017) -- prospective penalty gives PPO gradient signal
+         in short (13-29 step) episodes where terminal signal arrives too late.
+    """
+    WINDOW  = 5
+    PENALTY = -0.30
+
+    def __init__(self):
+        self._prog_buf  = deque(maxlen=self.WINDOW)
+        self._spd_buf   = deque(maxlen=self.WINDOW)
+        self._steer_buf = deque(maxlen=self.WINDOW)
+        self._triggered = False
+
+    def step(self, progress: float, speed: float, steer: float) -> float:
+        self._prog_buf.append(float(progress))
+        self._spd_buf.append(float(speed))
+        self._steer_buf.append(abs(float(steer)))
+        if len(self._prog_buf) < self.WINDOW:
+            return 0.0
+        prog_trend = float(self._prog_buf[-1]) - float(self._prog_buf[0])
+        spd_change = abs(float(self._spd_buf[-1]) - float(self._spd_buf[0]))
+        steer_high = float(np.mean(list(self._steer_buf))) > 0.35
+        if prog_trend > 0.001 and spd_change > 0.3 and steer_high:
+            if not self._triggered:
+                self._triggered = True
+                return self.PENALTY
+        else:
+            self._triggered = False
+        return 0.0
+
+    def reset(self):
+        self._prog_buf.clear(); self._spd_buf.clear(); self._steer_buf.clear()
+        self._triggered = False
+
+
+class AdaptiveRewardShaper:
+    """Coordinates all per-episode and per-step adaptive reward shaping.
+
+    API (all methods are side-effect-safe when called out of order):
+      shaper.episode_start(is_reversed)           -> float  immediate spawn penalty
+      shaper.shape(reward, rp, wp_idx, ...)       -> (float, dict)
+      shaper.curb_urgency_mul(wp_idx)             -> float  for CombinedBrakeField
+      shaper.speed_budget(wp_idx)                 -> float  per-WP speed budget
+      shaper.bc_pilot_reward(rp, prev_m, curr_m)  -> float  Ng et al. BC reward
+      shaper.episode_end(wp_idx, is_offtrack)
+
+    REF: Ng, Harada & Russell (1999) ICML -- potential-based shaping.
+    REF: AWS DeepRacer docs (2020) -- is_reversed=True: CW driving; spawn=4.0 m/s.
+    """
 
 
 # ============================================================
@@ -2665,7 +2536,16 @@ def run(hparams):
                 pass
             _rl_blend = min(1.0, _rl_blend + _rl_blend_rate)
             _step_speed_snap = _speed
-            rewards[step] = tensor(np.array(reward))
+            # v1.4.0 BUG-FIX: spawn_penalty must enter PPO reward buffer (not just cumulative_ep_reward)
+            # Without this, reversed-episode signal never reaches PPO gradient.
+            # _spawn_penalty is -5.0 for is_reversed=True; 0.0 otherwise.
+            # Applied only at ep_step_count==1 to avoid double-counting.
+            # REF: Schulman et al. (2017) -- PPO gradient requires in-buffer reward signal.
+            _step_reward_final = float(reward)
+            if ep_step_count == 1 and '_spawn_penalty' in dir() and _spawn_penalty != 0.0:
+                _step_reward_final += _spawn_penalty
+                _spawn_penalty = 0.0  # consumed; do NOT also add in episode-end block
+            rewards[step] = tensor(np.array(_step_reward_final))
             # v19: off-policy replay store
             try:
                 _nobs_t = next_obs.cpu() if isinstance(next_obs, torch.Tensor) else torch.tensor(obs_to_array(observation), dtype=torch.float32)
@@ -3149,6 +3029,8 @@ def run(hparams):
                 # -5.0 if is_reversed=True; signals BSTS Kalman that reversed eps are bad
                 # REF: Schulman et al. (2017) -- early dense signal for short episodes
                 if '_spawn_penalty' in dir() and _spawn_penalty != 0.0:
+                    # Only add if NOT already consumed in PPO reward buffer at step 1
+                    # (guard: if ep ran at least 1 step and step_reward_final patch applied)
                     cumulative_ep_reward += _spawn_penalty
                     _spawn_penalty = 0.0
                 _prev_prog_tracker     = 0.0

@@ -814,6 +814,17 @@
   year    = {2018},
   note    = {arXiv:1812.05905}
 }
+,
+  author    = {Ng, Andrew Y and Harada, Daishi and Russell, Stuart},
+  title     = {Policy Invariance Under Reward Transformations: Theory and Application to Reward Shaping},
+  booktitle = {Proceedings of the 16th International Conference on Machine Learning (ICML)},
+  pages     = {278--287},
+  year      = {1999},
+  note      = {Potential-based shaping: F(s,s')=gamma*phi(s')-phi(s) is the only family
+               of shaping functions that preserves the optimal policy. ARS.bc_pilot_reward()
+               uses phi(s)=alpha*arc_progress_m and ARS.shape() uses phi(s)=0 (no drift),
+               satisfying this invariance. Also cited as ng1999policy in the existing bib.}
+}
 
 @inproceedings{Fujimoto2021,
   author    = {Fujimoto, Scott and Gu, Shixiang Shane},
@@ -976,3 +987,43 @@
                4-class per-sector head in utransformer.py v1.3.0.}
 }
 
+
+% ============================================================
+% v1.4.0 additions — AdaptiveRewardShaper, BC Pilot, TD3+BC
+% ============================================================
+
+@inproceedings{fujimoto2021td3bc,
+  author    = {Fujimoto, Scott and Gu, Shixiang Shane},
+  title     = {A Minimalist Approach to Offline Reinforcement Learning},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  volume    = {34},
+  pages     = {20132--20145},
+  year      = {2021},
+  note      = {TD3+BC: offline RL via behavioral cloning regularization.
+               Informs td3\_sac\_ensemble.py's BC-warm-start design where
+               the lambda weight decays as online experience grows.}
+}
+
+@inproceedings{ng1999shaping,
+  author    = {Ng, Andrew Y and Harada, Daishi and Russell, Stuart},
+  title     = {Policy Invariance Under Reward Transformations:
+               Theory and Application to Reward Shaping},
+  booktitle = {Proceedings of the 16th International Conference on Machine Learning (ICML)},
+  pages     = {278--287},
+  year      = {1999},
+  note      = {Potential-based shaping F(s,s')=gamma*phi(s')-phi(s) preserves optimal
+               policy. AdaptiveRewardShaper.bc\_pilot\_reward() uses phi(s)=alpha*arc\_progress\_m,
+               satisfying this invariance. Canonical cite for BC pilot reward design.}
+}
+
+@inproceedings{haarnoja2018sac_orig,
+  author    = {Haarnoja, Tuomas and Zhou, Aurick and Abbeel, Pieter and Levine, Sergey},
+  title     = {Soft Actor-Critic: Off-Policy Maximum Entropy Deep Reinforcement Learning
+               with a Stochastic Actor},
+  booktitle = {International Conference on Machine Learning (ICML)},
+  pages     = {1861--1870},
+  year      = {2018},
+  note      = {Maximum entropy RL: SAC entropy bonus aids exploration past reversed-spawn
+               trap. update\_alpha() in td3\_sac\_ensemble.py implements the dual variable
+               update from this work. See also haarnoja2018sac entry.}
+}
