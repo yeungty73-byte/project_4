@@ -773,3 +773,86 @@ class SwinUNetPP(torch.nn.Module):
         t   = torch.tensor(obs_flat_np[:self.CAM_N], dtype=torch.float32).unsqueeze(0)
         out = self.forward(t)
         return (out[0, :self.SECTORS] > 0.5).numpy()
+
+    @torch.no_grad()
+    def classify_sectors_for_brake_field(
+        self,
+        obs_flat_np: "np.ndarray",
+        rp: dict = None,
+    ) -> dict:
+        """v1.3.0: 4-class per-sector classification for CombinedBrakeField.
+
+        Classes per sector:
+          0 = center_line  (derived from rp['distance_from_center'], not Swin)
+          1 = curb         (near + low obstacle confidence)
+          2 = obstacle     (mask logit > 0.55 — static object)
+          3 = bot          (mask logit > 0.55 + rp indicates other car nearby)
+
+        Returns:
+          {
+            "sector_classes":   np.ndarray(16,) int,   per-sector class label
+            "sector_mask":      np.ndarray(16,) float, obstacle mask probabilities
+            "sector_dist":      np.ndarray(16,) float, dist estimates [0,1]
+            "front_clear":      float [0,1],  1=fully clear ahead
+            "has_bot":          bool,
+            "swin_curb_prob":   float,   mean probability across curb sectors
+            "swin_obs_prob":    float,   mean probability across obstacle sectors
+            "swin_bot_prob":    float,   max mask across bot sectors
+          }
+
+        REF:
+          Liu et al. (2021) Swin Transformer ICCV §3.
+          Cao et al. (2021) Swin-Unet arXiv:2105.05537 §3.2.
+          Zhou et al. (2019) UNet++ §3.
+        """
+        import numpy as _np
+        null_out = {
+            "sector_classes": _np.zeros(self.SECTORS, dtype=_np.int8),
+            "sector_mask":    _np.zeros(self.SECTORS, dtype=_np.float32),
+            "sector_dist":    _np.ones(self.SECTORS,  dtype=_np.float32),
+            "front_clear":    0.5, "has_bot": False,
+            "swin_curb_prob": 0.0, "swin_obs_prob": 0.0, "swin_bot_prob": 0.0,
+        }
+        if obs_flat_np is None or len(obs_flat_np) < self.CAM_N:
+            return null_out
+        try:
+            t   = torch.tensor(obs_flat_np[:self.CAM_N].astype(_np.float32)).unsqueeze(0)
+            out = self.forward(t)[0].cpu().numpy()   # (64,)
+            mask = _np.clip(1.0 / (1.0 + _np.exp(-out[:self.SECTORS])), 0.0, 1.0)
+            dist = _np.clip(out[self.SECTORS:self.SECTORS * 2], 0.0, 1.0)
+
+            has_bot = bool(
+                rp is not None and
+                rp.get("objects_location") is not None and
+                len(rp.get("objects_location", [])) > 0
+            )
+
+            classes = _np.zeros(self.SECTORS, dtype=_np.int8)
+            for s in range(self.SECTORS):
+                m, d = float(mask[s]), float(dist[s])
+                if m > 0.55:
+                    classes[s] = 3 if has_bot else 2  # bot else static obstacle
+                elif d > 0.60 and m < 0.40:
+                    classes[s] = 1   # curb: near but low obstacle confidence
+                # else 0 = center_line / clear
+
+            # Forward arc = sectors 0, 1, 15  (±22.5 deg from heading)
+            front_clear = float(1.0 - _np.max(mask[[0, 1, 15]]))
+
+            idx_curb = _np.where(classes == 1)[0]
+            idx_obs  = _np.where(classes == 2)[0]
+            idx_bot  = _np.where(classes == 3)[0]
+
+            return {
+                "sector_classes": classes,
+                "sector_mask":    mask,
+                "sector_dist":    dist,
+                "front_clear":    float(_np.clip(front_clear, 0.0, 1.0)),
+                "has_bot":        has_bot,
+                "swin_curb_prob": float(_np.mean(mask[idx_curb])) if len(idx_curb) else 0.0,
+                "swin_obs_prob":  float(_np.mean(mask[idx_obs]))  if len(idx_obs)  else 0.0,
+                "swin_bot_prob":  float(_np.max(mask[idx_bot]))   if len(idx_bot)  else 0.0,
+            }
+        except Exception:
+            return null_out
+

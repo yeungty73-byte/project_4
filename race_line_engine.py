@@ -441,12 +441,23 @@ class MultiRaceLineEngine:
         line_rewards['swin_gate'] = swin_gate
         return float(total_r), line_rewards
 
-    def get_target_speed(self, wp_idx: int, context: int) -> float:
+    def get_target_speed(
+        self, wp_idx: int, context: int,
+        brake_safe_speed: float = None,   # v1.3.0: max speed from CombinedBrakeField
+    ) -> float:
+        """Returns optimal speed at wp_idx, clamped to brake_safe_speed if provided.
+        brake_safe_speed = CombinedBrakeField.race_line_safe_speed(...).
+        This is the race-line / brake-field harmonisation contract.
+        REF: Heilmeier et al. (2020) §4 — speed profile as constraint on race line.
+        """
         if not self._initialized or self.LINE_TIME_TRIAL not in self._lines:
-            return 2.0
+            return 2.0 if brake_safe_speed is None else float(min(2.0, brake_safe_speed))
         line = (self._lines.get(self.LINE_OBSTACLE, self._lines[self.LINE_TIME_TRIAL])
                 if context in (1, 2, 3) else self._lines[self.LINE_TIME_TRIAL])
-        return float(line.speeds[wp_idx % self.n])
+        spd = float(line.speeds[wp_idx % self.n])
+        if brake_safe_speed is not None:
+            spd = float(min(spd, max(brake_safe_speed, 0.5)))
+        return spd
 
     def reset(self):
         self._initialized = False
@@ -468,6 +479,7 @@ def get_active_line_for_bc_pilot(
     context: int = 0,
     bot_progress: float = 0.0,
     own_progress: float = 0.0,
+    brake_safe_speed: float = None,   # v1.3.0: from CombinedBrakeField.race_line_safe_speed
 ) -> dict:
     """v1.2.0: single query point for BCPilot.act() to get active race line data.
 
@@ -510,6 +522,8 @@ def get_active_line_for_bc_pilot(
     idx  = wp_idx % n
     target_offset  = float(line.offsets[idx])
     target_speed   = float(line.speeds[idx])
+    if brake_safe_speed is not None:
+        target_speed = float(min(target_speed, max(brake_safe_speed, 0.5)))
     target_heading = float(line.headings[idx])
 
     # Brake-zone lookahead: speed-adaptive
@@ -530,8 +544,19 @@ def get_active_line_for_bc_pilot(
     )
 
 
-def get_speed_targets_array(engine) -> "np.ndarray | None":
-    """v1.2.0: export time_trial speed targets for BrakeField.set_waypoints().
+def get_speed_targets_array(
+    engine,
+    brake_field=None,       # v1.3.0: optional CombinedBrakeField instance
+    heading_rad: float = 0.0,
+    barrier_angle: float = 0.0,
+    obs_dist: float = 5.0,
+    curb_dist: float = 5.0,
+    bot_dist: float = 10.0,
+) -> "np.ndarray | None":
+    """v1.3.0: Export time_trial speed targets, optionally clamped to BrakeField safe speeds.
+    When brake_field is provided, each waypoint's speed is floored at
+    CombinedBrakeField.race_line_safe_speed() → brake-field and race line harmonised.
+    REF: Heilmeier et al. (2020) §4 velocity profile.
     Returns np.ndarray(N,) or None if engine not initialized.
     """
     import numpy as _np
@@ -540,4 +565,19 @@ def get_speed_targets_array(engine) -> "np.ndarray | None":
     LINE_TT = 'time_trial'
     if LINE_TT not in getattr(engine, '_lines', {}):
         return None
-    return engine._lines[LINE_TT].speeds.copy()
+    speeds = engine._lines[LINE_TT].speeds.copy()
+    if brake_field is None:
+        return speeds
+    # Clamp per-WP speed to max safe speed from brake field
+    for i in range(len(speeds)):
+        safe = brake_field.race_line_safe_speed(
+            wp_idx=i, car_speed=float(speeds[i]),
+            race_speeds=None,
+            heading_rad=heading_rad,
+            barrier_angle_rad=barrier_angle,
+            obs_dist=obs_dist,
+            curb_dist=curb_dist,
+            bot_dist=bot_dist,
+        )
+        speeds[i] = float(min(speeds[i], max(safe, 0.5)))
+    return speeds
