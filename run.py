@@ -19,6 +19,7 @@ import subprocess
 import csv as _csv
 from munch import munchify
 from torch.utils.tensorboard import SummaryWriter
+import torch.nn.functional as F
 
 from agents import PPOAgent, RandomAgent
 # REF: Schulman, J. et al. (2017). Proximal Policy Optimization Algorithms. arXiv:1707.06347.
