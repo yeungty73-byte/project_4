@@ -10,3 +10,5 @@ steering_angle:
 speed:
   min: 0.5
   max: 4.0
+SPAWN_RANDOM_HEADING: false
+INITIAL_SPEED: 0.1          # start from rest, not 2.25 m/s
