@@ -1193,3 +1193,81 @@
                warm-start handling.}
 }
 
+
+@misc{aws_deepracer_zmq_2020,
+  author       = {{Amazon Web Services}},
+  title        = {{AWS DeepRacer Developer Guide: How AWS DeepRacer Works}},
+  year         = {2020},
+  howpublished = {\url{https://docs.aws.amazon.com/deepracer/latest/developerguide/deepracer-how-it-works.html}},
+  note         = {Documents ZMQ bridge architecture; spawn speed at step-1 is Gazebo-injected read-only observation, not a settable parameter. Basis for v1.1.6b PATCH-BLEED design.}
+}
+
+@misc{aws_deepracer_actionspace_2021,
+  author       = {{Amazon Web Services}},
+  title        = {{Customizable Action Space for AWS DeepRacer}},
+  year         = {2021},
+  howpublished = {\url{https://aws.amazon.com/about-aws/whats-new/2021/08/customizable-action-space-aws-deepracer-console/}},
+  note         = {Confirms discrete action space uses JSON speed table directly; continuous mode ignores speed bounds in makeactionspace. Basis for v1.1.6b model\_metadata.json discrete-mode switch.}
+}
+
+@misc{aws_deepracer_continuous_2021,
+  author       = {{Amazon Web Services}},
+  title        = {{Using the AWS DeepRacer Soft Actor-Critic Algorithm with Continuous Action Spaces}},
+  year         = {2021},
+  howpublished = {\url{https://aws.amazon.com/blogs/machine-learning/using-the-aws-deepracer-new-soft-actor-critic-algorithm-with-continuous-action-spaces/}},
+  note         = {Confirms that continuous action space gym returns Box(-1,1,2) regardless of JSON speed bounds. Critical for understanding that agentparams.json speed.high is metadata-only in continuous mode.}
+}
+
+@inproceedings{levine2020offline,
+  author    = {Levine, Sergey and Kumar, Aviral and Tucker, George and Fu, Justin},
+  title     = {Offline Reinforcement Learning: Tutorial, Review, and Perspectives on Open Problems},
+  booktitle = {arXiv preprint arXiv:2005.01643},
+  year      = {2020},
+  note      = {Establishes that BC warm-start demonstrations must be collected from representative
+               initial state distributions. Justifies PATCH-BCPILOT-IDLE: BCPilot demonstrations
+               at spawn-speed 4.0 m/s are out-of-distribution for the policy\'s actual operating regime.}
+}
+
+@inproceedings{ng1999policy,
+  author    = {Ng, Andrew Y. and Harada, Daishi and Russell, Stuart},
+  title     = {Policy Invariance Under Reward Transformations: Theory and Application to Reward Shaping},
+  booktitle = {Proceedings of the Sixteenth International Conference on Machine Learning (ICML)},
+  year      = {1999},
+  pages     = {278--287},
+  note      = {Theorem 1: potential-based reward shaping preserves optimal policy IFF the shaping
+               function F(s,a,s\') = gamma*Phi(s\') - Phi(s). Requires correct state at t=0.
+               Basis for PATCH-BLEED: if the agent\'s t=0 state is always spawn-at-4ms,
+               the potential Phi(s_0) is miscalibrated for the entire episode.}
+}
+
+@inproceedings{koenig2004design,
+  author    = {Koenig, Nathan and Howard, Andrew},
+  title     = {Design and Use Paradigms for {Gazebo}, an Open-Source Multi-Robot Simulator},
+  booktitle = {Proceedings of the IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)},
+  year      = {2004},
+  pages     = {2149--2154},
+  doi       = {10.1109/IROS.2004.1389727},
+  note      = {Gazebo physics initialisation; spawn velocity injection via ModelSetLinearVel
+               from deepracer\_drive plugin. Establishes why spawn speed cannot be set to 0
+               via Python without a bleed loop at the gym adapter layer.}
+}
+
+@techreport{aws_deepracer_docs_2020,
+  author      = {{Amazon Web Services}},
+  title       = {{AWS DeepRacer} Developer Guide: Reward Function Reference},
+  institution = {Amazon Web Services},
+  year        = {2020},
+  url         = {https://docs.aws.amazon.com/deepracer/latest/developerguide/deepracer-reward-function-reference.html},
+  note        = {Documents is\_reversed flag and spawn behaviour. v1.1.6a forensics confirm
+                 nominal 4.0 m/s spawn but ZMQ/physics tick offset yields 2.29--4.0 m/s
+                 at step\,1 (run\_20260428\_000840.log).}
+}
+
+@misc{aws_deepracer_github,
+  author = {{Amazon Web Services}},
+  title  = {aws-deepracer: Open-Source Packages},
+  year   = {2021},
+  url    = {https://github.com/aws-deepracer/aws-deepracer},
+  note   = {deepracer\_drive plugin (ROS node) that injects velocity commands into Gazebo.
+            Confirms that throttle $\\in [0,1]$ maps to $[0, 4.0]$ m/s via internal PID.}
+}

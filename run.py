@@ -48,12 +48,11 @@ from corner_analysis import (
     LineOfSightReward,    # Garlick, J., & Middleditch, A. (2022)
     CornerAnalyzer,       # Yang, S. et al. (2023). COMPSAC
     OvertakeAnalyzer,     # Yang, S. et al. (2023). REUNS
-)
-from corner_analysis import (
+    lookahead_curvature_scan,
     compute_braking_reward,
     compute_turn_alignment_reward,
     get_stuck_antecedent_bonus,
-        build_racing_line_map,
+    build_racing_line_map,
     racing_line_reward,
 )
 from federated_pool import FederatedPool
@@ -127,6 +126,23 @@ _device_str = "cuda" if torch.cuda.is_available() else "cpu"
 device = torch.device(_device_str)   # explicit torch.device object, not a lambda/function
 
 # v210: ContextAwarePPOAgent helpers
+
+# v1.1.6b PATCH-SPEEDCAP: phase-gated speed ceiling controlled by TPA curriculum
+# Phase 0 (bootstrap): cap to 40% throttle ≈ 1.6 m/s — prevents post-bleed re-acceleration
+# Phase 1 (find-the-line): cap to 65% throttle ≈ 2.6 m/s
+# Phase 2 (go-fast): uncapped
+# TPA provides current_phase via shaper.current_phase if shaper is initialised.
+_PHASE_SPEED_CAP = {0: 0.40, 1: 0.65, 2: 1.0}
+
+def get_phase_speed_cap(shaper=None):
+    try:
+        if shaper is not None and hasattr(shaper, 'current_phase'):
+            ph = int(shaper.current_phase)
+            return _PHASE_SPEED_CAP.get(ph, 1.0)
+    except Exception:
+        pass
+    return _PHASE_SPEED_CAP.get(0, 0.40)
+
 def process_action(rawaction, actionspace):
     """Squeeze batch dim; for Discrete → argmax-then-clamp; for Box → clip."""
     a = np.asarray(rawaction)
@@ -499,6 +515,8 @@ Heilmeier et al. (2020) VSD: minimum curvature speed profile (per-WP budget).
 Ng, Harada & Russell (1999) ICML: potential-based shaping, r=alpha*delta_progress_m.
 Schulman et al. (2017) arXiv: PPO prospective penalty in short episodes.
 AWS DeepRacer docs (2020): is_reversed=True => CW driving; spawn speed 4.0 m/s.
+v1.1.6a confirmed: step-1 speed is 2.29-4.0 m/s (ZMQ/physics tick offset).
+Actual neutralisation is via gym_adapter.py PATCH-BLEED bleed loop (budget=40 steps).
 """
 
 # ── Module-level constants ────────────────────────────────────────────────────
@@ -896,6 +914,20 @@ def harvest_htm_pilots(env, htm_agent, td3sac, n_episodes=12, min_progress=2.0):
     for ep in range(max(n_episodes * 3, n_episodes)):
         obs, info = env.reset()
         rp = info.get('reward_params', {}) if isinstance(info, dict) else {}
+        # v1.1.6a PATCH-BLEED-BC: record post-bleed spawn state.
+        # gym_adapter.env_reset() now bleeds spawn velocity to ≤0.30 m/s before
+        # returning.  Log confirms step-1 speed 2.29-4.0 m/s pre-bleed.
+        # REF: Koenig & Howard (2004) — Gazebo spawn init; Ng et al. (1999) ICML.
+        _bc_spawn_speed   = float(rp.get('speed', 0.0))
+        _bc_spawn_heading = float(rp.get('heading', 0.0))
+        _bc_spawn_neutral = _bc_spawn_speed < 0.30  # post-bleed check
+        if not _bc_spawn_neutral:
+            print(
+                f"[BC-BLEED WARNING] post-bleed speed={_bc_spawn_speed:.2f} m/s "
+                f"heading={_bc_spawn_heading:.1f}° — bleed budget exhausted; "
+                f"BC Pilot ep discarded (won't count toward pilot_count).",
+                flush=True, file=sys.stderr
+            )
         _bc_progress_cache = {}
         _bc_progress_state = reset_episode_centerline_progress(rp, _bc_progress_cache)
         ep_buf, ep_prog = [], 0.0
@@ -943,7 +975,12 @@ def harvest_htm_pilots(env, htm_agent, td3sac, n_episodes=12, min_progress=2.0):
             if torch.isfinite(obs_t).all() and torch.isfinite(nobs_t).all():
                 ep_buf.append((obs_t, act_t, _bc_reward, nobs_t, float(terminated or truncated)))
             obs, rp = next_obs, next_rp
-        if ep_buf and ep_prog >= float(min_progress):
+        # v1.1.6a PATCH-BLEED-BC-GUARD: discard episode if post-bleed spawn not neutral.
+        # A non-neutral spawn means the bleed budget expired → BC Pilot crashed immediately.
+        # Storing these transitions would teach the RL agent to also crash on spawn.
+        if not _bc_spawn_neutral:
+            pass  # discard — non-neutral spawn, BC Pilot crashed during bleed deficit
+        elif ep_buf and ep_prog >= float(min_progress):
             for transition in ep_buf:
                 td3sac.store_transition(*transition)
                 stored += 1
@@ -1037,6 +1074,7 @@ class BCPilot:
             while diff < -180: diff += 360
             return diff
         except Exception:
+            print("head to track failed")
             return 0.0
 
     def act(self, rp: dict):
@@ -1050,7 +1088,7 @@ class BCPilot:
 
         if len(waypoints) < 3:
             # v1.1.1: output in env space [steer in [-1,1], throttle in [0,1]]
-            return _np.array([0.0, 0.3], dtype=_np.float32)
+            return np.array([0.0, 0.3], dtype=np.float32)
 
         # --- Heading recovery: if >45deg off track tangent, align first ---
         hdiff = self._heading_to_track(rp)
@@ -1061,16 +1099,16 @@ class BCPilot:
             # Fix: slow crawl during realignment so steering torque actually bites.
             steer_sign = -1.0 if hdiff > 0 else 1.0
             steer_strength = min(1.0, abs(hdiff) / 45.0)  # v1.1.1: sharper corrective gain
-            return _np.array([steer_sign * steer_strength, 0.15], dtype=_np.float32)  # v1.1.1: slow crawl
+            return np.array([steer_sign * steer_strength, 0.15], dtype=np.float32)  # v1.1.1: slow crawl
 
         # --- Reversal recovery ---
         if is_reversed:
             # v1.1.1: reversed + large hdiff -> compound error needs stronger steer + slow throttle.
             # At reversed=-180deg AND spawn hdiff=-77.7deg, /90 gain was too gentle.
             hdiff_rev = self._heading_to_track(rp)
-            steer_rev = _np.clip(-hdiff_rev / 60.0, -1.0, 1.0)   # v1.1.1: sharper gain /60 (was /90)
+            steer_rev = np.clip(-hdiff_rev / 60.0, -1.0, 1.0)   # v1.1.1: sharper gain /60 (was /90)
             _rev_throttle = 0.20 if abs(hdiff_rev) > 30.0 else 0.35  # v1.1.1: slow when misaligned
-            return _np.array([steer_rev, _rev_throttle], dtype=_np.float32)
+            return np.array([steer_rev, _rev_throttle], dtype=np.float32)
 
         # --- Normal racing line control ---
         # v1.1.0: speed-adaptive lookahead — faster speed = look further ahead
@@ -1081,17 +1119,19 @@ class BCPilot:
                 waypoints, closest, max_lookahead=_la_wps
             )
         except Exception:
+            print("corn an failed")
             safe_speed, dist_to_corner = 2.5, 5.0
 
         try:
             rl_offset = compute_racing_line_offset(waypoints, closest, tw, lookahead=max(6, _la_wps // 2))
         except Exception:
+            print("race line failed")
             rl_offset = 0.0
 
         lat_err = (rl_offset * tw / 2.0) - dist_ctr * (1 if is_left else -1)
         # v1.1.0: track-width-adaptive steering gain — prevents overcorrection on narrow tracks
         _steer_gain = max(0.8, min(1.5, 0.6 / max(tw, 0.3)))
-        steering = float(_np.clip(lat_err / max(tw * 0.5, 0.01) * _steer_gain, -1.0, 1.0))
+        steering = float(np.clip(lat_err / max(tw * 0.5, 0.01) * _steer_gain, -1.0, 1.0))
 
         # v1.1.1: throttle directly in env space [0,1] — NO process_action remapping
         # braker<0.4 → needs to brake → throttle=0.05 (near zero)
@@ -1112,7 +1152,7 @@ class BCPilot:
         throttle = _throttle_base * (_floor_frac + (1.0 - _floor_frac) * float(braker))
         throttle = max(0.22, throttle)  # hard floor — car must always creep forward
 
-        return _np.array([steering, throttle], dtype=_np.float32)
+        return np.array([steering, throttle], dtype=np.float32)
 
 # v1.1.1: Lightweight observation preprocessor
 # obs_dim=38464 is a flattened LIDAR/camera image — too large for BC bootstrap.
@@ -1124,7 +1164,6 @@ def extract_compact_obs(obs_raw, rp: dict, waypoints, closest) -> np.ndarray:
     Falls back to zeros for missing fields. Always returns shape (12,).
     Use this alongside or instead of raw obs for RL state.
     """
-    import math as math
     try:
         speed = float(rp.get("speed", 0.0))
         dist_ctr = float(rp.get("distance_from_center", 0.0))
@@ -1153,12 +1192,12 @@ def extract_compact_obs(obs_raw, rp: dict, waypoints, closest) -> np.ndarray:
 
         # Curvature ahead
         try:
-            from corner_analysis import lookahead_curvature_scan
             _, _, safe_speed, dist_to_corner = lookahead_curvature_scan(
                 waypoints, closest, max_lookahead=10)
             curv_signal = (speed - safe_speed) / max(safe_speed, 0.1)  # >0 means too fast
             dist_corner_norm = min(dist_to_corner / 5.0, 1.0)
         except Exception:
+            print("corner analysis failed at BC @ extract_compact_obs")
             curv_signal = 0.0
             dist_corner_norm = 1.0
 
@@ -1327,7 +1366,7 @@ class BootstrapRewardController:
 
 
 def run(hparams):
-    global os
+    global os, math
     # v203: allow bypass when GYM_BRIDGE_OPTIONAL=1 (Ed #586 local-loop mode)
     # v205: auto-bootstrap deepracer container
     _auto_bootstrap_deepracer()
@@ -2310,7 +2349,7 @@ def run(hparams):
                         _bf_barrier_angle = float(_barrier_angle_rad) if '_barrier_angle_rad' in dir() else 0.0
                         _bf_actual_decel  = float(ep_prev_speed - _speed) if ep_prev_speed > 0 else 0.0
                         # v1.3.0: CombinedBrakeField.step() — per-class vector fields
-                        # Pass full context; obs_flat_np drives SwinUNetPP 4-class perception.
+                        # Pass full context; obs_flatnp drives SwinUNetPP 4-class perception.
                         _bf_obs_raw = obs if obs is not None and hasattr(obs, '__len__') and len(obs) >= 19200 else None
                         _bf_step          = _brake_field.step(
                             wp_idx          = _closest[0] if _closest else 0,
@@ -2345,7 +2384,7 @@ def run(hparams):
                                              if '_dist_from_center' in dir() else 0.0,
                             track_half_w    = float(_track_width) / 2.0 if '_track_width' in dir() else 0.30,
                             # SwinUNetPP full obs for 4-class perception
-                            obs_flat_np     = _bf_obs_raw,
+                            obs_flatnp     = _bf_obs_raw,
                             # v1.4.0: AdaptiveRewardShaper per-WP curb urgency
                             # Scales effective curb distance down for historically dangerous WPs
                             # REF: Khatib (1986) APF -- repulsive field magnitude vs approach velocity
@@ -2537,9 +2576,8 @@ def run(hparams):
 
             
             # v13: On-track bonus (no penalties, only rewards)
-            rp_v7 = info.get("reward_params", {})
             # v7: Speed bonus for staying on track
-            if rp_v7.get("speed", 0) > 1.0 and not _offtrack and not _is_rev:
+            if _speed > 1.0 and not _offtrack and not _is_rev:
                 reward += 0.5 * min(_speed * 4.0, 1.0)
             cumulative_ep_reward += reward
 
@@ -3373,6 +3411,11 @@ def run(hparams):
                         # and episode_summary_metrics use real values, not 0.6 / 100 defaults.
                         'track_width':  float(_tw) if '_tw' in dir() and _tw else 0.6,
                         'n_waypoints':  len(_waypoints) if '_waypoints' in dir() and _waypoints else 120,
+                        # v1.1.6a PATCH-BLEED-LOG: forward post-bleed spawn telemetry to
+                        # episode_summary_metrics and BSTS Kalman.  Pre-bleed the sim injected
+                        # 2.29-4.0 m/s; post-bleed this should be ≤0.30 m/s.
+                        'spawn_speed':   float(_reset_info_rp.get('speed', 0.0)) if '_reset_info_rp' in dir() else 0.0,
+                        'spawn_heading': float(_reset_info_rp.get('heading', 0.0)) if '_reset_info_rp' in dir() else 0.0,
                         # v1.1.5e FIX-I: forward real arc length so _track_progress() guard
                         # (< 99.0) passes. rp['tracklength'] = 16.635 confirmed in every step.
                         # ep_track_length_m=16.6 after FIX-O; both are < 99.0, guard passes.
