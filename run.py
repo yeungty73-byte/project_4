@@ -1787,6 +1787,29 @@ def run(hparams):
     # start
     global_step = 0
     episode_count = 0
+    # v1.1.5b PATCH-Z: clear ALL per-episode accumulators before new episode spawn
+    # REF: v1.1.5d Bug Z -- ep_ante_buf never cleared between episodes.
+    #      ep17 ANTE t-16 showed step=1 (ep17 spawn), t-17 showed step=13 (ep16 final)
+    ep_ante_buf = []
+    _ep_step_log = []
+    ep_step_count = 0
+    cumulative_ep_reward = 0.0
+    _prev_prog_tracker = 0.0
+    ep_speeds = []; ep_headings = []; ep_closest_wps = []; ep_dist_from_center = []
+    ep_heading_diffs = []; ep_steerings_raw = []; ep_positions = []; ep_progress_hist = []
+    ep_context_preds = []; ep_lidar_mins = []; ep_barrier_proximities = []; ep_nearest_objects = []
+    ep_ang_vel_centerline = []; ep_jerk_abs = []; ep_brake_before_barrier = []
+    ep_decel_penalties = []; ep_safe_speed_ratios = []; ep_racing_line_errors = []
+    ep_corner_speeds = []; ep_turn_entry_speeds = []
+    ep_offtrack_count = 0; ep_offtrack_steps = 0; ep_recovery_steps = 0
+    ep_reversed_count = 0; ep_zero_speed_count = 0; ep_graze_count = 0
+    ep_in_recovery = False; ep_first_offtrack_step = None
+    ep_crash_ctx = None; ep_crash_speed = None; ep_crash_heading = None
+    ep_crash_closest_wp = None; ep_crash_lidar_min = None
+    ep_progress = 0.0; ep_progress_pct = 0.0; ep_centerline_progress_m = 0.0
+    ep_track_progress_pct = 0.0; ep_prev_speed = 0.0; ep_prev_accel = None
+    ep_start_time = time.time()
+    for _rc_key in ep_rewards_components: ep_rewards_components[_rc_key] = []
     observation, info = env.reset()
     # v1.3.1: detect spawn reversal and log heading for debugging
     _reset_info_rp = info.get('reward_params', {}) if isinstance(info, dict) else {}
@@ -2081,6 +2104,13 @@ def run(hparams):
             # Now only created once per episode (at episode start below).
             if rp:
                 _speed = rp.get("speed", 0)
+                # v1.1.5b PATCH-BB: update ep_track_length_m from rp per-step
+                # REF: Bug BB -- tracklengthm 0.0 in Kalman. rp["tracklength"]=16.635021
+                #      confirmed at step1 in log, but ep_track_length_m was only updated
+                #      from waypoint arc calc, not from rp["tracklength"] directly.
+                _tl_rp = rp.get('tracklength') or rp.get('track_length')
+                if _tl_rp and float(_tl_rp) > 1.0:
+                    ep_track_length_m = max(ep_track_length_m, float(_tl_rp))
                 # v4-bsts: barrier proximity from LIDAR and objects
                 _lidar = rp.get('lidar', [])
                 _lidar_min = min(_lidar) if _lidar else 1.0
@@ -3029,6 +3059,22 @@ def run(hparams):
                     # Empty dict → `.get(k, neutral_default)` in the merge block below uses correct neutrals.
                     # race_line_adherence neutral=0.5, brake_compliance neutral=1.0 (vacuously compliant).
                     _hm_out = {}
+                # v1.1.5b PATCH-CC: unconditional neutral floor for bsts_metrics compliance keys
+                # REF: Bug CC -- Kalman X-matrix reads summary (underscored keys).
+                #      When compute_all() throws => _hm_out={} => 3-tier merge writes 0.0
+                #      not neutral. Fix: write neutral floor to bsts_metrics before merge.
+                import math as _math_cc
+                _CC_NEUTRALS = {
+                    'race_line_adherence': 0.5, 'brake_compliance': 1.0,
+                    'brake_field_compliance_gradient': 1.0,
+                    'race_line_compliance_gradient': 0.5,
+                }
+                for _cc_k, _cc_n in _CC_NEUTRALS.items():
+                    _cc_cur = bsts_metrics.get(_cc_k)
+                    _cc_bad = (_cc_cur is None or
+                               not _math_cc.isfinite(float(_cc_cur if _cc_cur is not None else float("nan"))))
+                    if _cc_bad:
+                        bsts_metrics[_cc_k] = float(_hm_out.get(_cc_k, _cc_n) if _hm_out else _cc_n)
                 # v213: race-type tag for plot/CSV differentiation
                 _race_type_tag = {
                     'time_trial': 'tt',
@@ -3193,7 +3239,11 @@ def run(hparams):
                 # v1.1.1: skip BSTS weight adjustment during bootstrap.
                 # BSTS was overwriting bootstrap progress weights -> rw_adj:prog collapsed 0.127->0.026.
                 if _bootstrap_active:
-                    _adjusted_rw = rw  # bootstrap weights unchanged during bootstrap phase
+                    _adjusted_rw = rw
+                    _adjusted_rw['progress']    = max(_adjusted_rw.get('progress', 0.0), 0.45)
+                    _adjusted_rw['racing_line'] = min(_adjusted_rw.get('racing_line', 0.0), 0.04)
+                    _adjusted_rw['curv_speed']  = min(_adjusted_rw.get('curv_speed', 0.0), 0.02)
+                    _adjusted_rw = {k: v / sum(_adjusted_rw.values()) for k, v in _adjusted_rw.items()}
                 else:
                     _adjusted_rw = bsts_feedback.adjust_weights(rw)
                 # --- Rich BSTS console log every episode ---
