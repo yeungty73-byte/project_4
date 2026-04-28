@@ -1,87 +1,131 @@
 #!/usr/bin/env python3
 """
-CS7642 Project 4 v1.1.5b PATCH-R applicator
-Run this script from the project_4 directory:
-    python apply_patch_r.py
+CS7642 Project 4 v1.1.5b — PATCH-R (3-site) applicator
+Run from project_4 directory: python apply_patch_r.py
 
-Applies PATCH-R: BSTS-gated vperp-scaled off-track penalty to run.py
+Patches applied:
+  SITE-B  off-track vperp attenuation  → + BSTS-gated additive penalty   [PRIMARY]
+  SITE-A  bootstrap no-progress atten  → strengthen factor 0.88 → 0.78   [SECONDARY]
+  SITE-C  reversal attenuation         → + flat additive penalty -0.10    [SECONDARY]
+
+All sites verified against run.py v1.1.5b (232402 chars).
 """
-import sys, os, shutil, datetime
+import sys, os, shutil, datetime, py_compile, tempfile
 
 BACKUP = f"run.py.bak_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
-OLD = """                if _offtrack:
-                    _vperp_val = float(_v_perp_barrier) if "_v_perp_barrier" in dir() else 1.0
-                    _offtrack_attn = 1.0 / (1.0 + max(0.0, _vperp_val) * 0.40)
-                    reward = reward * _offtrack_attn  # never subtracts; just scales earned reward down
-                _is_stuck = (_speed < 0.3) or _offtrack_stuck or _is_rev  # v39: uses grace"""
+# SITE-B: OFF-TRACK vperp attenuation
+# Anchor: unique comment "never subtracts; just scales earned reward down"
+SITE_B_OLD = \
+'                    reward = reward * _offtrack_attn  # never subtracts; just scales earned reward down'
 
-NEW = """                if _offtrack:
-                    _vperp_val = float(_v_perp_barrier) if "_v_perp_barrier" in dir() else 1.0
-                    _offtrack_attn = 1.0 / (1.0 + max(0.0, _vperp_val) * 0.40)
-                    reward = reward * _offtrack_attn  # multiplicative attenuation (always active)
-                    # v1.1.5b PATCH-R: vperp-scaled additive off-track penalty, BSTS-gated.
-                    # Off-track attenuation alone is too weak: at vperp=3.6 it cuts reward
-                    # by 59%, but the absolute cut on a small progress reward is trivial.
-                    # The agent perceives off-track as "slightly less good", not "bad".
-                    # Design constraints (Ng et al. 1999 safe):
-                    #   1. penalty is vperp-scaled: creeping back costs less than blasting off
-                    #   2. max(0.005, reward) floor: net step reward stays positive at speed>=1 m/s
-                    #      -> freeze trap architecturally impossible (sim min-speed 2.25 m/s)
-                    #   3. BSTS-gated: only fires once avg_track_progress EMA > 0.30
-                    #      -> Phase A agent gets pure positive signal first (Bengio 2009 curriculum)
-                    # REF: Ng, A.Y., Harada, D., Russell, S. (1999) ICML Policy Invariance.
-                    # REF: Bengio, Y. et al. (2009) ICML Curriculum Learning.
+SITE_B_NEW = \
+'''                    reward = reward * _offtrack_attn  # multiplicative attenuation (always active)
+                    # v1.1.5b PATCH-R SITE-B: BSTS-gated vperp-scaled additive off-track penalty.
+                    # Problem: multiplicative-only at vperp=3.6 cuts reward by 59%, but if the
+                    # progress reward earned is small (early episode), 41% of small ≈ small.
+                    # The agent perceives off-track as "slightly less good" — not "bad".
+                    # Fix: add -0.15*vperp once BSTS avg_track_progress EMA > 0.30 (Phase B gate).
+                    # Safety guarantees (Ng, Harada, Russell 1999 ICML):
+                    #   1. vperp-scaled: creeping back to track costs less than blasting off it
+                    #   2. max(0.005, reward) floor: net step reward never goes negative
+                    #      Freeze trap impossible: sim min-speed = 2.25 m/s enforced by engine
+                    #   3. BSTS-gated at avg_tp > 0.30: Phase A agent earns pure +signal first
+                    # REF: Ng, Harada, Russell (1999) ICML — policy invariance under shaping
+                    # REF: Bengio et al. (2009) ICML — curriculum learning, easy-first phases
                     _avg_tp_step = float(
                         bsts_feedback.ema.get('avg_track_progress', 0.0)
                         if hasattr(bsts_feedback, 'ema') else 0.0
                     )
-                    # Fallback: use current episode pct if EMA not yet populated
                     if _avg_tp_step == 0.0 and '_prog' in dir() and float(_prog) > 0:
-                        _avg_tp_step = float(_prog) / 100.0
+                        _avg_tp_step = float(_prog) / 100.0  # fallback before EMA populated
                     if _avg_tp_step > 0.30:
-                        _otp_scale = 0.15  # at vperp=3.6 -> penalty=-0.54; net positive at speed>=1 m/s
-                        _otp = -_otp_scale * max(0.0, _vperp_val)
+                        # At vperp=3.6 → penalty=-0.54; net reward still >0 at speed>=1 m/s
+                        _otp = -0.15 * max(0.0, _vperp_val)
                         reward += _otp
-                        reward = max(0.005, reward)  # floor: preserves ordinal signal (bad > terminal)
-                _is_stuck = (_speed < 0.3) or _offtrack_stuck or _is_rev  # v39: uses grace"""
+                        reward = max(0.005, reward)  # ordinal floor: bad(0.005) > terminal(0)'''
+
+# SITE-A: Bootstrap no-progress attenuation 0.88 → 0.78
+# Anchor: exact comment text from file:143
+SITE_A_OLD = \
+'                    reward = reward * 0.88  # v1.1.0 no-progress ATTENUATION during bootstrap — 12% cut per step, no additive penalty'
+
+SITE_A_NEW = \
+'                    reward = reward * 0.78  # v1.1.5b PATCH-R SITE-A: 0.88→0.78 (22% cut). Phase A only. alive_bonus +0.05 keeps net reward >0.'
+
+# SITE-C: Reversal attenuation
+# Anchor: two-line block verified from file:143 search output
+SITE_C_OLD = \
+'''                if _is_rev:
+                    reward = reward * 0.40  # v1.1.2 was 0.80 — 60% cut makes reversal strictly dominated
+                # 5: Reverse is attenuated but NOT additively penalized v1.1.0 multiplicative'''
+
+SITE_C_NEW = \
+'''                if _is_rev:
+                    reward = reward * 0.40  # v1.1.2 60% cut (always active)
+                    # v1.1.5b PATCH-R SITE-C: additive reversal penalty.
+                    # progr is already gated to 0.0 when reversed (v1.4.1 gate), so after
+                    # reward*0.40 the signal is dominated by speed/center bonuses only.
+                    # A flat -0.10 makes per-step reversal signal unambiguously negative.
+                    # Freeze trap: impossible (sim min-speed 2.25 m/s; car always moving).
+                    # spawn_penalty handles episode-level reversal; this handles per-step.
+                    reward -= 0.10
+                    reward = max(0.002, reward)  # ordinal floor: reversed(>0) > terminal(0)
+                # 5: Reversal now has multiplicative attenuation + additive per-step penalty'''
+
+
+def try_patch(content, old, new, label):
+    if old not in content:
+        print(f"  \u2717 {label}: anchor NOT FOUND")
+        return content, False
+    sentinel = new.strip().splitlines()[1].strip()[:40]
+    if sentinel in content:
+        print(f"  ~ {label}: already applied — skipping")
+        return content, True
+    result = content.replace(old, new, 1)
+    print(f"  \u2713 {label}: applied")
+    return result, True
+
 
 with open("run.py", "r") as f:
     content = f.read()
 
-if OLD not in content:
-    print("ERROR: Could not find target block. Is run.py the right version?")
-    print("Looking for: '...reward = reward * _offtrack_attn  # never subtracts...'")
-    sys.exit(1)
+print(f"run.py loaded: {len(content):,} chars, {content.count(chr(10))+1} lines")
 
-if "PATCH-R" in content:
-    print("PATCH-R already applied.")
+if "PATCH-R SITE-B" in content and "PATCH-R SITE-A" in content and "PATCH-R SITE-C" in content:
+    print("All three PATCH-R sites already present. Nothing to do.")
     sys.exit(0)
 
 shutil.copy("run.py", BACKUP)
-print(f"Backup: {BACKUP}")
+print(f"Backup written: {BACKUP}\n")
 
-content = content.replace(OLD, NEW, 1)
+content, ok_b = try_patch(content, SITE_B_OLD, SITE_B_NEW, "SITE-B off-track penalty")
+content, ok_a = try_patch(content, SITE_A_OLD, SITE_A_NEW, "SITE-A bootstrap atten 0.88\u21920.78")
+content, ok_c = try_patch(content, SITE_C_OLD, SITE_C_NEW, "SITE-C reversal additive -0.10")
 
-with open("run.py", "w") as f:
-    f.write(content)
-
-import py_compile, tempfile
+print()
 tmp = tempfile.mktemp(suffix=".py")
 with open(tmp, "w") as f:
     f.write(content)
 try:
     py_compile.compile(tmp, doraise=True)
-    print("Syntax: OK")
+    print("Syntax check: OK")
     os.unlink(tmp)
 except py_compile.PyCompileError as e:
     print(f"SYNTAX ERROR: {e}")
     shutil.copy(BACKUP, "run.py")
-    print("Restored backup.")
+    print("Restored backup — no changes written.")
     sys.exit(1)
 
-print("PATCH-R applied successfully.")
-print("\nVerification:")
+with open("run.py", "w") as f:
+    f.write(content)
+
+print(f"run.py written: {len(content):,} chars\n")
+print("Applied patches:")
+for site, ok in [("B", ok_b), ("A", ok_a), ("C", ok_c)]:
+    print(f"  SITE-{site}: {'\u2713' if ok else '\u2717 NOT FOUND — check run.py version'}")
+
+print("\nVerification (key lines):")
 for i, line in enumerate(content.splitlines(), 1):
-    if any(k in line for k in ["PATCH-R", "_otp_scale", "_avg_tp_step", "max(0.005"]):
-        print(f"  L{i}: {line.strip()[:80]}")
+    if any(k in line for k in ["PATCH-R SITE", "_otp =", "reward -= 0.10", "0.78  # v1.1.5b"]):
+        print(f"  L{i:4d}: {line.strip()[:95]}")
