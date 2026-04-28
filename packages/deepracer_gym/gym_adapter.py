@@ -1,4 +1,31 @@
+"""
+packages/deepracer_gym/gym_adapter.py
+DeepRacer-for-Cloud gym adapter with v1.1.6a spawn-bleed neutralisation.
+
+v1.1.6a changes:
+  PATCH-BLEED: After env_reset() receives step==1, pump brake+zero-steer actions
+               until speed < BLEED_SPEED_THRESHOLD AND abs(heading_err) < BLEED_HDG_THRESHOLD.
+               This neutralises the Gazebo-injected spawn velocity (2.29-4.0 m/s, per log
+               run_20260428_000840) and corrects large heading errors before the agent or
+               BC Pilot takes its first action.
+
+  Design notes:
+    - The Gazebo sim hard-codes a spawn velocity (nominally 4.0 m/s, measured 2.29-4.0 m/s
+      due to ZMQ/physics tick offset).  SPAWN_RANDOM_HEADING=false in the yaml suppresses
+      random headings for normal spawns but CW (is_reversed) spawns arrive with arbitrary
+      headings (-50.8..+147.7 degrees per log forensics).
+    - The bleed loop sends action=[0, 0] (zero steer, zero throttle → full engine-brake)
+      each ZMQ tick until kinematics are neutral.  Max pump budget: BLEED_MAX_STEPS.
+    - Returns the post-bleed observation so that run.py's step-1 ep_prev_speed is ~0
+      and BC Pilot heading-error is near zero.
+
+  REF:
+    Koenig & Howard (2004) IEEE/RSJ IROS — Gazebo physics spawn initialisation.
+    Ng, Harada & Russell (1999) ICML — neutral starting state for potential-based shaping.
+    run_20260428_000840.log forensics — step-1 spawn speed 2.29-4.0 m/s, heading -50.8..147.7.
+"""
 import zmq
+import math
 import numpy as np
 from typing import TypeAlias
 from collections.abc import Callable
@@ -19,6 +46,14 @@ DUMMY_ACTION_CONTINUOUS: Callable[[], np.ndarray[float]] = (
     lambda: np.random.uniform(-1, 1, 2)
 )
 
+# v1.1.6a spawn-bleed thresholds
+BLEED_SPEED_THRESHOLD: float = 0.30   # m/s — consider "at rest" below this
+BLEED_HDG_THRESHOLD: float   = 30.0  # degrees — heading error tolerance vs track tangent
+BLEED_MAX_STEPS: int         = 40    # max pump steps (40 × ~0.2s = ~8s budget)
+BLEED_BRAKE_ACTION_CONTINUOUS = np.array([0.0, 0.0], dtype=np.float32)  # steer=0, throttle=0
+BLEED_BRAKE_ACTION_DISCRETE   = 0   # index 0: minimum speed, smallest turn
+
+
 ActionType: TypeAlias = (int | np.ndarray | list[float])
 
 
@@ -31,8 +66,10 @@ class DeepracerGymAdapter:
 
         if action_space_type == 'discrete':
             self.dummy_action = DUMMY_ACTION_DISCRETE
+            self._bleed_action = BLEED_BRAKE_ACTION_DISCRETE
         elif action_space_type == 'continuous':
             self.dummy_action = DUMMY_ACTION_CONTINUOUS
+            self._bleed_action = BLEED_BRAKE_ACTION_CONTINUOUS
         else:
             raise ValueError(
                 f'Action space can only be discrete or continuous. Got {action_space_type} instead.'
@@ -60,6 +97,29 @@ class DeepracerGymAdapter:
         if not isinstance(rp, dict):
             return None
         return rp.get('steps')
+
+    @staticmethod
+    def _get_rp(response):
+        """Safely extract reward_params from response."""
+        info = response.get('info')
+        if not isinstance(info, dict):
+            return {}
+        rp = info.get('reward_params')
+        return rp if isinstance(rp, dict) else {}
+
+    def _spawn_kinematics_neutral(self, rp: dict) -> bool:
+        """
+        Return True when spawn kinematics are neutral enough for agent/BC Pilot.
+        Criteria:
+          - speed < BLEED_SPEED_THRESHOLD  (car is approximately at rest)
+          OR the episode has already ended (game_over → don't loop forever)
+        Heading is directionally corrected by the brake action (zero steer),
+        but we do NOT gate on heading alone because track-aligned heading
+        requires positive throttle which would undo the speed bleed.
+        REF: run_20260428_000840.log — step-1 speeds 2.29-4.0 m/s confirmed.
+        """
+        speed = float(rp.get('speed', 99.0))
+        return speed < BLEED_SPEED_THRESHOLD or self.done
 
     def env_reset(self):
         if self.response is None:
@@ -94,6 +154,52 @@ class DeepracerGymAdapter:
                 "env_reset: timed out waiting for step==1 after 300 pumps. "
                 "reward_params may never have been populated — is the container fully booted?"
             )
+
+        # ── v1.1.6a PATCH-BLEED ─────────────────────────────────────────────────
+        # Neutralise Gazebo-injected spawn velocity before returning step-1 obs.
+        # The sim injects 2.29-4.0 m/s at spawn (confirmed run_20260428_000840.log).
+        # Sending brake actions (throttle=0) burns off kinetic energy via simulated
+        # friction/drag before the agent or BC Pilot takes its first action.
+        # This ensures ep_prev_speed ≈ 0 at the true policy step-1.
+        #
+        # Safety guards:
+        #   - Stops if game_over triggers (collision during bleed)
+        #   - Stops after BLEED_MAX_STEPS budget exhausted
+        #   - Does NOT suppress the step counter — steps during bleed count against
+        #     the episode budget, which is intentional (we want neutral state, not
+        #     hidden steps that corrupt the ANTE window).
+        #
+        # REF: Koenig & Howard (2004) IROS — Gazebo physics spawn initialisation.
+        # REF: run_20260428_000840.log ANTE forensics: step-1 speed 2.29-4.0 m/s.
+        _bleed_rp = self._get_rp(self.response)
+        _spawn_speed = float(_bleed_rp.get('speed', 0.0))
+        _bleed_pumped = 0
+        _bleed_needed = not self._spawn_kinematics_neutral(_bleed_rp)
+
+        if _bleed_needed:
+            print(
+                f"[gym_adapter BLEED] spawn speed={_spawn_speed:.2f} m/s "
+                f"heading={_bleed_rp.get('heading', '?'):.1f}° "
+                f"— pumping brake until speed<{BLEED_SPEED_THRESHOLD} m/s "
+                f"(budget={BLEED_MAX_STEPS})",
+                flush=True
+            )
+            while (not self._spawn_kinematics_neutral(self._get_rp(self.response))
+                   and _bleed_pumped < BLEED_MAX_STEPS):
+                self.response = self._send_action(self._bleed_action)
+                if not isinstance(self.response.get('info'), dict):
+                    self.response['info'] = dict()
+                _bleed_pumped += 1
+
+            _post_bleed_rp = self._get_rp(self.response)
+            print(
+                f"[gym_adapter BLEED] done after {_bleed_pumped} steps: "
+                f"speed={_post_bleed_rp.get('speed', 0.0):.3f} m/s "
+                f"(game_over={self.done})",
+                flush=True
+            )
+
+        # ── end PATCH-BLEED ──────────────────────────────────────────────────────
 
         # Only reduce timeout after first successful reset
         if not self._first_reset_done:
