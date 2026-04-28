@@ -1014,7 +1014,6 @@ class BCPilot:
 
     def _heading_to_track(self, rp):
         """Compute signed angle between car heading and track tangent (deg)."""
-        import math as _math
         waypoints = rp.get("waypoints", self.waypoints)
         closest = rp.get("closest_waypoints", [0, 1])
         heading = float(rp.get("heading", 0.0))
@@ -1027,7 +1026,7 @@ class BCPilot:
             # v1.1.2 fix: if p0==p1 (loop-closure duplicate), advance by 1
             if abs(p0[0]-p1[0]) < 1e-4 and abs(p0[1]-p1[1]) < 1e-4:
                 p1 = waypoints[(closest[1] + 1) % n]
-            track_angle = _math.degrees(_math.atan2(p1[1] - p0[1], p1[0] - p0[0]))
+            track_angle = math.degrees(math.atan2(p1[1] - p0[1], p1[0] - p0[0]))
             diff = heading - track_angle
             # Normalize to [-180, 180]
             while diff > 180:  diff -= 360
@@ -1037,8 +1036,6 @@ class BCPilot:
             return 0.0
 
     def act(self, rp: dict):
-        import numpy as _np
-        import math as _math
         waypoints = rp.get("waypoints", self.waypoints)
         closest = rp.get("closest_waypoints", [0, 1])
         speed = float(rp.get("speed", 0.0))
@@ -1123,7 +1120,7 @@ def extract_compact_obs(obs_raw, rp: dict, waypoints, closest) -> np.ndarray:
     Falls back to zeros for missing fields. Always returns shape (12,).
     Use this alongside or instead of raw obs for RL state.
     """
-    import math as _math
+    import math as math
     try:
         speed = float(rp.get("speed", 0.0))
         dist_ctr = float(rp.get("distance_from_center", 0.0))
@@ -1139,7 +1136,7 @@ def extract_compact_obs(obs_raw, rp: dict, waypoints, closest) -> np.ndarray:
             n = len(waypoints)
             p0 = waypoints[closest[0] % n]
             p1 = waypoints[closest[1] % n]
-            track_angle = _math.degrees(_math.atan2(p1[1]-p0[1], p1[0]-p0[0]))
+            track_angle = math.degrees(math.atan2(p1[1]-p0[1], p1[0]-p0[0]))
             hdiff = heading - track_angle
             while hdiff > 180: hdiff -= 360
             while hdiff < -180: hdiff += 360
@@ -1326,6 +1323,7 @@ class BootstrapRewardController:
 
 
 def run(hparams):
+    global os
     # v203: allow bypass when GYM_BRIDGE_OPTIONAL=1 (Ed #586 local-loop mode)
     # v205: auto-bootstrap deepracer container
     _auto_bootstrap_deepracer()
@@ -1355,7 +1353,7 @@ def run(hparams):
 
     # --- Track identification ---
     try:
-        import os as _os; _base_dir = _os.path.dirname(_os.path.abspath(__file__)); _env_params_path = getattr(args, 'environment_params_path', _os.path.join(_base_dir, 'configs', 'environment_params.yaml'))
+        _base_dir = os.path.dirname(os.path.abspath(__file__)); _env_params_path = getattr(args, 'environment_params_path', os.path.join(_base_dir, 'configs', 'environment_params.yaml'))
         with open(_env_params_path) as _ef:
             for _line in _ef:
                 _line = _line.strip()
@@ -2674,6 +2672,19 @@ def run(hparams):
                         0.5 * (float(_bf_compliance_grad) if '_bf_compliance_grad' in dir() else 1.0)
                         + 0.5 * (float(_rl_compliance_grad) if '_rl_compliance_grad' in dir() else 0.5)
                     ),
+                    # v1.1.5d PATCH-Q: forward avg_track_progress so adjust_weights() Phase A/B/C
+                    # gate can read it from bsts_feedback EMA. Without this, adjust_weights()
+                    # has no curriculum progress signal → Phase A progress-dominant weights never lift.
+                    # REF: Bengio et al. (2009) ICML -- easy-first curriculum requires progress EMA.
+                    'avg_track_progress': float(
+                        (ep_centerline_progress_m / max(float(ep_track_length_m), 1.0))
+                        if ('ep_centerline_progress_m' in dir() and 'ep_track_length_m' in dir()
+                            and float(ep_track_length_m) > 1.0)
+                        else (float(_prog) / 100.0 if '_prog' in dir() else 0.0)
+                    ),
+                    # v1.1.5d PATCH-Q: also track brake_compliance for Phase B divergence gate.
+                    'brake_compliance': float(_bf_compliance_grad) if '_bf_compliance_grad' in dir() else 1.0,
+                    'race_line_compliance': float(_rl_compliance_grad) if '_rl_compliance_grad' in dir() else 0.5,
                 },
                 step=global_step,
                 race_type_tag=_track_variant,
@@ -3063,7 +3074,6 @@ def run(hparams):
                 # REF: Bug CC -- Kalman X-matrix reads summary (underscored keys).
                 #      When compute_all() throws => _hm_out={} => 3-tier merge writes 0.0
                 #      not neutral. Fix: write neutral floor to bsts_metrics before merge.
-                import math as _math_cc
                 _CC_NEUTRALS = {
                     'race_line_adherence': 0.5, 'brake_compliance': 1.0,
                     'brake_field_compliance_gradient': 1.0,
@@ -3072,7 +3082,7 @@ def run(hparams):
                 for _cc_k, _cc_n in _CC_NEUTRALS.items():
                     _cc_cur = bsts_metrics.get(_cc_k)
                     _cc_bad = (_cc_cur is None or
-                               not _math_cc.isfinite(float(_cc_cur if _cc_cur is not None else float("nan"))))
+                               not math.isfinite(float(_cc_cur if _cc_cur is not None else float("nan"))))
                     if _cc_bad:
                         bsts_metrics[_cc_k] = float(_hm_out.get(_cc_k, _cc_n) if _hm_out else _cc_n)
                 # v213: race-type tag for plot/CSV differentiation
@@ -3246,6 +3256,38 @@ def run(hparams):
                     _adjusted_rw = {k: v / sum(_adjusted_rw.values()) for k, v in _adjusted_rw.items()}
                 else:
                     _adjusted_rw = bsts_feedback.adjust_weights(rw)
+                    # v1.1.5d PATCH-Q2: Phase A/B/C curriculum gate on top of BSTS adjust_weights.
+                    # Goal: creep-forward → consistent lap completion → brake-line diverge from
+                    # race-line → converge at speed. REF: Bengio et al. (2009) ICML.
+                    # avg_track_progress EMA was injected per-step (PATCH-Q) so trends are populated.
+                    _avg_tp = float(bsts_feedback.get_trend_vector(race_type_filter=_track_variant).get(
+                        'avg_track_progress', 0.0) if hasattr(bsts_feedback, 'get_trend_vector') else 0.0)
+                    # Fallback: use raw ep progress fraction if EMA not yet populated
+                    if _avg_tp == 0.0 and ep_progress_pct > 0:
+                        _avg_tp = ep_progress_pct / 100.0
+                    if _avg_tp < 0.50:
+                        # Phase A — Survival: progress dominant, racing_line / speed suppressed
+                        _adjusted_rw['progress']       = max(_adjusted_rw.get('progress', 0.0), 0.45)
+                        _adjusted_rw['braking']        = max(_adjusted_rw.get('braking', 0.0), 0.12)
+                        _adjusted_rw['racing_line']    = min(_adjusted_rw.get('racing_line', 0.04), 0.04)
+                        _adjusted_rw['curv_speed']     = min(_adjusted_rw.get('curv_speed', 0.02), 0.02)
+                        _adjusted_rw['min_speed']      = min(_adjusted_rw.get('min_speed', 0.04), 0.04)
+                    elif _avg_tp < 0.90:
+                        # Phase B — Divergence: brake > racing_line (explicitly widening gap)
+                        # Teaches: brake-field compliance is a SEPARATE objective from race-line.
+                        # Low jerk, notable decel at corners, speed gates partially open.
+                        _div_frac = (_avg_tp - 0.50) / 0.40   # 0→1 linear over Phase B
+                        _brk_floor  = 0.18 * (1 - _div_frac) + 0.12 * _div_frac
+                        _rl_floor   = 0.04 * (1 - _div_frac) + 0.10 * _div_frac
+                        _csv_floor  = 0.02 * (1 - _div_frac) + 0.08 * _div_frac
+                        _adjusted_rw['braking']        = max(_adjusted_rw.get('braking', 0.0), _brk_floor)
+                        _adjusted_rw['racing_line']    = max(_adjusted_rw.get('racing_line', 0.0), _rl_floor)
+                        _adjusted_rw['curv_speed']     = max(_adjusted_rw.get('curv_speed', 0.0), _csv_floor)
+                    # Phase C (>= 0.90): no clamp — all weights evolve freely under BSTS
+                    # Re-normalise after curriculum clamp
+                    _rw_total = sum(_adjusted_rw.values())
+                    if _rw_total > 0:
+                        _adjusted_rw = {k: v / _rw_total for k, v in _adjusted_rw.items()}
                 # --- Rich BSTS console log every episode ---
                 _bsts_ctx = f"ctx=clear:{bsts_metrics.get('ctx_clear_ratio',0):.2f}/curb:{bsts_metrics.get('ctx_curb_ratio',0):.2f}/obs:{bsts_metrics.get('ctx_obstacle_ratio',0):.2f}"
                 print(
@@ -3301,9 +3343,7 @@ def run(hparams):
                         # ep_track_length_m=16.6 after FIX-O; both are < 99.0, guard passes.
                         # Without this key, episode_summary_metrics uses ep.get('track_length_m', 16.6)
                         # correctly, BUT compute_all() receives it; the issue is the key was absent.
-                        'track_length_m': float(ep_track_length_m) if (
-                            'ep_track_length_m' in dir() and ep_track_length_m > 1.0 and ep_track_length_m < 99.0
-                        ) else 16.6,
+                        'track_length_m': float(rp.get('tracklength', 16.6)) if 'rp' in dir() and rp else 16.6,
                     }
                     # Wire: extract real intermediary metrics from episode step log
                     try:
@@ -3624,9 +3664,8 @@ def run(hparams):
                 # v17: periodic live analysis and race-line phase-out
                 if episode_count % 50 == 0 and episode_count > 0:
                     try:
-                        import os as _os
-                        _lp = _os.path.join("results", "metrics.jsonl")
-                        if _os.path.exists(_lp) and _ANALYSIS_MODULES:
+                        _lp = os.path.join("results", "metrics.jsonl")
+                        if os.path.exists(_lp) and _ANALYSIS_MODULES:
                             _a = live_analyze(_lp)
                             logger.info(f"Live analysis ep{episode_count}: {_a}")
                     except Exception as _e:
@@ -3907,8 +3946,8 @@ def run(hparams):
     # --- v201 guard: detect silent empty-episode / no-sim failure ---
     try:
         jsonl_file.flush()
-        import os as _os
-        _sz = _os.path.getsize(jsonl_path)
+        import os as os
+        _sz = os.path.getsize(jsonl_path)
         if _sz == 0:
             logger.error(f'[GUARD] JSONL is EMPTY ({jsonl_path}): no episodes terminated. '
                          f'Likely the DeepRacer sim (docker) is not running on this node. '
