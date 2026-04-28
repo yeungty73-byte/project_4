@@ -1,4 +1,16 @@
 from __future__ import annotations
+# v1.1.6b PATCHES APPLIED (2026-04-28):
+#   FIX-SPAWN-1: episode_start() kwargs (bsts_trends, episode_count) dropped — TypeError
+#                silently caught → _spawn_penalty=0.0 for every episode.
+#                Fix: call episode_start(is_reversed) only. (line ~1869)
+#   FIX-SPAWN-2: _bc_spawn_neutral used distbarrier>0.15 — distbarrier=0.02 at ALL
+#                step-1 observations (confirmed log run_20260428_120552.log).
+#                Fix: _bc_spawn_neutral = speed < 0.30 m/s. (line ~923)
+#   gym_adapter.py changes (separate file):
+#     FIX-BLEED-1: BLEED_BRAKE_ACTION_CONTINUOUS = [0.0, -1.0] (was [0.0, 0.0])
+#     FIX-BLEED-2: Bleed-restart on game_over during bleed (BLEED_MAX_RESTARTS=3)
+#     FIX-BLEED-3: _spawn_kinematics_neutral() no longer exits on self.done
+#     FIX-BLEED-4: BLEED_MAX_STEPS raised 40->80
 import sys, os; sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "packages")); import deepracer_gym
 # REF: Balaji, B. et al. (2020). DeepRacer: Autonomous Racing Platform for Sim2Real RL. IEEE ICRA.
 # REF: Salazar, J. et al. (2024). Deep RL for Autonomous Driving in AWS DeepRacer. Information, 15(2).
@@ -920,7 +932,11 @@ def harvest_htm_pilots(env, htm_agent, td3sac, n_episodes=12, min_progress=2.0):
         # REF: Koenig & Howard (2004) — Gazebo spawn init; Ng et al. (1999) ICML.
         _bc_spawn_speed   = float(rp.get('speed', 0.0))
         _bc_spawn_heading = float(rp.get('heading', 0.0))
-        _bc_spawn_neutral = _bc_spawn_speed < 0.30  # post-bleed check
+        # v1.1.6b FIX: neutral check must match _spawn_kinematics_neutral() in gym_adapter.py.
+        # Old check used distbarrier > 0.15 — but distbarrier=0.02 at EVERY step-1 (log confirmed).
+        # So _bc_spawn_neutral was always False -> BC Pilot discarded every episode.
+        # Correct check: speed < BLEED_SPEED_THRESHOLD (0.30 m/s).
+        _bc_spawn_neutral = float(rp.get('speed', 99.0)) < 0.30  # post-bleed check
         if not _bc_spawn_neutral:
             print(
                 f"[BC-BLEED WARNING] post-bleed speed={_bc_spawn_speed:.2f} m/s "
@@ -1864,10 +1880,12 @@ def run(hparams):
         # v1.4.1+: episode_start now accepts bsts_trends for Kalman-phase controller.
         _bsts_trends_now = bsts_feedback.get_trend_vector(race_type_filter=_track_variant) \
             if hasattr(bsts_feedback, 'get_trend_vector') else {}
+        # v1.1.6b FIX: episode_start() only accepts (self, is_reversed: bool).
+        # Calling with bsts_trends= and episode_count= kwargs raised TypeError,
+        # which was silently caught, leaving _spawn_penalty=0.0 for ALL episodes.
+        # Confirmed: AdaptiveRewardShaper.episode_start signature line 649 run-2.py.
         _spawn_penalty = _shaper.episode_start(
-            bool(_reset_info_rp.get('is_reversed', False)),
-            bsts_trends=_bsts_trends_now,
-            episode_count=episode_count,
+            bool(_reset_info_rp.get('is_reversed', False))
         )
         if _spawn_penalty != 0.0:
             logger.debug(f"[ARS] spawn_penalty={_spawn_penalty:.1f} ep={episode_count}")
