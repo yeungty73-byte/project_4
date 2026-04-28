@@ -34,8 +34,6 @@ failed  = []
 
 # ---------------------------------------------------------------------------
 # PATCH-Z: Clear ep_ante_buf + episode accumulators at episode reset
-# Target: the single 4-space-indented "observation, info = env.reset()"
-#         inside the terminated/truncated episode-end block
 # ---------------------------------------------------------------------------
 Z_OLD = (
     '    observation, info = env.reset()\n'
@@ -77,10 +75,12 @@ else:
 
 # ---------------------------------------------------------------------------
 # PATCH-AA: Allow adjust_weights() during bootstrap, clamp to phase-A floor
+# FIXED: comment in run.py is 'bootstrap weights unchanged during bootstrap phase'
+#        NOT 'bootstrap: keep progress-dominant weights'
 # ---------------------------------------------------------------------------
 AA_OLD = (
     '        if _bootstrap_active:\n'
-    "            _adjusted_rw = rw  # bootstrap: keep progress-dominant weights\n"
+    '            _adjusted_rw = rw  # bootstrap weights unchanged during bootstrap phase\n'
     '        else:\n'
     '            _adjusted_rw = bsts_feedback.adjust_weights(rw)'
 )
