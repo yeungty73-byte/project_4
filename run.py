@@ -2539,10 +2539,8 @@ def run(hparams):
             # v13: On-track bonus (no penalties, only rewards)
             rp_v7 = info.get("reward_params", {})
             # v7: Speed bonus for staying on track
-            _v7_offtrack = bool(rp_v7.get("is_offtrack", offtrack))
-            _v7_reversed = bool(rp_v7.get("is_reversed", False))
-            if rp_v7.get("speed", 0) > 1.0 and not _v7_offtrack and not _v7_reversed:
-                reward += 0.5 * min(speed * 4.0, 1.0)
+            if rp_v7.get("speed", 0) > 1.0 and not _offtrack and not _is_rev:
+                reward += 0.5 * min(_speed * 4.0, 1.0)
             cumulative_ep_reward += reward
 
             # v1.4.1: ICM intrinsic reward — curiosity bonus per step
