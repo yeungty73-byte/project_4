@@ -1,3 +1,4 @@
+from __future__ import annotations
 import traceback as _tb
 """failure_analysis.py  v5.0 — forensic sampler, wired into replay and reward.
 
@@ -35,7 +36,6 @@ Hotspot wiring contract (copy into run.py step-reward block)
   if _hs_sig['is_hotspot']:
       td3sac.replay.boost_priority(_seg, factor=1.5)  # if replay supports it
 """
-from __future__ import annotations
 import json, csv, os, math, random
 import numpy as np
 from collections import defaultdict, Counter

@@ -1,3 +1,4 @@
+from __future__ import annotations
 import traceback as _tb
 """BSTS module: canonical home for BSTSFeedback + BSTSSeasonal.
 

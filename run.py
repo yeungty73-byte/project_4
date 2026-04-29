@@ -1,5 +1,6 @@
 from __future__ import annotations
 import traceback as _tb
+
 # v1.1.6b PATCHES APPLIED (2026-04-28):
 #   FIX-SPAWN-1: episode_start() kwargs (bsts_trends, episode_count) dropped — TypeError
 #                silently caught → _spawn_penalty=0.0 for every episode.
@@ -46,13 +47,9 @@ from context_aware_agent import ContextAwarePPOAgent, compute_intermed_targets
 from failure_analysis import FailurePointSampler
 from brake_field import BrakeField
 
-
-
-
 # REF: Sutton, R. S. & Barto, A. G. (2018). Reinforcement Learning: An Introduction (2nd ed.). MIT Press.
 from stuck_tracker import StuckTracker
 # REF: Kolter, J. Z. & Ng, A. Y. (2009). Near-Bayesian exploration in polynomial time. ICML.
-from corner_analysis import lookahead_curvature_scan, curvature_radius, optimal_speed
 # REF: Garlick, J. & Middleditch, A. (2022). Real-time optimal racing line generation. IEEE Trans. Games.
 # Research-module integration (phased out to corner_analysis + utils)
 # REF: Yang, S. et al. (2023). COMPSAC. | Haarnoja, T. et al. (2018). ICML.
@@ -67,6 +64,8 @@ from corner_analysis import (
     get_stuck_antecedent_bonus,
     build_racing_line_map,
     racing_line_reward,
+    curvature_radius,
+    optimal_speed
 )
 from federated_pool import FederatedPool
 # REF: Lillicrap, T. P. et al. (2016). Continuous control with deep reinforcement learning. ICLR.
@@ -109,11 +108,7 @@ from bsts_seasonal import BSTSFeedback
 from icm import ICM  # v1.4.1: intrinsic curiosity module
 # REF: Scott, S. L. & Varian, H. R. (2014). Predicting the present with Bayesian structural time series. Int. J. Math. Model. Numer. Optim., 5(1-2), 4-23.
 live_analyze = lambda *a,**k: None  # live_metrics.py purged (stubbed)
-try:
-    from live_dashboard import console_summary as live_summary
-except Exception:
-    print(f"[EXCEPT][run.py:113] {_tb.format_exc().splitlines()[-1]}", flush=True)
-    live_summary = None
+
 from analyze_logs import (
 # REF: Brodersen, K. H. et al. (2015). Inferring causal impact using Bayesian structural time-series models. Ann. Appl. Stat., 9(1), 247-274.
     BSTSKalmanFilter,
@@ -1146,7 +1141,7 @@ class BCPilot:
         # At 1.6m/s (slow): 8 wps; at 4m/s (max): 20 wps. Prevents late-braking.
         _la_wps = max(8, min(20, int(speed * 5)))
         try:
-            _, _, safe_speed, dist_to_corner = lookahead_curvature_scan(
+            _, _, safe_speed, dist_to_corner, *_ = lookahead_curvature_scan(
                 waypoints, closest, max_lookahead=_la_wps
             )
         except Exception:
@@ -1226,7 +1221,7 @@ def extract_compact_obs(obs_raw, rp: dict, waypoints, closest) -> np.ndarray:
 
         # Curvature ahead
         try:
-            _, _, safe_speed, dist_to_corner = lookahead_curvature_scan(
+            _, _, safe_speed, dist_to_corner, *_ = lookahead_curvature_scan(
                 waypoints, closest, max_lookahead=10)
             curv_signal = (speed - safe_speed) / max(safe_speed, 0.1)  # >0 means too fast
             dist_corner_norm = min(dist_to_corner / 5.0, 1.0)
@@ -2256,7 +2251,7 @@ def run(hparams):
                 # --- v5: Track geometry ---
                 _curvature, _safe_speed = compute_track_curvature(_waypoints, _closest)
                 # --- v6: lookahead curvature scan ---
-                _max_curv_ahead, _max_curv_wp, _safe_speed_ahead, _dist_to_corner = \
+                _max_curv_ahead, _max_curv_wp, _safe_speed_ahead, _dist_to_corner, *_ = \
                     lookahead_curvature_scan(_waypoints, _closest, max_lookahead=15)
                 _brake_r = compute_braking_reward(_speed, _safe_speed_ahead, _dist_to_corner)
                 _turn_align_r = compute_turn_alignment_reward(_heading, _waypoints, _closest)

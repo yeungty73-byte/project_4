@@ -1,3 +1,4 @@
+from __future__ import annotations
 import traceback as _tb
 """brake_field.py — v1.3.0
 ===================================================================================
@@ -48,7 +49,6 @@ REFERENCES
   Cao et al. (2021) Swin-Unet. arXiv:2105.05537
 ===================================================================================
 """
-from __future__ import annotations
 import math
 import numpy as np
 from typing import Optional, Dict, List, Tuple
