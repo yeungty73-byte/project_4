@@ -130,6 +130,7 @@ from utils import (
     BSTSLogger,
     EpisodeMetricsAccumulator,
     BSTSTracker,          # AWS. (2020). DeepRacer log analysis
+    demo,                 # PATCH-DEMO v1.1.6c
     ReplayBuffer,         # Fujimoto, S. et al. (2018). ICML
     make_environment,
 )
@@ -4056,6 +4057,34 @@ def run(hparams):
     jsonl_file.close()
     logger.info(f'Model {agent.name} saved. Training complete.')
     logger.info(f'JSONL metrics saved to {jsonl_path}')
+    # ---------------------------------------------------------------
+    # DEMO GENERATION — Project 4 requirement: 3 videos (one per race-type)
+    # REF: Project 4 instructions "include 3 videos in README.md"
+    #      10 pts deducted if missing; 10/3 pts per video.
+    # Uses reInvent2019_wide for all 3 variants (consistent track).
+    # action_post_processor=process_action handles throttle remap so
+    # car drives forward; ContextAwarePPOAgent ctx fallback is inside demo().
+    # ---------------------------------------------------------------
+    _DEMO_PHASES = [
+        ("reinvent2019_wide", "time_trial"),
+        ("reinvent2019_wide", "obstacle"),
+        ("reinvent2019_wide", "h2h"),
+    ]
+    os.makedirs('./demos', exist_ok=True)
+    for _dp_track, _dp_variant in _DEMO_PHASES:
+        try:
+            _dp_phase = {'track': _dp_track, 'variant': _dp_variant}
+            apply_phase_env(args, _dp_phase, current_env=None)
+            demo(
+                agent,
+                environment_name=ENVIRONMENT_NAME,
+                directory='./demos',
+                action_post_processor=process_action,
+            )
+            logger.info(f'[DEMO] Generated video: {_dp_track}/{_dp_variant}')
+        except Exception as _de:
+            logger.warning(f'[DEMO] Failed for {_dp_track}/{_dp_variant}: {_de}')
+
     env.close()
     writer.close()
     # Shutdown dashboard

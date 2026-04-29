@@ -172,70 +172,142 @@ def get_race_type(
         )
 
 
+def _demo_obs_to_array(obs):
+    """Inline obs->flat array for demo(); avoids run.py import dependency."""
+    if isinstance(obs, dict):
+        parts = []
+        for k in sorted(obs.keys()):
+            v = obs[k]
+            parts.append(np.asarray(v).flatten() if hasattr(v, '__array__') else np.array(v).flatten())
+        return np.concatenate(parts)
+    return np.asarray(obs).flatten() if hasattr(obs, '__array__') else np.array(obs).flatten()
+
+
+def _demo_obs_to_frame(obs, H=120, W=160):
+    """Extract H×W grayscale frame from flat DeepRacer obs tensor."""
+    flat = _demo_obs_to_array(obs)
+    n = H * W  # 19200 floats = DeepRacer camera
+    if flat.size < n:
+        return None
+    return flat[:n].reshape(H, W).astype(np.float32)
+
+
 def demo(
         agent: Agent,
-        environment_name: str=ENVIRONMENT_NAME,
-        directory: str='./demos'
+        environment_name: str = ENVIRONMENT_NAME,
+        directory: str = './demos',
+        action_post_processor=None,
     ):
-    race_type = get_race_type(
-        environment_params_path=ENVIRONMENT_PARAMS_PATH
-    )
-    world_name = get_world_name(
-        environment_params_path=ENVIRONMENT_PARAMS_PATH
-    )
+    """Export a demo .mp4 after training.
+
+    PATCH-DEMO v1.1.6c (2026-04-29).
+    Fixes vs original utils.demo:
+      DEMO-1: DeepRacer gym has no render_mode='rgb_array'; RecordVideo gave empty files.
+              Fix: capture frames from obs tensor (120×160 greyscale camera feed).
+      DEMO-2: process_action throttle remap was skipped so car reversed.
+              Fix: accept action_post_processor kwarg (set to run.process_action).
+      DEMO-3: ContextAwarePPOAgent.get_action needs context label.
+              Fix: fallback ctx=zeros(1) on TypeError.
+      DEMO-4: demo_progress was accessed before assignment when PROGRESS_MANAGER=None.
+              Fix: guarded with is not None checks throughout.
+    """
+    import numpy as _npd
+    try:
+        import cv2 as _cv2; _HAS_CV2 = True
+    except ImportError:
+        _HAS_CV2 = False
+    try:
+        import imageio as _iio; _HAS_IIO = True
+    except ImportError:
+        _HAS_IIO = False
+
+    race_type  = get_race_type(environment_params_path=ENVIRONMENT_PARAMS_PATH)
+    world_name = get_world_name(environment_params_path=ENVIRONMENT_PARAMS_PATH)
 
     demo_device = torch.device('cpu')
     agent.eval().to(demo_device)
     os.makedirs(directory, exist_ok=True)
 
-    demo_environment = make_environment(
-        environment_name, render_mode='rgb_array'
-    )
-
-    demo_environment = RecordVideo(
-        demo_environment,
-        video_folder=directory,
-        episode_trigger=lambda _: True,
-        name_prefix=f'{world_name}-{race_type}-{agent.name}'
-    )
-
+    # No render_mode — DeepRacer gym does not support 'rgb_array'
+    demo_environment = make_environment(environment_name)
     observation, _ = demo_environment.reset()
 
+    video_path = os.path.join(directory, f'{world_name}-{race_type}-{agent.name}.mp4')
+    frame_h, frame_w = 120, 160
+    vid_writer = None
+    frames_buf = []
+    if _HAS_CV2:
+        fourcc = _cv2.VideoWriter_fourcc(*'mp4v')
+        vid_writer = _cv2.VideoWriter(video_path, fourcc, 15.0, (frame_w, frame_h), isColor=False)
+
+    demo_progress = None
     if PROGRESS_MANAGER is not None:
         demo_progress = PROGRESS_MANAGER.counter(
-        total=MAX_DEMO_STEPS, desc=f'{world_name} {race_type} demo', unit='steps', leave=False
-    )
+            total=MAX_DEMO_STEPS, desc=f'{world_name} {race_type} demo',
+            unit='steps', leave=False,
+        )
+
+    frames_written = 0
     for t in range(MAX_DEMO_STEPS):
-        action = agent.get_action(torch.Tensor(observation)[None, :])
-        if not isinstance(action, np.ndarray) and torch.is_tensor(action):
-            action = action.cpu().detach().numpy()
-        if isinstance(demo_environment.action_space, spaces.Discrete):
-            action = action.item()
+        obs_t = torch.tensor(_demo_obs_to_array(observation), dtype=torch.float32)[None, :]
+        try:
+            raw_action = agent.get_action(obs_t)
+        except TypeError:
+            ctx = torch.zeros(1, dtype=torch.long)
+            raw_action = agent.get_action(obs_t, ctx)
+        if not isinstance(raw_action, _npd.ndarray) and torch.is_tensor(raw_action):
+            raw_action = raw_action.cpu().detach().numpy()
+        if action_post_processor is not None:
+            action = action_post_processor(raw_action, demo_environment.action_space)
+        elif isinstance(demo_environment.action_space, spaces.Discrete):
+            idx = int(_npd.round(float(raw_action.item()) if hasattr(raw_action, 'item') else raw_action))
+            action = int(_npd.clip(idx, 0, demo_environment.action_space.n - 1))
+        else:
+            action = _npd.clip(
+                _npd.asarray(raw_action, dtype=_npd.float32),
+                demo_environment.action_space.low,
+                demo_environment.action_space.high,
+            )
         observation, _, terminated, truncated, _ = demo_environment.step(action)
-        demo_progress.update()
-        demo_progress.refresh()
+
+        # Capture frame from obs tensor (DEMO-1 fix)
+        frame = _demo_obs_to_frame(observation, H=frame_h, W=frame_w)
+        if frame is not None:
+            frame_u8 = (frame * 255.0).clip(0, 255).astype(_npd.uint8)
+            if _HAS_CV2 and vid_writer is not None:
+                vid_writer.write(frame_u8)
+            else:
+                frames_buf.append(frame_u8)
+            frames_written += 1
+
+        if demo_progress is not None:
+            demo_progress.update()
         if terminated or truncated:
             break
 
+    if _HAS_CV2 and vid_writer is not None:
+        vid_writer.release()
+    elif frames_buf and not _HAS_CV2:
+        try:
+            _iio.mimwrite(video_path, frames_buf, fps=15, codec='libx264')
+        except Exception as e:
+            print(f'[demo] imageio write failed: {e}', flush=True)
+
     demo_environment.close()
-    demo_progress.close()
+    if demo_progress is not None:
+        demo_progress.close()
 
-    filtered_videos = sorted(
-        f for f in os.listdir(directory)
-        if (
-            f.endswith('.mp4')
-            and agent.name in f
-            and world_name in f
-            and race_type in f
-        )
-    )
-    if len(filtered_videos) == 0:
-        logger.warning('No videos found!')
-        return
+    if frames_written == 0:
+        print(f'[demo] WARNING: No frames captured → {video_path}', flush=True)
+    else:
+        print(f'[demo] Saved {frames_written}-frame video → {video_path}', flush=True)
 
-    video_path = os.path.join(directory, filtered_videos[-1])
-    clear_output(wait=True)
-    display(Video(video_path, embed=True))
+    try:
+        clear_output(wait=True)
+        display(Video(video_path, embed=True))
+    except Exception:
+        pass
+    return video_path
 
 
 def command_exists(command: str) -> bool:
