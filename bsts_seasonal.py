@@ -1,3 +1,4 @@
+import traceback as _tb
 """BSTS module: canonical home for BSTSFeedback + BSTSSeasonal.
 
 Classes
@@ -46,6 +47,7 @@ try:
     from matplotlib import rcParams
     HAS_MPL = True
 except ImportError:
+    print(f"[EXCEPT][bsts_seasonal.py:49] {_tb.format_exc().splitlines()[-1]}", flush=True)
     HAS_MPL = False
 
 # ---------------------------------------------------------------------------
@@ -474,6 +476,7 @@ class BSTSFeedback:
                 if not math.isfinite(slope):
                     slope = 0.0
             except Exception:
+                print(f"[EXCEPT][bsts_seasonal.py:477] {_tb.format_exc().splitlines()[-1]}", flush=True)
                 slope = 0.0
             out[k] = slope
         return out
@@ -547,6 +550,7 @@ class BSTSFeedback:
             try:
                 return float(self.kf_trends.get(k, 0.0))
             except Exception:
+                print(f"[EXCEPT][bsts_seasonal.py:550] {_tb.format_exc().splitlines()[-1]}", flush=True)
                 return 0.0
 
         # ── Layer 0: Compliance gradient shaping (v1.2.0, PRIMARY) ─────────
@@ -667,6 +671,7 @@ def _ols(X, y):
         beta = np.linalg.solve(XtX, X.T @ y)
         return beta, X @ beta
     except np.linalg.LinAlgError:
+        print(f"[EXCEPT][bsts_seasonal.py:670] {_tb.format_exc().splitlines()[-1]}", flush=True)
         return np.zeros(X.shape[1]), np.zeros(len(y))
 
 
@@ -682,8 +687,10 @@ def _load_jsonl(path):
                 try:
                     rows.append(json.loads(line))
                 except json.JSONDecodeError:
+                    print(f"[EXCEPT][bsts_seasonal.py:685] {_tb.format_exc().splitlines()[-1]}", flush=True)
                     pass
     except FileNotFoundError:
+        print(f"[EXCEPT][bsts_seasonal.py:687] {_tb.format_exc().splitlines()[-1]}", flush=True)
         pass
     return rows
 

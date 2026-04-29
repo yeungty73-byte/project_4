@@ -7,6 +7,7 @@
 #      Gonzalez (2020); Coulom (2002) curvature calculus;
 #      Heilmeier et al. (2020) minimum-curvature QP race line;
 #      Waymo Motion Prediction (2021) constant-velocity projection.
+import traceback as _tb
 import math
 import numpy as np
 from typing import List, Tuple, Optional, Dict
@@ -263,6 +264,7 @@ class MultiRaceLineEngine:
             from scipy.ndimage import uniform_filter1d
             offsets = uniform_filter1d(offsets, size=5, mode='wrap')
         except Exception:
+            print(f"[EXCEPT][race_line_engine.py:266] {_tb.format_exc().splitlines()[-1]}", flush=True)
             pass
         return offsets
 

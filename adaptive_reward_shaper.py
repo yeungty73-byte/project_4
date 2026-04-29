@@ -1,3 +1,4 @@
+import traceback as _tb
 """adaptive_reward_shaper.py — v1.5.0b
 Standalone module. Drop-in replacement.
 

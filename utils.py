@@ -1,3 +1,4 @@
+import traceback as _tb
 import os, re
 import json
 import yaml
@@ -7,6 +8,7 @@ import shutil
 try:
     import enlighten
 except ImportError:
+    print(f"[EXCEPT][utils.py:10] {_tb.format_exc().splitlines()[-1]}", flush=True)
     class _DummyCounter:
         def update(self, *a, **kw): pass
         def close(self, *a, **kw): pass
@@ -38,6 +40,7 @@ from agents import Agent
 try:
     PROGRESS_MANAGER = enlighten.get_manager()
 except (TypeError, ValueError):
+    print(f"[EXCEPT][utils.py:41] {_tb.format_exc().splitlines()[-1]}", flush=True)
     PROGRESS_MANAGER = None
 FS_TICK: int = 12
 FS_LABEL: int = 18
@@ -215,10 +218,12 @@ def demo(
     try:
         import cv2 as _cv2; _HAS_CV2 = True
     except ImportError:
+        print(f"[EXCEPT][utils.py:218] {_tb.format_exc().splitlines()[-1]}", flush=True)
         _HAS_CV2 = False
     try:
         import imageio as _iio; _HAS_IIO = True
     except ImportError:
+        print(f"[EXCEPT][utils.py:222] {_tb.format_exc().splitlines()[-1]}", flush=True)
         _HAS_IIO = False
 
     race_type  = get_race_type(environment_params_path=ENVIRONMENT_PARAMS_PATH)
@@ -252,10 +257,16 @@ def demo(
         obs_t = torch.tensor(_demo_obs_to_array(observation), dtype=torch.float32)[None, :]
         try:
             raw_action = agent.get_action(obs_t)
-        except TypeError:
-            ctx = torch.zeros(1, dtype=torch.long)
-            raw_action = agent.get_action(obs_t, ctx)
-        if not isinstance(raw_action, _npd.ndarray) and torch.is_tensor(raw_action):
+        except (TypeError, AttributeError, RuntimeError):
+            # BUG-AGENT-FIX: ContextAwarePPOAgent requires (obs, context).
+            # Also catches RuntimeError for shape mismatch in actor forward.
+            print(f"[DEMO][EXCEPT][utils.py:get_action] {_tb.format_exc().splitlines()[-1]}", flush=True)
+            try:
+                ctx = torch.zeros(1, dtype=torch.long)
+                raw_action = agent.get_action(obs_t, ctx)
+            except Exception:
+                print(f"[DEMO][EXCEPT][utils.py:get_action_ctx] {_tb.format_exc().splitlines()[-1]}", flush=True)
+                raw_action = torch.zeros(getattr(agent, 'act_dim', 2))
             raw_action = raw_action.cpu().detach().numpy()
         if action_post_processor is not None:
             action = action_post_processor(raw_action, demo_environment.action_space)
@@ -291,6 +302,7 @@ def demo(
         try:
             _iio.mimwrite(video_path, frames_buf, fps=15, codec='libx264')
         except Exception as e:
+            print(f"[EXCEPT][utils.py:294] {_tb.format_exc().splitlines()[-1]}", flush=True)
             print(f'[demo] imageio write failed: {e}', flush=True)
 
     demo_environment.close()
@@ -306,6 +318,7 @@ def demo(
         clear_output(wait=True)
         display(Video(video_path, embed=True))
     except Exception:
+        print(f"[EXCEPT][utils.py:309] {_tb.format_exc().splitlines()[-1]}", flush=True)
         pass
     return video_path
 
@@ -386,6 +399,7 @@ def evaluate_track(
         with open(f'{directory}/{race_type}-{agent.name}.json', '+r') as f:
             all_metrics = json.load(f)
     except:
+        print(f"[EXCEPT][utils.py:389] {_tb.format_exc().splitlines()[-1]}", flush=True)
         all_metrics = {}
 
     all_metrics.update({world_name: eval_metrics})
@@ -467,12 +481,14 @@ def plot_metrics(
         from statsmodels.tsa.seasonal import STL
         _HAS_STL = True
     except ImportError:
+        print(f"[EXCEPT][utils.py:470] {_tb.format_exc().splitlines()[-1]}", flush=True)
         _HAS_STL = False
     try:
         from denim_theme import (apply_theme, get_color, DENIM_BRIGHT,
             AMBER, TERRA_COTTA, SAGE_GREEN, MUTED_PURPLE, GOLD_WARM,
             DENIM_MID, DENIM_DARK, BG_DARK, WHITE_SMOKE, MUTED_GRAY)
     except ImportError:
+        print(f"[EXCEPT][utils.py:476] {_tb.format_exc().splitlines()[-1]}", flush=True)
         BG_DARK, WHITE_SMOKE, MUTED_GRAY = "#2E2E2E", "#F5F5F5", "#8C8C8C"
         DENIM_BRIGHT, AMBER, TERRA_COTTA = "#5B9BD5", "#D4A03C", "#C75B39"
         SAGE_GREEN, MUTED_PURPLE, GOLD_WARM = "#6BB38A", "#9B6EB7", "#E8C167"
@@ -483,6 +499,7 @@ def plot_metrics(
     try:
         from IPython.display import clear_output
     except ImportError:
+        print(f"[EXCEPT][utils.py:486] {_tb.format_exc().splitlines()[-1]}", flush=True)
         def clear_output(wait=False): pass
 
     PLOT_DPI = 150
@@ -590,6 +607,7 @@ def plot_metrics(
                 fontsize=6.5, color=GOLD_WARM, alpha=0.9,
                 bbox=dict(boxstyle="round,pad=0.3", fc=DENIM_DARK, alpha=0.7, ec=MUTED_GRAY))
         except Exception:
+            print(f"[EXCEPT][utils.py:593] {_tb.format_exc().splitlines()[-1]}", flush=True)
             pass
         ax.set_ylabel(key, fontsize=9)
 
@@ -602,6 +620,7 @@ def plot_metrics(
                 res = stl.fit()
                 trend_c, seasonal_c, resid_c = res.trend, res.seasonal, res.resid
             except Exception:
+                print(f"[EXCEPT][utils.py:605] {_tb.format_exc().splitlines()[-1]}", flush=True)
                 trend_c = ema_line
                 seasonal_c = np.zeros(n)
                 resid_c = series - ema_line

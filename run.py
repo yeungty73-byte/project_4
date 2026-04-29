@@ -1,4 +1,5 @@
 from __future__ import annotations
+import traceback as _tb
 # v1.1.6b PATCHES APPLIED (2026-04-28):
 #   FIX-SPAWN-1: episode_start() kwargs (bsts_trends, episode_count) dropped — TypeError
 #                silently caught → _spawn_penalty=0.0 for every episode.
@@ -85,6 +86,7 @@ def _purge_stale_pycache():
         try:
             shutil.rmtree(_pc)
         except Exception:
+            print(f"[EXCEPT][run.py:88] {_tb.format_exc().splitlines()[-1]}", flush=True)
             pass
     # Also invalidate any already-loaded cached .pyc bytecode
     import importlib, importlib.util
@@ -110,6 +112,7 @@ live_analyze = lambda *a,**k: None  # live_metrics.py purged (stubbed)
 try:
     from live_dashboard import console_summary as live_summary
 except Exception:
+    print(f"[EXCEPT][run.py:113] {_tb.format_exc().splitlines()[-1]}", flush=True)
     live_summary = None
 from analyze_logs import (
 # REF: Brodersen, K. H. et al. (2015). Inferring causal impact using Bayesian structural time-series models. Ann. Appl. Stat., 9(1), 247-274.
@@ -153,6 +156,7 @@ def get_phase_speed_cap(shaper=None):
             ph = int(shaper.current_phase)
             return _PHASE_SPEED_CAP.get(ph, 1.0)
     except Exception:
+        print(f"[EXCEPT][run.py:156] {_tb.format_exc().splitlines()[-1]}", flush=True)
         pass
     return _PHASE_SPEED_CAP.get(0, 0.40)
 
@@ -189,6 +193,7 @@ def process_action(rawaction, actionspace):
                     _tpa_head = _shaper.process_action_scale()
                     a[1] = min(a[1], float(_tpa_head))
             except Exception:
+                print(f"[EXCEPT][run.py:192] {_tb.format_exc().splitlines()[-1]}", flush=True)
                 pass
         return np.clip(a, actionspace.low, actionspace.high).astype(np.float32)
 
@@ -239,6 +244,7 @@ def _compute_crash_v_perp(speed, heading, closest_wp, waypoints):
         delta = math.radians(heading - math.degrees(math.atan2(dy, dx)))
         return abs(speed * math.sin(delta))
     except Exception:
+        print(f"[EXCEPT][run.py:242] {_tb.format_exc().splitlines()[-1]}", flush=True)
         return 0.0
 
 
@@ -252,6 +258,7 @@ def _compute_crash_v_tang(speed, heading, closest_wp, waypoints):
         delta = math.radians(heading - math.degrees(math.atan2(dy, dx)))
         return abs(speed * math.cos(delta))
     except Exception:
+        print(f"[EXCEPT][run.py:255] {_tb.format_exc().splitlines()[-1]}", flush=True)
         return 0.0
 
 # v5: Track geometry helpers
@@ -478,6 +485,7 @@ def _auto_bootstrap_deepracer(max_wait=60):
             subprocess.run(['bash', start_sh], timeout=600, capture_output=True)
             print('[v205] start_deepracer.sh executed', flush=True)
         except Exception as e:
+            print(f"[EXCEPT][run.py:481] {_tb.format_exc().splitlines()[-1]}", flush=True)
             print(f'[v205] start_deepracer.sh failed: {e}', flush=True)
     # Wait for gym bridge with retries
     for i in range(max_wait // 5):
@@ -496,6 +504,7 @@ def _auto_bootstrap_deepracer(max_wait=60):
                             os.environ['GYM_PORT'] = port
                             print(f'[v205] auto-discovered GYM_PORT={port}', flush=True)
             except Exception:
+                print(f"[EXCEPT][run.py:499] {_tb.format_exc().splitlines()[-1]}", flush=True)
                 pass
         if _preflight_gym_bridge():
             return True
@@ -514,6 +523,7 @@ def _preflight_gym_bridge():
         with socket.create_connection((host,port), timeout=5):
             print(f'[preflight v202] gym bridge {host}:{port} OPEN', flush=True); return True
     except Exception as e:
+        print(f"[EXCEPT][run.py:517] {_tb.format_exc().splitlines()[-1]}", flush=True)
         print(f'[preflight v202] gym bridge {host}:{port} UNREACHABLE: {e}', flush=True); return False
 
 # ============================================================
@@ -850,6 +860,7 @@ def _build_phase_schedule(total_timesteps, cluster_ids=None):
             logger.info(f"[ORCH] Multi-cluster: {len(cluster_ids)} nodes, "
                         f"{len(phases)} phases delegated to {my_host}")
         except ImportError:
+            print(f"[EXCEPT][run.py:853] {_tb.format_exc().splitlines()[-1]}", flush=True)
             offset = my_hash % n_phases
             order  = list(range(n_phases))
             order  = order[offset:] + order[:offset]
@@ -903,6 +914,7 @@ def _apply_phase_env(args, phase, current_env=None):
         try:
             current_env.close()
         except Exception:
+            print(f"[EXCEPT][run.py:906] {_tb.format_exc().splitlines()[-1]}", flush=True)
             pass
 
     # 3. gym.make always gets the registered env ID, not the yaml path
@@ -1046,6 +1058,7 @@ def preflightgymbridge():
             print(f"preflight v202 gym bridge {host}:{port} OPEN", flush=True)
             return True
     except Exception as e:
+        print(f"[EXCEPT][run.py:1049] {_tb.format_exc().splitlines()[-1]}", flush=True)
         print(f"preflight v202 gym bridge {host}:{port} UNREACHABLE {e}", flush=True)
         return False
 # --- v213: BCPilot — internal deterministic expert for BC seeding ---
@@ -1091,6 +1104,7 @@ class BCPilot:
             while diff < -180: diff += 360
             return diff
         except Exception:
+            print(f"[EXCEPT][run.py:1094] {_tb.format_exc().splitlines()[-1]}", flush=True)
             print("head to track failed")
             return 0.0
 
@@ -1136,12 +1150,14 @@ class BCPilot:
                 waypoints, closest, max_lookahead=_la_wps
             )
         except Exception:
+            print(f"[EXCEPT][run.py:1139] {_tb.format_exc().splitlines()[-1]}", flush=True)
             print("corn an failed")
             safe_speed, dist_to_corner = 2.5, 5.0
 
         try:
             rl_offset = compute_racing_line_offset(waypoints, closest, tw, lookahead=max(6, _la_wps // 2))
         except Exception:
+            print(f"[EXCEPT][run.py:1145] {_tb.format_exc().splitlines()[-1]}", flush=True)
             print("race line failed")
             rl_offset = 0.0
 
@@ -1157,6 +1173,7 @@ class BCPilot:
         try:
             braker = compute_braking_reward(speed, safe_speed, dist_to_corner)
         except Exception:
+            print(f"[EXCEPT][run.py:1160] {_tb.format_exc().splitlines()[-1]}", flush=True)
             braker = 1.0 if speed < safe_speed * 0.95 else 0.5
 
         # v1.1.0: multiplicative throttle — no subtractive penalties (freeze trap avoided)
@@ -1214,6 +1231,7 @@ def extract_compact_obs(obs_raw, rp: dict, waypoints, closest) -> np.ndarray:
             curv_signal = (speed - safe_speed) / max(safe_speed, 0.1)  # >0 means too fast
             dist_corner_norm = min(dist_to_corner / 5.0, 1.0)
         except Exception:
+            print(f"[EXCEPT][run.py:1217] {_tb.format_exc().splitlines()[-1]}", flush=True)
             print("corner analysis failed at BC @ extract_compact_obs")
             curv_signal = 0.0
             dist_corner_norm = 1.0
@@ -1235,6 +1253,7 @@ def extract_compact_obs(obs_raw, rp: dict, waypoints, closest) -> np.ndarray:
             0.0,                # 11: reserved
         ], dtype=np.float32)
     except Exception:
+        print(f"[EXCEPT][run.py:1238] {_tb.format_exc().splitlines()[-1]}", flush=True)
         return np.zeros(12, dtype=np.float32)
 
 # --- v1.0.13: centerline arc-length progress + bootstrap reward controller ---
@@ -1277,6 +1296,7 @@ def centerline_arc_position_from_reward_params(rp: dict, cache: dict | None = No
         prev_i = int(closest[0]) % n
         next_i = int(closest[1]) % n
     except Exception:
+        print(f"[EXCEPT][run.py:1280] {_tb.format_exc().splitlines()[-1]}", flush=True)
         prev_i, next_i = 0, 1
     x = float(rp.get("x", waypoints[prev_i][0]) or waypoints[prev_i][0])
     y = float(rp.get("y", waypoints[prev_i][1]) or waypoints[prev_i][1])
@@ -1422,6 +1442,7 @@ def run(hparams):
                 elif _line.startswith('RACE_TYPE'):
                     _track_variant = _line.split(':',1)[1].strip().strip('"').strip("'").lower()
     except Exception as _e:
+        print(f"[EXCEPT][run.py:1425] {_tb.format_exc().splitlines()[-1]}", flush=True)
         print(f'Track ID error: {_e}')
     hp = args  # alias for hyperparameter access
 
@@ -1508,6 +1529,7 @@ def run(hparams):
                 agent = ckpt.to(DEVICE)
                 logger.info(f"v3 Loaded legacy object checkpoint from {checkpoint_path}")
         except Exception as e:
+            print(f"[EXCEPT][run.py:1511] {_tb.format_exc().splitlines()[-1]}", flush=True)
             logger.warning(f"Checkpoint load failed ({e}), training from scratch")
     else:
         logger.info("v3 No checkpoint found, training from scratch")
@@ -1536,6 +1558,7 @@ def run(hparams):
         bsts_season = _BSTSSeasonal(n_segments=12, save_dir=os.path.join("results", run_name), alpha=0.02)
         logger.info("[BSTS] BSTSSeasonal instantiated — record_step/_flush_episode now active")
     except Exception as _e_bsts:
+        print(f"[EXCEPT][run.py:1539] {_tb.format_exc().splitlines()[-1]}", flush=True)
         bsts_season = None
         logger.warning(f"[BSTS] BSTSSeasonal import failed: {_e_bsts}") 
 
@@ -1549,6 +1572,7 @@ def run(hparams):
         from failure_analysis import FailurePointSampler
         _ANALYSIS_MODULES = True
     except Exception:
+        print(f"[EXCEPT][run.py:1552] {_tb.format_exc().splitlines()[-1]}", flush=True)
         _ANALYSIS_MODULES = False
     # === RESEARCH INIT Haarnoja et al. (2018)Fujimoto et al. (2018)Garlick & Middleditch (2022) ===
     _los = LineOfSightReward(lookahead=5, weight=0.3) if _RESEARCH_MODULES else None
@@ -1609,6 +1633,7 @@ def run(hparams):
         )
         logger.info(f'[DASHBOARD] Started PID={_dash_proc.pid}')
     except Exception as _de:
+        print(f"[EXCEPT][run.py:1612] {_tb.format_exc().splitlines()[-1]}", flush=True)
         logger.warning(f'[DASHBOARD] Could not start: {_de}')
         _dash_proc = None
 
@@ -1682,6 +1707,7 @@ def run(hparams):
         _icm_prev_obs = None          # store obs_t for next step transition
         logger.info("[ICM] Intrinsic Curiosity Module initialised — obs_dim=%d act_dim=%d", _obs_dim, _act_dim_agent)
     except Exception as _icm_init_err:
+        print(f"[EXCEPT][run.py:1685] {_tb.format_exc().splitlines()[-1]}", flush=True)
         _icm = None
         _icm_prev_obs = None
         logger.warning("[ICM] Init failed (non-fatal): %s", _icm_init_err)
@@ -1752,6 +1778,7 @@ def run(hparams):
                     try:
                         _reset_result[0], _reset_result[1] = env.reset()
                     except Exception as e:
+                        print(f"[EXCEPT][run.py:1755] {_tb.format_exc().splitlines()[-1]}", flush=True)
                         _reset_exc[0] = e
                 t = threading.Thread(target=_reset_worker, daemon=True)
                 t.start()
@@ -1764,10 +1791,12 @@ def run(hparams):
             logger.info(f"env.reset() succeeded on attempt {_retry+1}")
             break
         except Exception as e:
+            print(f"[EXCEPT][run.py:1767] {_tb.format_exc().splitlines()[-1]}", flush=True)
             logger.warning(f"env.reset() attempt {_retry+1}/10 failed: {e}")
             try:
                 env.close()
             except:
+                print(f"[EXCEPT][run.py:1771] {_tb.format_exc().splitlines()[-1]}", flush=True)
                 pass
             time.sleep(30)
             env = _apply_phase_env(args, _phase)  # recreate env with fresh ZMQ socket
@@ -1792,6 +1821,7 @@ def run(hparams):
         if n_harvested >= 5:  # v1.1.4: was 10 — BCPilot only hits 5-12 successful eps
             pretrain_td3_bc(td3sac, agent, bc_steps=2000)
     except ImportError:
+        print(f"[EXCEPT][run.py:1795] {_tb.format_exc().splitlines()[-1]}", flush=True)
         # BCPilot: internal fallback, no external dependency
         logger.warning("[HTM] htm_reference not found – falling back to BCPilot")
         _init_rp = _init_info.get("reward_params", {}) if isinstance(_init_info, dict) else {}
@@ -1811,6 +1841,7 @@ def run(hparams):
         else:
             logger.warning("[BC] waypoints empty at init — skipping BC harvest")
     except Exception as _htm_e:
+        print(f"[EXCEPT][run.py:1814] {_tb.format_exc().splitlines()[-1]}", flush=True)
         # v213: also fall back to BCPilot on runtime crash (OOB etc)
         logger.warning(f"[HTM] BC harvest runtime error: {_htm_e} – falling back to BCPilot")
         _init_rp = _init_info.get("reward_params", {}) if isinstance(_init_info, dict) else {}
@@ -1895,6 +1926,7 @@ def run(hparams):
         try:
             rw = _shaper.get_phase_weights(rw)
         except TypeError:
+            print(f"[EXCEPT][run.py:1898] {_tb.format_exc().splitlines()[-1]}", flush=True)
             rw.update(_shaper.get_phase_weights())
         logger.info(f"[ARS] ep={episode_count} phase={_shaper.phase_label() if hasattr(_shaper,'phase_label') else _shaper.current_phase} "
                     f"rw_progress={rw.get('progress',0):.2f}")
@@ -2054,6 +2086,7 @@ def run(hparams):
             try:
                 _ep_step = int(ep_step_count) if 'ep_step_count' in dir() else global_step
             except Exception:
+                print(f"[EXCEPT][run.py:2057] {_tb.format_exc().splitlines()[-1]}", flush=True)
                 _ep_step = global_step
             # v1.0.13: telemetry only for first 3 steps of first 3 episodes
             if episode_count < 3 and ep_step_count < 3:
@@ -2063,6 +2096,7 @@ def run(hparams):
                     logger.debug(f"TELEMETRY gs={global_step} ep={episode_count} step={ep_step_count} "
                                 f"act_space={as_info} raw={type(raw_action).__name__}:{raw_action!r}")
                 except Exception as e:
+                    print(f"[EXCEPT][run.py:2066] {_tb.format_exc().splitlines()[-1]}", flush=True)
                     logger.warning(f"TELEMETRY fail {e}")
             observation, reward, terminated, truncated, info = env.step(_step_action)
             # v1.0.13: continuous arc-progress update — runs every step, not just episode end
@@ -2196,6 +2230,7 @@ def run(hparams):
                         race_engine.initialize()
                         logger.info(f"[V16] MultiRaceLineEngine initialized+.initialize() called with {len(_waypoints)} waypoints")
                     except Exception as _re_init_err:
+                        print(f"[EXCEPT][run.py:2199] {_tb.format_exc().splitlines()[-1]}", flush=True)
                         logger.warning(f"[V16] race_engine.initialize() failed: {_re_init_err}")
                     # BUG-FIX v1.3.1b: create BrakeField on first waypoints if episode-start block hasn't run yet
                     if _brake_field is None:
@@ -2437,6 +2472,7 @@ def run(hparams):
                         else:
                             _ars_info = {}
                     except Exception:
+                        print(f"[EXCEPT][run.py:2440] {_tb.format_exc().splitlines()[-1]}", flush=True)
                         _in_brake_field     = False
                         _brake_potential    = 0.0
                         _bf_compliance_grad = 1.0
@@ -2506,6 +2542,7 @@ def run(hparams):
                     _progress_gate = max(0.0, min(1.0, _d_prog * 20.0))  # 0→1 over 0.05 progress units
                     reward += float(_sac_ex) * 0.05 * _progress_gate
                 except Exception:
+                    print(f"[EXCEPT][run.py:2509] {_tb.format_exc().splitlines()[-1]}", flush=True)
                     pass
                 # --- v6: adaptive reward + stuck tracking ---
                 _cur_wp = _closest[0] if len(_closest) > 0 else 0
@@ -2535,6 +2572,7 @@ def run(hparams):
                     else:
                         reward = max(.002, reward * .40 - .10)  # v1.1.2: was 0.80; 60% cut makes reversal strictly dominated
                 except Exception:
+                    print(f"[EXCEPT][run.py:2538] {_tb.format_exc().splitlines()[-1]}", flush=True)
                     pass
 
                 # v39: offtrack grace period - don't count as stuck for first 10 offtrack steps
@@ -2617,6 +2655,7 @@ def run(hparams):
                     if float(_prog) > 0.1 and not rp.get('is_reversed', False):
                         reward += _icm_bonus
                 except Exception:
+                    print(f"[EXCEPT][run.py:2620] {_tb.format_exc().splitlines()[-1]}", flush=True)
                     pass
             _icm_prev_obs = observation.copy() if hasattr(observation, 'copy') else observation
 
@@ -2661,6 +2700,7 @@ def run(hparams):
                 else:
                     _barrier_angle_rad = 0.0
             except Exception:
+                print(f"[EXCEPT][run.py:2664] {_tb.format_exc().splitlines()[-1]}", flush=True)
                 _barrier_angle_rad = 0.0
             # stopping distance: d = v_perp^2 / (2*a_max) where a_max~3.0 m/s^2
             _A_MAX_BRAKE = 3.0
@@ -2790,6 +2830,7 @@ def run(hparams):
                     ep_jerk_abs.append(abs(_accel_jrk - ep_prev_accel) / 0.1)
                 ep_prev_accel = _accel_jrk
             except Exception:
+                print(f"[EXCEPT][run.py:2793] {_tb.format_exc().splitlines()[-1]}", flush=True)
                 pass
             _rl_blend = min(1.0, _rl_blend + _rl_blend_rate)
             _step_speed_snap = _speed
@@ -2930,6 +2971,7 @@ def run(hparams):
                 if torch.isfinite(_td3_obs_n).all() and torch.isfinite(_td3_nobs_n).all():
                     td3sac.store_transition(_td3_obs_n, _td3_action, reward, _td3_nobs_n, terminated or truncated)
             except Exception:
+                print(f"[EXCEPT][run.py:2933] {_tb.format_exc().splitlines()[-1]}", flush=True)
                 pass
             # context label: 0=straight, 1=left_curve, 2=right_curve
             context_labels[step] = 0 if not rp or abs(_curvature) < 0.01 else (1 if _curvature > 0 else 2)
@@ -3016,6 +3058,7 @@ def run(hparams):
                     try:
                         stuck_tracker.print_report()
                     except Exception as e:
+                        print(f"[EXCEPT][run.py:3019] {_tb.format_exc().splitlines()[-1]}", flush=True)
                         logger.warning(f"print_report failed: {e}")
 
                     # v7: Save BSTS data
@@ -3023,6 +3066,7 @@ def run(hparams):
                         try:
                             stuck_tracker.save_to_json("results")
                         except Exception as e:
+                            print(f"[EXCEPT][run.py:3026] {_tb.format_exc().splitlines()[-1]}", flush=True)
                             logger.warning(f"save_to_json failed: {e}")
                 
                             # v4: End episode for failure analysis
@@ -3152,6 +3196,7 @@ def run(hparams):
                         f"(1=silky, 0=oscillating)  NOTE: steering INPUT rate, not chassis jerk"
                     )
                 except Exception as _e_hm:
+                    print(f"[EXCEPT][run.py:3155] {_tb.format_exc().splitlines()[-1]}", flush=True)
                     logger.warning(f"[HM] compute_all failed: {_e_hm}", exc_info=True)
                     # v1.4.1 FIX: use empty dict {} NOT zero-filled dict.
                     # A zero-filled dict is truthy → `if _hm_out:` passes → all metrics silently = 0.0.
@@ -3415,8 +3460,10 @@ def run(hparams):
                         try:
                             live_summary(bsts_feedback, global_step, episode_count)
                         except Exception:
+                            print(f"[EXCEPT][run.py:3418] {_tb.format_exc().splitlines()[-1]}", flush=True)
                             pass  # non-critical
                 except Exception as _ce:
+                    print(f"[EXCEPT][run.py:3420] {_tb.format_exc().splitlines()[-1]}", flush=True)
                     pass
                 # Use BSTS-adjusted weights for next episode reward shaping
                 rw = _adjusted_rw
@@ -3446,6 +3493,7 @@ def run(hparams):
                     try:
                         intermediary = extract_intermediary_metrics({'steps': _ep_step_log})
                     except Exception as _im_exc:
+                        print(f"[EXCEPT][run.py:3449] {_tb.format_exc().splitlines()[-1]}", flush=True)
                         # v1.6.0 FIX-M: neutral defaults, not zeros.
                         # [0] → mean([0])=0.0 overwrites correct neutrals downstream.
                         _INTERM_NEUTRAL = {
@@ -3521,6 +3569,7 @@ def run(hparams):
                                     summary[_ck]           = _cvf
                                     summary[f'{_ck}_mean'] = _cvf
                             except (TypeError, ValueError):
+                                print(f"[EXCEPT][run.py:3524] {_tb.format_exc().splitlines()[-1]}", flush=True)
                                 pass
                         else:
                             # Write neutral so X-matrix never gets key-error 0.0
@@ -3535,6 +3584,7 @@ def run(hparams):
                                     summary[_hm_k]           = _hfv
                                     summary[f'{_hm_k}_mean'] = _hfv
                             except (TypeError, ValueError):
+                                print(f"[EXCEPT][run.py:3538] {_tb.format_exc().splitlines()[-1]}", flush=True)
                                 pass
                     # Tier 3: bsts_row — already has _hm_out merged in (L3049), most authoritative
                     # COHERENT with bsts_row.update(_hm_out) at L3049 — do NOT change L3049.
@@ -3548,6 +3598,7 @@ def run(hparams):
                                         summary[_bk]           = _bvf
                                         summary[f'{_bk}_mean'] = _bvf
                                 except (TypeError, ValueError):
+                                    print(f"[EXCEPT][run.py:3551] {_tb.format_exc().splitlines()[-1]}", flush=True)
                                     pass
                     _kf_episode_buffer.append(summary)
                     if hasattr(bsts_feedback, "_all_summaries"): bsts_feedback._all_summaries.append(summary)
@@ -3599,6 +3650,7 @@ def run(hparams):
                                     for k, v in _anneal_recs.get('reward_weight_adjustments', {}).items():
                                         logger.info(f"  [ANNEAL] {k}: {v}")
                             except Exception as _be:
+                                print(f"[EXCEPT][run.py:3602] {_tb.format_exc().splitlines()[-1]}", flush=True)
                                 logger.debug(f"BSTS report skip: {_be}")
 
                         # === Race Line Analysis (every 100 episodes) ===
@@ -3619,9 +3671,11 @@ def run(hparams):
                                 _rl_score = score_race_line_compliance(_rl_eps, _rl)
                                 logger.info(f"[RaceLine] perp_v={_rl_score.get('avg_perp_v', 0):.4f}")
                             except Exception as _re:
+                                print(f"[EXCEPT][run.py:3622] {_tb.format_exc().splitlines()[-1]}", flush=True)
                                 logger.debug(f"Race line analysis skip: {_re}")
                         logger.info(f"[BSTS-Kalman] trends={bsts_feedback.kf_trends} betas_top={dict(list(bsts_feedback.kf_betas.items())[:3])}")
                 except Exception as e:
+                    print(f"[EXCEPT][run.py:3625] {_tb.format_exc().splitlines()[-1]}", flush=True)
                     # v1.1.0: was bare `pass` — silent death of ALL Kalman signal.
                     # Now logs at DEBUG so we can see what's failing without spamming console.
                     logger.debug(f"[BSTS-Kalman] update failed ep={episode_count}: {type(e).__name__}: {e}")
@@ -3696,6 +3750,7 @@ def run(hparams):
                             _bsts_trend = bsts_season.get_trend() if hasattr(bsts_season, 'get_trend') else {}
                             logger.info(f"[BSTS-Kalman] ep={episode_count} trend={_bsts_trend}")
                     except Exception as _fe:
+                        print(f"[EXCEPT][run.py:3699] {_tb.format_exc().splitlines()[-1]}", flush=True)
                         logger.debug(f"BSTS flush error: {_fe}")
                 _ep_step_log = []
                 _icm_prev_obs = None  # v1.4.1: flush ICM transition buffer at episode boundary
@@ -3757,6 +3812,7 @@ def run(hparams):
                             _ep_mean_logp = float(logprobs[:min(ep_step_count, len(logprobs))].mean().item())
                             td3sac.update_alpha(_ep_mean_logp)
                     except Exception as e:
+                        print(f"[EXCEPT][run.py:3760] {_tb.format_exc().splitlines()[-1]}", flush=True)
                         logger.debug(f"BSTS feedback skip: {e}")
                 # v17: periodic live analysis and race-line phase-out
                 if episode_count % 50 == 0 and episode_count > 0:
@@ -3766,6 +3822,7 @@ def run(hparams):
                             _a = live_analyze(_lp)
                             logger.info(f"Live analysis ep{episode_count}: {_a}")
                     except Exception as _e:
+                        print(f"[EXCEPT][run.py:3769] {_tb.format_exc().splitlines()[-1]}", flush=True)
                         logger.debug(f"Live analysis skip: {_e}")
 
                 for _rtry in range(3):
@@ -3789,6 +3846,7 @@ def run(hparams):
                         )
                         break
                     except Exception as e:
+                        print(f"[EXCEPT][run.py:3792] {_tb.format_exc().splitlines()[-1]}", flush=True)
                         logger.warning(f"mid-training reset attempt {_rtry+1}/3 failed: {e}")
                         if _rtry < 2:
                             # Simple retry first — ZMQ may just need a moment
@@ -3799,6 +3857,7 @@ def run(hparams):
                             try:
                                 env.close()
                             except Exception:
+                                print(f"[EXCEPT][run.py:3802] {_tb.format_exc().splitlines()[-1]}", flush=True)
                                 pass
                             time.sleep(10)  # let OS release the socket before rebind
                             env = _apply_phase_env(args, _phase)
@@ -3999,6 +4058,7 @@ def run(hparams):
                         if _hotspots:
                             _icm.update_hotspot_weights(_hotspots)
                 except Exception:
+                    print(f"[EXCEPT][run.py:4002] {_tb.format_exc().splitlines()[-1]}", flush=True)
                     pass
 
             if target_kl is not None and approx_kl > target_kl:
@@ -4053,6 +4113,7 @@ def run(hparams):
         else:
             logger.info(f'[GUARD] JSONL size={_sz} bytes -> episodes were recorded.')
     except Exception as _ge:
+        print(f"[EXCEPT][run.py:4056] {_tb.format_exc().splitlines()[-1]}", flush=True)
         logger.warning(f'[GUARD] size check failed: {_ge}')
     jsonl_file.close()
     logger.info(f'Model {agent.name} saved. Training complete.')
@@ -4070,11 +4131,22 @@ def run(hparams):
         ("reinvent2019_wide", "obstacle"),
         ("reinvent2019_wide", "h2h"),
     ]
+    # BUG-DEMO-FIX (v1.1.6d): Close the training env BEFORE the demo loop.
+    # demo() calls make_environment() which opens a 2nd ZMQ client on port 8888.
+    # Two simultaneous clients deadlock Gazebo. env.close() MUST come first.
+    print("[DEMO] Closing training env before demo generation...", flush=True)
+    try:
+        env.close()
+        print("[DEMO] Training env closed OK.", flush=True)
+    except Exception:
+        print(f"[DEMO][EXCEPT][run.py:env_close] {_tb.format_exc().splitlines()[-1]}", flush=True)
+    import time as _demo_time_mod; _demo_time_mod.sleep(2.0)  # allow ZMQ socket teardown
+
     os.makedirs('./demos', exist_ok=True)
     for _dp_track, _dp_variant in _DEMO_PHASES:
         try:
-            _dp_phase = {'track': _dp_track, 'variant': _dp_variant}
-            apply_phase_env(args, _dp_phase, current_env=None)
+            print(f"[DEMO] Starting generation: track={_dp_track} variant={_dp_variant}", flush=True)
+            # NOTE: apply_phase_env removed — cannot reconfigure env post-close.
             demo(
                 agent,
                 environment_name=ENVIRONMENT_NAME,
@@ -4083,9 +4155,8 @@ def run(hparams):
             )
             logger.info(f'[DEMO] Generated video: {_dp_track}/{_dp_variant}')
         except Exception as _de:
+            print(f"[DEMO][EXCEPT][run.py:demo_loop] {_tb.format_exc()}", flush=True)
             logger.warning(f'[DEMO] Failed for {_dp_track}/{_dp_variant}: {_de}')
-
-    env.close()
     writer.close()
     # Shutdown dashboard
     try:

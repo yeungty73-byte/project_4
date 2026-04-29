@@ -1,3 +1,4 @@
+import traceback as _tb
 """brake_field.py — v1.3.0
 ===================================================================================
 DESIGN: Per-class Vector Field Brake Field
@@ -499,6 +500,7 @@ class CombinedBrakeField:
             return {"mask16": mask, "dist16": dist,
                     "sector_class16": sector_cls, "front_clear": front_clear}
         except Exception:
+            print(f"[EXCEPT][brake_field.py:502] {_tb.format_exc().splitlines()[-1]}", flush=True)
             return null
 
     # ── Corner potential (same as v1.2.0, for backward compatibility) ─────────
@@ -782,6 +784,7 @@ class CombinedBrakeField:
             }
 
         except Exception as _e:
+            print(f"[EXCEPT][brake_field.py:785] {_tb.format_exc().splitlines()[-1]}", flush=True)
             return {
                 "brake_potential": 0.0, "potential": 0.0, "in_brake_field": False,
                 "compliance_gradient": 1.0, "compliance": False, "v_perp": 0.0,

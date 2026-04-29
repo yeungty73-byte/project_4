@@ -1,3 +1,4 @@
+import traceback as _tb
 import os
 from denim_theme import apply_theme, get_color, DENIM_BRIGHT, AMBER, TERRA_COTTA, SAGE_GREEN, MUTED_PURPLE, GOLD_WARM, DENIM_MID, DENIM_DARK, BG_DARK, WHITE_SMOKE
 #!/usr/bin/env python3
@@ -437,6 +438,7 @@ def compute_optimal_race_line(waypoints: List[Tuple[float, float]],
         ])
         max_speeds = np.array([_optimal_speed(1.0 / max(k, 1e-4)) for k in curvatures])
     except ImportError:
+        print(f"[EXCEPT][analyze_logs.py:440] {_tb.format_exc().splitlines()[-1]}", flush=True)
         dx = np.gradient(pts[:, 0])
         dy = np.gradient(pts[:, 1])
         d2x = np.gradient(dx)
@@ -916,6 +918,7 @@ def plot_bsts_decomposition(bsts_rpt: dict, matrix: list,
             AMBER, TERRA_COTTA, SAGE_GREEN, MUTED_PURPLE, GOLD_WARM,
             DENIM_MID, DENIM_DARK, BG_DARK, WHITE_SMOKE, MUTED_GRAY)
     except ImportError:
+        print(f"[EXCEPT][analyze_logs.py:919] {_tb.format_exc().splitlines()[-1]}", flush=True)
         BG_DARK, WHITE_SMOKE, MUTED_GRAY = "#2E2E2E", "#F5F5F5", "#8C8C8C"
         DENIM_BRIGHT, AMBER, TERRA_COTTA = "#5B9BD5", "#D4A03C", "#C75B39"
         SAGE_GREEN, MUTED_PURPLE, GOLD_WARM = "#6BB38A", "#9B6EB7", "#E8C167"

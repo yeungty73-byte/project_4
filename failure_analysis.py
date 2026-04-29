@@ -1,3 +1,4 @@
+import traceback as _tb
 """failure_analysis.py  v5.0 — forensic sampler, wired into replay and reward.
 
 What changed in v5.0
@@ -186,6 +187,7 @@ class FailurePointSampler:
                               if hasattr(o, 'tolist') else float(o))
                     f.write('\n')
             except Exception:
+                print(f"[EXCEPT][failure_analysis.py:189] {_tb.format_exc().splitlines()[-1]}", flush=True)
                 pass
 
         # Reservoir-sample successes
@@ -310,6 +312,7 @@ class FailureAnalyzer:
                     try:
                         eps.append(json.loads(line))
                     except Exception:
+                        print(f"[EXCEPT][failure_analysis.py:313] {_tb.format_exc().splitlines()[-1]}", flush=True)
                         pass
         return eps
 
@@ -325,6 +328,7 @@ class FailureAnalyzer:
                 try:
                     row[k] = float(v)
                 except (ValueError, TypeError):
+                    print(f"[EXCEPT][failure_analysis.py:328] {_tb.format_exc().splitlines()[-1]}", flush=True)
                     row[k] = v
             out.append(row)
         return out
