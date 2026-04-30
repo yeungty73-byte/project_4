@@ -6,6 +6,40 @@ A PPO-based autonomous racing agent for the AWS DeepRacer simulator,
 incorporating insights from autonomous racing and reward shaping literature.
 Features federated multi-worker training across PACE ICE cluster nodes.
 
+## Key Equations
+
+### Harmonized Track Progress (concave amplifier)
+
+$$p^{\star} = 1 - \left(1 - \frac{p_{\text{raw}}}{100}\right)^2$$
+
+Lifts episode-level variance above the BSTS Kalman observation noise floor (SNR ≥ 1.5 at Phase-A entry).
+
+### Four-Channel Potential-Based Reward (Ng-invariant)
+
+$$\tilde{r}(s,a,s') = r(s,a,s') + \gamma\,\Phi(s') - \Phi(s)$$
+
+$$\Phi = w_p\,\Phi_{\text{prog}} + w_b\,\Phi_{\text{brake}} + w_r\,\Phi_{\text{race}} + w_h\,\Phi_{\text{head}}$$
+
+Weights $w_t$ anneal across curriculum phases A→B→C (see `adaptive_reward_shaper.py`).
+
+### Brake-Field Speed Cap
+
+$$v_{\text{cap}}(\kappa) = \sqrt{\frac{\mu g}{|\kappa|}}$$
+
+Curvature-limited velocity ceiling from quasi-static tire dynamics.
+
+### ICM Intrinsic Reward (Pathak et al., 2017)
+
+$$r^i_t = \eta \cdot \frac{1}{2}\,\left\|\phi(s_{t+1}) - \hat{\phi}(s_{t+1} \mid s_t, a_t)\right\|^2 \cdot w\!\left(\text{seg}(s_t)\right)$$
+
+Forward-model prediction error in encoder space, scaled by crash-density hotspot weight $w \in [1, 3]$ from `failure_analysis.py`.
+
+### PPO Clipped Surrogate Objective
+
+$$\mathcal{L}^{\text{CLIP}}(\theta) = \mathbb{E}_t\!\left[\min\!\left(r_t(\theta)\hat{A}_t,\;\mathrm{clip}(r_t(\theta),\,1{-}\epsilon,\,1{+}\epsilon)\hat{A}_t\right)\right]$$
+
+---
+
 ## v1.0.7 — Waypoint Tracking + DeepRacer Termination Conditions
 
 ### Key Changes
@@ -25,6 +59,7 @@ project_4/
   agents.py                 # PPOAgent, RandomAgent
   context_aware_agent.py    # ContextAwarePPOAgent (straight/curve/obstacle)
   td3_sac_ensemble.py       # TD3+SAC twin-critic ensemble
+  icm.py                    # Intrinsic Curiosity Module (Pathak et al. 2017)
   corner_analysis.py        # Curvature, braking, racing line rewards
   race_line_engine.py       # Multi-strategy racing line computation
   brake_field.py            # Continuous brake-line vector field
