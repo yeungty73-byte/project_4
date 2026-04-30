@@ -965,7 +965,7 @@ def harvest_htm_pilots(env, htm_agent, td3sac, n_episodes=12, min_progress=2.0):
                 action = np.clip(np.asarray(raw_action, dtype=np.float32),
                                  env.action_space.low, env.action_space.high)
             else:
-                action = process_action(raw_action, env.action_space, rp.get("waypoints", []))
+                action = process_action(raw_action, env.action_space, None)  # PATCH-v1.1.7a: _shaper not in scope here; None → TPA skip is safe
             next_obs, reward, terminated, truncated, info = env.step(action)
             next_rp = info.get('reward_params', {}) if isinstance(info, dict) else {}
             _, _, prog_pct, _, _bc_progress_state = update_episode_centerline_progress(
@@ -2076,7 +2076,7 @@ def run(hparams):
 
             # --- v213 FIX: use process_action for ALL action dispatch (discrete + continuous) ---
             raw_action = action.cpu().numpy()          # ← must be BEFORE process_action call
-            _step_action = process_action(raw_action, env.action_space, rp.get("waypoints", []))
+            _step_action = process_action(raw_action, env.action_space, locals().get('_shaper', None))  # PATCH-v1.1.7a: BUG-PROCESS-ACTION-ARG
             # v40.2: removed duplicate env.step that used un-remapped action (caused 100% stuck episodes)
             # v40.3: comprehensive action dispatch telemetry for first 20 steps of each episode
             try:
@@ -4038,7 +4038,8 @@ def run(hparams):
                     _icm_obs_mb  = b_obs[mb_inds].float()
                     _icm_obs_mb1 = torch.roll(_icm_obs_mb, -1, dims=0)   # t+1 observations
                     _icm_act_mb  = b_actions[mb_inds].float()
-                    _icm_fwd, _icm_inv = _icm.loss(_icm_obs_mb[:-1], _icm_obs_mb1[:-1], _icm_act_mb[:-1])
+                    _icm_out = _icm.loss(_icm_obs_mb[:-1], _icm_obs_mb1[:-1], _icm_act_mb[:-1])  # PATCH-v1.1.7a: BUG-ICM-UNPACK
+                    _icm_fwd, _icm_inv = _icm_out[0], _icm_out[1]  # safe even if loss() returns >2 values
                     _icm_loss_total = _icm_fwd + _icm_inv
                     _icm_optim.zero_grad()
                     _icm_loss_total.backward()
@@ -4165,6 +4166,19 @@ def run(hparams):
                     logger.warning(f"DEMO utils.ENVIRONMENT_PARAMS_PATH patch failed: {_upe}")
             else:
                 logger.warning(f"DEMO no env-map for {_dp_track}/{_dp_variant} -- using last training env vars")
+            # ---- DEMO-CALL-FIX v1.1.7a -----------------------------------------
+            # BUG-DEMO-MISSING-CALL: previous code only injected env vars but
+            # never called demo().  All three videos were always zero-frame.
+            # action_post_processor uses None shaper (TPA cap irrelevant at demo).
+            # -----------------------------------------------------------------------
+            _demo_pp = lambda _raw, _asp: process_action(_raw, _asp, None)
+            _demo_path = demo(
+                agent,
+                environment_name=ENVIRONMENT_NAME,
+                directory='./demos',
+                action_post_processor=_demo_pp,
+            )
+            print(f"[DEMO] {_dp_variant} video → {_demo_path}", flush=True)
         except Exception as de:
             if writer is not None:
                 writer.close()        # FIX: was no-op (missing parentheses)
