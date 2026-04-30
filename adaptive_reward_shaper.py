@@ -1,3 +1,4 @@
+from __future__ import annotations
 import traceback as _tb
 """adaptive_reward_shaper.py — v1.5.0b
 Standalone module. Drop-in replacement.
@@ -53,7 +54,6 @@ REF: Bengio et al. (2009) ICML: curriculum learning -- easy-first ordering impro
 REF: Florensa et al. (2017) CoRL: automatic curriculum via reverse curriculum generation.
 """
 
-from __future__ import annotations
 import math
 import numpy as np
 from collections import deque
