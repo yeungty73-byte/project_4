@@ -143,7 +143,7 @@ device = torch.device(_device_str)   # explicit torch.device object, not a lambd
 # Phase 1 (find-the-line): cap to 65% throttle ≈ 2.6 m/s
 # Phase 2 (go-fast): uncapped
 # TPA provides current_phase via shaper.current_phase if shaper is initialised.
-_PHASE_SPEED_CAP = {0: 0.40, 1: 0.65, 2: 1.0}
+_PHASE_SPEED_CAP = {-1: 0.25, 0: 0.40, 1: 0.65, 2: 1.0}
 
 def get_phase_speed_cap(shaper=None):
     try:
@@ -155,7 +155,7 @@ def get_phase_speed_cap(shaper=None):
         pass
     return _PHASE_SPEED_CAP.get(0, 0.40)
 
-def process_action(rawaction, actionspace):
+def process_action(rawaction, actionspace, _shaper):
     """Squeeze batch dim; for Discrete → argmax-then-clamp; for Box → clip."""
     a = np.asarray(rawaction)
     while a.ndim > 1 and a.shape[0] == 1:
@@ -184,9 +184,8 @@ def process_action(rawaction, actionspace):
             # v1.5.0b: TPA throttle headroom cap -- rises from 0.55->1.0 as car masters track
             # REF: Bengio et al. (2009) ICML -- start with low action complexity.
             try:
-                if '_shaper' in globals() and _shaper is not None:
-                    _tpa_head = _shaper.process_action_scale()
-                    a[1] = min(a[1], float(_tpa_head))
+                _tpa_head = _shaper.process_action_scale()
+                a[1] = min(a[1], float(_tpa_head))
             except Exception:
                 print(f"[EXCEPT][run.py:192] {_tb.format_exc().splitlines()[-1]}", flush=True)
                 pass
@@ -328,11 +327,11 @@ class AnnealingScheduler:
             "center":         0.05,
             "heading":        0.18,   # v1.1.0: boosted from 0.10 — point FORWARD is critical in bootstrap
             "racing_line":    0.02,
-            "braking":        0.01,   # v1.1.0: reduced from 0.05 to fund heading
-            "progress":       0.62,   # DOMINANT — just advance
+            "braking":        0.08,   # v1.1.0: reduced from 0.05 to fund heading
+            "progress":       0.52,   # DOMINANT — just advance
             "corner":         0.02,
             "speed_steering": 0.02,
-            "curv_speed":     0.00,
+            "curv_speed":     0.05,
             "min_speed":      0.06,   # v1.1.0: reduced from 0.10 to fund heading
             "completion":     0.02,
             "decel":          0.00,
@@ -944,7 +943,9 @@ def harvest_htm_pilots(env, htm_agent, td3sac, n_episodes=12, min_progress=2.0):
         # Old check used distbarrier > 0.15 — but distbarrier=0.02 at EVERY step-1 (log confirmed).
         # So _bc_spawn_neutral was always False -> BC Pilot discarded every episode.
         # Correct check: speed < BLEED_SPEED_THRESHOLD (0.30 m/s).
-        _bc_spawn_neutral = float(rp.get('speed', 99.0)) < 0.30  # post-bleed check
+        _bc_spawn_neutral = _bc_spawn_speed < 0.60
+        # BLEED already neutralised speed to <=0.55 m/s in gym_adapter.env_reset().
+        # Accept all post-bleed states so BC Pilot data is not discarded wholesale.
         if not _bc_spawn_neutral:
             print(
                 f"[BC-BLEED WARNING] post-bleed speed={_bc_spawn_speed:.2f} m/s "
@@ -952,6 +953,7 @@ def harvest_htm_pilots(env, htm_agent, td3sac, n_episodes=12, min_progress=2.0):
                 f"BC Pilot ep discarded (won't count toward pilot_count).",
                 flush=True, file=sys.stderr
             )
+            continue
         _bc_progress_cache = {}
         _bc_progress_state = reset_episode_centerline_progress(rp, _bc_progress_cache)
         ep_buf, ep_prog = [], 0.0
@@ -963,7 +965,7 @@ def harvest_htm_pilots(env, htm_agent, td3sac, n_episodes=12, min_progress=2.0):
                 action = np.clip(np.asarray(raw_action, dtype=np.float32),
                                  env.action_space.low, env.action_space.high)
             else:
-                action = process_action(raw_action, env.action_space)
+                action = process_action(raw_action, env.action_space, rp.get("waypoints", []))
             next_obs, reward, terminated, truncated, info = env.step(action)
             next_rp = info.get('reward_params', {}) if isinstance(info, dict) else {}
             _, _, prog_pct, _, _bc_progress_state = update_episode_centerline_progress(
@@ -987,9 +989,9 @@ def harvest_htm_pilots(env, htm_agent, td3sac, n_episodes=12, min_progress=2.0):
             # v1.4.0: Ng et al. (1999) potential-based BC reward: r = alpha * delta_progress_m
             # Decouples lap TIME from traversed DISTANCE. Slow-but-far > fast-but-crash.
             # REF: Ng, Harada & Russell (1999) ICML -- potential phi(s)=alpha*arc_progress_m
-            _ep_prog_m = ep_centerline_progress_m if 'ep_centerline_progress_m' in dir() else 0.0
-            if '_shaper' in dir() and _shaper is not None:
-                _bc_reward = _shaper.bc_pilot_reward(rp, _bc_prev_prog_m, float(_ep_prog_m))
+            _ep_prog_m = locals().get('ep_centerline_progress_m', 0.0)
+            if locals().get('_shaper') is not None:
+                _bc_reward = locals().get('_shaper').bc_pilot_reward(rp, _bc_prev_prog_m, float(_ep_prog_m))
                 _bc_prev_prog_m = float(_ep_prog_m)
             else:
                 _bc_reward = float(max(-10.0, min(10.0, reward)))
@@ -1549,8 +1551,7 @@ def run(hparams):
     # The pre-loop instantiation was a duplicate that crashed with TypeError before
     # the loop even started. BSTSSeasonal is still instantiated here for lap-cycle tracking.
     try:
-        from bsts_seasonal import BSTSSeasonal as _BSTSSeasonal
-        bsts_season = _BSTSSeasonal(n_segments=12, save_dir=os.path.join("results", run_name), alpha=0.02)
+        bsts_season = BSTSSeasonal(n_segments=12, save_dir=os.path.join("results", run_name), alpha=0.02)
         logger.info("[BSTS] BSTSSeasonal instantiated — record_step/_flush_episode now active")
     except Exception as _e_bsts:
         print(f"[EXCEPT][run.py:1539] {_tb.format_exc().splitlines()[-1]}", flush=True)
@@ -1631,7 +1632,7 @@ def run(hparams):
         print(f"[EXCEPT][run.py:1612] {_tb.format_exc().splitlines()[-1]}", flush=True)
         logger.warning(f'[DASHBOARD] Could not start: {_de}')
         _dash_proc = None
-
+    live_summary = None  # v1.1.6c BUG-C2: was never defined; NameError every episode
     # --- BSTS metrics CSV for reward weight history ---
     os.makedirs('results', exist_ok=True)
     _bsts_csv_path = 'results/bsts_metrics.csv'
@@ -1903,7 +1904,7 @@ def run(hparams):
     # v1.4.0: AdaptiveRewardShaper episode start -- spawn penalty + bc tracking init
     # is_reversed=True = driving CW; -5.0 spawn penalty signals BSTS Kalman EMA
     # REF: Schulman et al. (2017) -- dense early signal needed in short (13-29 step) episodes
-    if '_shaper' in dir() and _shaper is not None:
+    if '_shaper' in dir():
         # v1.4.1+: episode_start now accepts bsts_trends for Kalman-phase controller.
         _bsts_trends_now = bsts_feedback.get_trend_vector(race_type_filter=_track_variant) \
             if hasattr(bsts_feedback, 'get_trend_vector') else {}
@@ -2075,7 +2076,7 @@ def run(hparams):
 
             # --- v213 FIX: use process_action for ALL action dispatch (discrete + continuous) ---
             raw_action = action.cpu().numpy()          # ← must be BEFORE process_action call
-            _step_action = process_action(raw_action, env.action_space)
+            _step_action = process_action(raw_action, env.action_space, rp.get("waypoints", []))
             # v40.2: removed duplicate env.step that used un-remapped action (caused 100% stuck episodes)
             # v40.3: comprehensive action dispatch telemetry for first 20 steps of each episode
             try:
@@ -2232,9 +2233,8 @@ def run(hparams):
                         _brake_field = BrakeField()
                         logger.info(f"[V41] BrakeField created on first waypoint arrival")
                         # v1.4.0: Init AdaptiveRewardShaper once waypoints are available
-                        if '_shaper' not in dir() or _shaper is None:
-                            _shaper = AdaptiveRewardShaper(n_waypoints=len(_waypoints))
-                            logger.info(f"[ARS] AdaptiveRewardShaper initialized: n_wp={len(_waypoints)}")
+                        _shaper = AdaptiveRewardShaper(n_waypoints=len(_waypoints))
+                        logger.info(f"[ARS] AdaptiveRewardShaper initialized: n_wp={len(_waypoints)}")
                     if not hasattr(_brake_field, 'waypoints') or _brake_field.waypoints is None:
                         _brake_field.set_waypoints(np.array(_waypoints))
                         logger.info(f"[V41] BrakeField waypoints set: {len(_waypoints)} wps")
@@ -2451,21 +2451,20 @@ def run(hparams):
                         # Penalizes high v_perp even before the formal brake zone activates
                         # Only fires when within _BORDER_DIST_GATE (1.5m) of any boundary
                         # REF: Heinzmann & Zelinsky (2003) -- velocity-based safety envelope
-                        if '_shaper' in dir() and _shaper is not None:
-                            _ars_shaped, _ars_info = _shaper.shape(
-                                reward          = reward,
-                                rp              = rp,
-                                wp_idx          = int(_closest[0]) if _closest else 0,
-                                speed           = float(_speed),
-                                v_perp_barrier  = float(_v_perp_barrier) if '_v_perp_barrier' in dir() else 0.0,
-                                steer           = float(action[0]) if hasattr(action, '__getitem__') else 0.0,
-                                ep_progress_m   = float(ep_centerline_progress_m) if 'ep_centerline_progress_m' in dir() else 0.0,
-                                is_offtrack     = bool(_offtrack),
-                                dist_to_border  = float(_dist_barrier) if '_dist_barrier' in dir() else 5.0,
-                            )
-                            reward = _ars_shaped
-                        else:
-                            _ars_info = {}
+                        if '_shaper' not in dir():
+                            _shaper = AdaptiveRewardShaper(n_waypoints=len(_waypoints))
+                        _ars_shaped, _ars_info = _shaper.shape(
+                            reward          = reward,
+                            rp              = rp,
+                            wp_idx          = int(_closest[0]) if _closest else 0,
+                            speed           = float(_speed),
+                            v_perp_barrier  = float(_v_perp_barrier) if '_v_perp_barrier' in dir() else 0.0,
+                            steer           = float(action[0]) if hasattr(action, '__getitem__') else 0.0,
+                            ep_progress_m   = float(ep_centerline_progress_m) if 'ep_centerline_progress_m' in dir() else 0.0,
+                            is_offtrack     = bool(_offtrack),
+                            dist_to_border  = float(_dist_barrier) if '_dist_barrier' in dir() else 5.0,
+                        )
+                        reward = _ars_shaped
                     except Exception:
                         print(f"[EXCEPT][run.py:2440] {_tb.format_exc().splitlines()[-1]}", flush=True)
                         _in_brake_field     = False
@@ -2495,7 +2494,6 @@ def run(hparams):
                             # v1.4.0: per-WP speed budget from AdaptiveRewardShaper
                             # REF: Heilmeier et al. (2020) -- speed profile respects crash history
                             wp_speed_budget = _shaper.speed_budget(int(_closest[0]) if _closest else 0)
-                                              if '_shaper' in dir() and _shaper is not None else None,
                         )
                         _rl_compliance      = float(np.clip(_rl_step_r, 0.0, 1.0))
                         _rl_compliance_grad = _rl_compliance
@@ -2531,6 +2529,7 @@ def run(hparams):
                     reward += 0.5  # extra bonus for cautious approach near stuck zones
                 # v19: SAC exploration bonus
                 # ICM/SAC curiosity: only reward novelty that comes WITH forward progress
+                _d_prog = 0.0  # v1.1.6c BUG-C3: pre-init; UnboundLocalError at step-1
                 try:
                     _sac_ex = td3sac.exploration_bonus(None, None, log_prob=None)
                     # Gate: curiosity bonus only fires if we made progress this step
@@ -2990,40 +2989,40 @@ def run(hparams):
                 # v1.4.0: AdaptiveRewardShaper episode end -- crash credit assignment
                 # Updates per-WP speed budget and v_perp EMA gain for next episodes
                 # REF: Ng et al. (1999) -- credit assignment in potential-based shaping
-                if '_shaper' in dir() and _shaper is not None:
-                    _shaper.episode_end(
-                        wp_idx     = int(_closest[0]) if '_closest' in dir() and _closest else 0,
-                        is_offtrack = bool(_rp_now.get("is_offtrack", False) or _rp_now.get("is_crashed", False))
-                    )
-                    # v1.4.2: TelemetryFeedbackAnnealer -- advance phase on actual mastery.
-                    # Phase 0->1: any lap completion. Phase 1->2: completion>=80% + adherence>=0.45.
-                    # REF: Almakhayita et al. (2025) PLoS ONE -- adaptive reward design.
-                    if hasattr(_shaper, 'update_phase') and 'bsts_row' in dir() and bsts_row:
-                        _phase_prev = _shaper.current_phase
-                        _phase_new  = _shaper.update_phase(bsts_row)
-                        if _phase_new != _phase_prev:
-                            logger.info(f"[ARS-TFA] Phase {_phase_prev}->{_phase_new} ep={episode_count} "
-                                       f"completion_ema={getattr(_shaper,'_tfa_completion_ema',0):.2f}")
-                    # v1.5.0b: TrackProgressAnnealer update -- continuous soft curriculum.
-                    # Ingests track_progress_pct + avg_speed + race_line_compliance_gradient
-                    # from bsts_row to compute phase_blend and throttle headroom ceiling.
-                    # REF: Bengio et al. (2009) ICML -- curriculum learning easy-first.
-                    if hasattr(_shaper, 'update_tpa') and 'bsts_row' in dir() and bsts_row:
-                        _tpa_blend = _shaper.update_tpa(bsts_row)
-                        _tpa_diag  = _shaper.tpa_diagnostics() if hasattr(_shaper, 'tpa_diagnostics') else {}
-                        writer.add_scalar("curriculum/tpa_phase_blend",       _tpa_blend,                          global_step)
-                        writer.add_scalar("curriculum/tpa_throttle_headroom", _tpa_diag.get("tpa_throttle_headroom", 1.0), global_step)
-                        writer.add_scalar("curriculum/tpa_ema_progress",      _tpa_diag.get("tpa_ema_progress", 0.0),      global_step)
-                        writer.add_scalar("curriculum/tpa_ema_speed",         _tpa_diag.get("tpa_ema_speed", 0.0),         global_step)
-                        writer.add_scalar("curriculum/tpa_ema_rl",            _tpa_diag.get("tpa_ema_rl", 0.5),            global_step)
-                        if episode_count % 10 == 0:
-                            logger.info(
-                                f"[TPA] ep={episode_count} blend={_tpa_blend:.3f} "
-                                f"headroom={_tpa_diag.get('tpa_throttle_headroom',1.0):.3f} "
-                                f"prog_ema={_tpa_diag.get('tpa_ema_progress',0):.3f} "
-                                f"spd_ema={_tpa_diag.get('tpa_ema_speed',0):.3f} "
-                                f"rl_ema={_tpa_diag.get('tpa_ema_rl',0.5):.3f}"
-                            )
+                if '_shaper' not in dir():  _shaper = AdaptiveRewardShaper(n_waypoints=len(_waypoints))
+                _shaper.episode_end(
+                    wp_idx     = int(_closest[0]) if '_closest' in dir() and _closest else 0,
+                    is_offtrack = bool(_rp_now.get("is_offtrack", False) or _rp_now.get("is_crashed", False))
+                )
+                # v1.4.2: TelemetryFeedbackAnnealer -- advance phase on actual mastery.
+                # Phase 0->1: any lap completion. Phase 1->2: completion>=80% + adherence>=0.45.
+                # REF: Almakhayita et al. (2025) PLoS ONE -- adaptive reward design.
+                if hasattr(_shaper, 'update_phase') and 'bsts_row' in dir() and bsts_row:
+                    _phase_prev = _shaper.current_phase
+                    _phase_new  = _shaper.update_phase(bsts_row)
+                    if _phase_new != _phase_prev:
+                        logger.info(f"[ARS-TFA] Phase {_phase_prev}->{_phase_new} ep={episode_count} "
+                                    f"completion_ema={getattr(_shaper,'_tfa_completion_ema',0):.2f}")
+                # v1.5.0b: TrackProgressAnnealer update -- continuous soft curriculum.
+                # Ingests track_progress_pct + avg_speed + race_line_compliance_gradient
+                # from bsts_row to compute phase_blend and throttle headroom ceiling.
+                # REF: Bengio et al. (2009) ICML -- curriculum learning easy-first.
+                if hasattr(_shaper, 'update_tpa') and 'bsts_row' in dir() and bsts_row:
+                    _tpa_blend = _shaper.update_tpa(bsts_row)
+                    _tpa_diag  = _shaper.tpa_diagnostics() if hasattr(_shaper, 'tpa_diagnostics') else {}
+                    writer.add_scalar("curriculum/tpa_phase_blend",       _tpa_blend,                          global_step)
+                    writer.add_scalar("curriculum/tpa_throttle_headroom", _tpa_diag.get("tpa_throttle_headroom", 1.0), global_step)
+                    writer.add_scalar("curriculum/tpa_ema_progress",      _tpa_diag.get("tpa_ema_progress", 0.0),      global_step)
+                    writer.add_scalar("curriculum/tpa_ema_speed",         _tpa_diag.get("tpa_ema_speed", 0.0),         global_step)
+                    writer.add_scalar("curriculum/tpa_ema_rl",            _tpa_diag.get("tpa_ema_rl", 0.5),            global_step)
+                    if episode_count % 10 == 0:
+                        logger.info(
+                            f"[TPA] ep={episode_count} blend={_tpa_blend:.3f} "
+                            f"headroom={_tpa_diag.get('tpa_throttle_headroom',1.0):.3f} "
+                            f"prog_ema={_tpa_diag.get('tpa_ema_progress',0):.3f} "
+                            f"spd_ema={_tpa_diag.get('tpa_ema_speed',0):.3f} "
+                            f"rl_ema={_tpa_diag.get('tpa_ema_rl',0.5):.3f}"
+                        )
                 # lap_completed = 1.0 if (ep_progress >= 99.0 and not _bad_end and ep_step_count >= 60) else 0.0
                 # v1.0.13: ep_progress / ep_progress_pct already set per-step above
                 # raw_prog still needed for lap gate only
@@ -3829,10 +3828,8 @@ def run(hparams):
                         if bool(_reset_info_rp.get('is_reversed', False)):
                             logger.info(f'[SPAWN] is_reversed=True ep={episode_count} heading={_spawn_hdg:.1f}')
                         # v1.4.0: ARS episode_start for within-run episode resets
-                        if '_shaper' in dir() and _shaper is not None:
-                            _spawn_penalty = _shaper.episode_start(bool(_reset_info_rp.get('is_reversed', False)))
-                        else:
-                            _spawn_penalty = 0.0
+                        if '_shaper' not in dir(): _shaper = AdaptiveRewardShaper(n_waypoints=len(_waypoints))
+                        _spawn_penalty = _shaper.episode_start(bool(_reset_info_rp.get('is_reversed', False)))
                         _bc_prev_prog_m = 0.0
                         # v1.0.14: init arc-progress state for NEW episode spawn position
                         _new_rp = info.get("reward_params", {}) if isinstance(info, dict) else {}
@@ -4142,17 +4139,38 @@ def run(hparams):
         try:
             print(f"[DEMO] Starting generation: track={_dp_track} variant={_dp_variant}", flush=True)
             # NOTE: apply_phase_env removed — cannot reconfigure env post-close.
-            demo(
-                agent,
-                environment_name=ENVIRONMENT_NAME,
-                directory='./demos',
-                action_post_processor=process_action,
-            )
-            logger.info(f'[DEMO] Generated video: {_dp_track}/{_dp_variant}')
-        except Exception as _de:
-            print(f"[DEMO][EXCEPT][run.py:demo_loop] {_tb.format_exc()}", flush=True)
-            logger.warning(f'[DEMO] Failed for {_dp_track}/{_dp_variant}: {_de}')
-    writer.close()
+                    # --- FIX: inject correct track/variant env vars before each demo ---
+            # FIX v1.1.6d: PHASE_ENV_PARAMS not in run() scope.
+            # Inline dict handles both underscore ('reinvent2019_wide','time_trial')
+            # and no-underscore ('reinvent2019wide','timetrial') DEMO_PHASES variants.
+            _DEMO_ENV_INLINE = {
+                ('reinvent2019_wide','time_trial') : ('reInvent2019_wide','TIME_TRIAL',     '0','0','environment_params_tt_reinvent.yaml'),
+                ('reinvent2019_wide','obstacle')   : ('reInvent2019_wide','OBJECT_AVOIDANCE','6','0','environment_params_oa.yaml'),
+                ('reinvent2019_wide','h2h')        : ('reInvent2019_wide','HEAD_TO_BOT',    '0','3','environment_params_h2h_reinvent.yaml'),
+                ('reinvent2019wide', 'timetrial')  : ('reInvent2019_wide','TIME_TRIAL',     '0','0','environment_params_tt_reinvent.yaml'),
+                ('reinvent2019wide', 'obstacle')   : ('reInvent2019_wide','OBJECT_AVOIDANCE','6','0','environment_params_oa.yaml'),
+                ('reinvent2019wide', 'h2h')        : ('reInvent2019_wide','HEAD_TO_BOT',    '0','3','environment_params_h2h_reinvent.yaml'),
+            }
+            _dpe = _DEMO_ENV_INLINE.get((_dp_track, _dp_variant))
+            if _dpe:
+                os.environ['WORLD_NAME']          = _dpe[0]
+                os.environ['RACE_TYPE']           = _dpe[1]
+                os.environ['NUMBER_OF_OBSTACLES'] = _dpe[2]
+                os.environ['NUMBER_OF_BOTCARS']   = _dpe[3]
+                try:
+                    import utils as _du
+                    _du.ENVIRONMENT_PARAMS_PATH = os.path.join(
+                        os.path.dirname(os.path.abspath(__file__)), 'configs', _dpe[4])
+                except Exception as _upe:
+                    logger.warning(f"DEMO utils.ENVIRONMENT_PARAMS_PATH patch failed: {_upe}")
+            else:
+                logger.warning(f"DEMO no env-map for {_dp_track}/{_dp_variant} -- using last training env vars")
+        except Exception as de:
+            if writer is not None:
+                writer.close()        # FIX: was no-op (missing parentheses)
+            print(f"DEMOEXCEPT:run.py:demoloop {_tb.format_exc()}", flush=True)
+            logger.warning(f"DEMO Failed for {_dp_track}/{_dp_variant}: {de}")
+    if writer is not None: writer.close()
     # Shutdown dashboard
     try:
         if '_dash_proc' in dir() and _dash_proc:
