@@ -294,16 +294,50 @@ def demo(
         if demo_progress is not None:
             demo_progress.update()
         if terminated or truncated:
-            break
+            # v1.1.7a FIX-DEMO-RESET: reset instead of break so we capture full MAX_DEMO_STEPS
+            observation, _ = demo_environment.reset()
 
     if _HAS_CV2 and vid_writer is not None:
         vid_writer.release()
-    elif frames_buf and not _HAS_CV2:
-        try:
-            _iio.mimwrite(video_path, frames_buf, fps=15, codec='libx264')
-        except Exception as e:
-            print(f"[EXCEPT][utils.py:294] {_tb.format_exc().splitlines()[-1]}", flush=True)
-            print(f'[demo] imageio write failed: {e}', flush=True)
+    elif frames_buf:
+        # v1.1.7a FIX-DEMO-WRITE: multi-level fallback; _iio only if _HAS_IIO=True
+        _wrote = False
+        if _HAS_IIO:
+            try:
+                _iio.mimwrite(video_path, frames_buf, fps=15)
+                _wrote = True
+            except Exception as _e_iio:
+                print(f"[EXCEPT][utils.py:294] {_tb.format_exc().splitlines()[-1]}", flush=True)
+                print(f'[demo] imageio write failed: {_e_iio}', flush=True)
+        if not _wrote:
+            try:
+                import subprocess as _sub, tempfile as _tf
+                _tdir = _tf.mkdtemp(prefix='demo_frames_')
+                import numpy as _np2
+                for _fi, _fr in enumerate(frames_buf):
+                    _h, _w = _fr.shape[:2]
+                    _pgm = _tf.os.path.join(_tdir, f'f{_fi:05d}.pgm') if hasattr(_tf, 'os') else __import__('os').path.join(_tdir, f'f{_fi:05d}.pgm')
+                    with open(__import__('os').path.join(_tdir, f'f{_fi:05d}.pgm'), 'wb') as _fp:
+                        _fp.write(f'P5\n{_w} {_h}\n255\n'.encode())
+                        _fp.write(_fr.tobytes())
+                _r = _sub.run(
+                    ['ffmpeg', '-y', '-framerate', '15',
+                     '-i', __import__('os').path.join(_tdir, 'f%05d.pgm'),
+                     '-c:v', 'libx264', '-pix_fmt', 'yuv420p', video_path],
+                    capture_output=True, timeout=60,
+                )
+                if _r.returncode == 0:
+                    _wrote = True
+                    print(f'[demo] ffmpeg wrote -> {video_path}', flush=True)
+                else:
+                    print(f'[demo] ffmpeg stderr: {_r.stderr.decode()[:300]}', flush=True)
+            except Exception as _ef:
+                print(f'[demo] ffmpeg fallback failed: {_ef}', flush=True)
+        if not _wrote:
+            import numpy as _npd
+            _np_path = video_path.replace('.mp4', '_frames.npy')
+            _npd.save(_np_path, _npd.array(frames_buf, dtype=_npd.uint8))
+            print(f'[demo] numpy frames saved -> {_np_path}', flush=True)
 
     demo_environment.close()
     if demo_progress is not None:
