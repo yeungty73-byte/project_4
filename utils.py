@@ -187,12 +187,25 @@ def _demo_obs_to_array(obs):
 
 
 def _demo_obs_to_frame(obs, H=120, W=160):
-    """Extract H×W grayscale frame from flat DeepRacer obs tensor."""
+    """Extract H×W grayscale camera frame from flat DeepRacer obs tensor.
+    
+    The DeepRacer gym FlattenObservation wrapper concatenates sub-obs in
+    sorted key order. The camera image (H*W floats, values 0–255) is always
+    the FIRST segment of the flat vector. Slicing flat[n:] (previously) was
+    grabbing lidar/physics floats near zero → white frames.
+    Fix: slice flat[:n] for the camera pixels.
+    """
     flat = _demo_obs_to_array(obs)
-    n = H * W  # 19200 floats = DeepRacer camera
+    n = H * W  # 19200 camera pixels
     if flat.size < n:
         return None
-    return flat[:n].reshape(H, W).astype(np.float32)
+    # Camera image is the FIRST n floats (values roughly 0-255).
+    # Normalize to [0,1] for uint8 conversion downstream.
+    frame = flat[:n].reshape(H, W).astype(np.float32)
+    # Values may be 0-255 range (raw uint8 cast to float) — normalize if needed
+    if frame.max() > 1.0:
+        frame = frame / 255.0
+    return frame
 
 
 def demo(
