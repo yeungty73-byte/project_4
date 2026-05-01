@@ -80,8 +80,12 @@ from utils import (
 )
 
 # v210: ContextAwarePPOAgent helpers
-def process_action(rawaction, actionspace):
-    """Squeeze batch dim; for Discrete → argmax-then-clamp; for Box → clip."""
+def process_action(rawaction, actionspace, shaper=None):
+    """Squeeze batch dim; for Discrete -> argmax-then-clamp; for Box -> clip.
+    shaper: optional ContextAwarePPOAgent / TPA instance; when present its
+    process_action_scale property caps the throttle output (phase speed cap).
+    Pass None to skip (safe default for demo/harvest contexts). v1.1.7a.
+    """
     a = np.asarray(rawaction)
     while a.ndim > 1 and a.shape[0] == 1:
         a = a[0]
@@ -89,10 +93,10 @@ def process_action(rawaction, actionspace):
     if isinstance(actionspace, gym.spaces.Discrete):
         # a might be logits (shape [n]) or a scalar index
         if a.ndim >= 1 and a.size == actionspace.n:
-            # logits → pick best action
+            # logits -> pick best action
             idx = int(np.argmax(a))
         else:
-            # already a scalar index — just clamp it
+            # already a scalar index -- just clamp it
             idx = int(np.round(a.item() if hasattr(a, 'item') else float(a)))
         return int(np.clip(idx, 0, actionspace.n - 1))
     else:
@@ -102,8 +106,14 @@ def process_action(rawaction, actionspace):
             a = np.array([float(a)])
         a = a.copy().astype(np.float32)
         if actdim >= 2 and a.size >= 2:
-            # remap throttle channel from tanh [-1,1] → env [0,1]
+            # remap throttle channel from tanh [-1,1] -> env [0,1]
             a[1] = (a[1] + 1.0) / 2.0
+            a[1] = max(0.0, float(a[1]))  # v1.1.2: hard floor -- car cannot drive backward
+        if shaper is not None and hasattr(shaper, 'process_action_scale'):
+            try:
+                a[1] = min(a[1], float(shaper.process_action_scale))
+            except Exception:
+                pass  # TPA unavailable; silently skip, no spam
         return np.clip(a, actionspace.low, actionspace.high).astype(np.float32)
 
 def compute_track_curvature(waypoints, closest, lookahead=5):
@@ -2936,8 +2946,71 @@ def run(hparams):
     jsonl_file.close()
     logger.info(f'Model {agent.name} saved. Training complete.')
     logger.info(f'JSONL metrics saved to {jsonl_path}')
-    env.close()
     writer.close()
+
+    # =========================================================================
+    # DEMO GENERATION  v1.1.7a  (grafted from run-2.py / PATCH-DEMO v1.1.6c)
+    # Runs AFTER training completes.  Generates one .mp4 per race type.
+    # REF: AWS. 2020. DeepRacer log analysis demo.
+    # =========================================================================
+    _DEMO_PHASES = [
+        ('reinvent2019wide', 'timetrial'),
+        ('reinvent2019wide', 'obstacle'),
+        ('reinvent2019wide', 'h2h'),
+    ]
+    _DEMO_ENV_INLINE = {
+        ('reinvent2019wide', 'timetrial'): ('reInvent2019wide', 'TIMETRIAL',       '0', '0', 'environment_params_tt_reinvent.yaml'),
+        ('reinvent2019wide', 'obstacle'):  ('reInvent2019wide', 'OBJECTAVOIDANCE', '6', '0', 'environment_params_oa.yaml'),
+        ('reinvent2019wide', 'h2h'):       ('reInvent2019wide', 'HEADTOBOT',       '0', '3', 'environment_params_h2h_reinvent.yaml'),
+        # whitespace-key aliases for any accidental trailing-space variants
+        ('reinvent2019wide ', 'timetrial'): ('reInvent2019wide', 'TIMETRIAL',       '0', '0', 'environment_params_tt_reinvent.yaml'),
+        ('reinvent2019wide ', 'obstacle'):  ('reInvent2019wide', 'OBJECTAVOIDANCE', '6', '0', 'environment_params_oa.yaml'),
+        ('reinvent2019wide ', 'h2h'):       ('reInvent2019wide', 'HEADTOBOT',       '0', '3', 'environment_params_h2h_reinvent.yaml'),
+    }
+
+    print("DEMO Closing training env before demo generation...", flush=True)
+    try:
+        env.close()
+        print("DEMO Training env closed OK.", flush=True)
+    except Exception:
+        print(f"[DEMO-EXCEPT][run.py:env_close] {tb.format_exc().splitlines()[-1]}", flush=True)
+
+    import time as _demo_time_mod
+    _demo_time_mod.sleep(2.0)           # allow ZMQ / Gazebo socket teardown
+    os.makedirs('./demos', exist_ok=True)
+
+    for _dp_track, _dp_variant in _DEMO_PHASES:
+        try:
+            print(f"[DEMO] Starting generation track={_dp_track} variant={_dp_variant}", flush=True)
+            _dpe = _DEMO_ENV_INLINE.get((_dp_track, _dp_variant))
+            if _dpe:
+                os.environ['WORLDNAME']         = _dpe[0]
+                os.environ['RACETYPE']          = _dpe[1]
+                os.environ['NUMBEROFOBSTACLES'] = _dpe[2]
+                os.environ['NUMBEROFBOTCARS']   = _dpe[3]   # FIX-v1.1.7a: was BOTCARS (no underscore)
+                try:
+                    import utils as _du
+                    _du.ENVIRONMENT_PARAMS_PATH = os.path.join(
+                        os.path.dirname(os.path.abspath(__file__)), 'configs', _dpe[4]
+                    )
+                except Exception as _upe:
+                    logger.warning(f"[DEMO] utils.ENVIRONMENT_PARAMS_PATH patch failed: {_upe}")
+            else:
+                logger.warning(
+                    f"[DEMO] no env-map for {_dp_track}/{_dp_variant} -- using last training env vars"
+                )
+
+            _demo_pp   = lambda _raw, _asp: process_action(_raw, _asp, None)
+            _demo_path = demo(
+                agent,
+                environment_name='deepracer-v0',   # v1.1.7c FIX-ENV-NAME: ENVIRONMENT_NAME not
+                directory='./demos',               #   in run() scope; deepracer-v0 is gym reg ID
+                action_post_processor=_demo_pp,
+            )
+            print(f"[DEMO] {_dp_variant} video -> {_demo_path}", flush=True)
+        except Exception as _de:
+            print(f"[DEMO-EXCEPT][run.py:demo_loop] {tb.format_exc()}", flush=True)
+            logger.warning(f"[DEMO] Failed for {_dp_track}/{_dp_variant}: {_de}")
     # Shutdown dashboard
     try:
         if '_dash_proc' in dir() and _dash_proc:
