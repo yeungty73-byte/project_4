@@ -137,7 +137,7 @@ def get_race_type(
     count-based logic for backwards compatibility.
 
     Original code silently ignored RACE_TYPE and would raise ValueError for
-    any bot-car count other than exactly 3 — crashing eval for h2b.yaml
+    any bot-car count other than exactly 3 -- crashing eval for h2b.yaml
     which had NUMBER_OF_BOT_CARS: 4.
     """
     with open(environment_params_path, 'r') as f:
@@ -187,12 +187,12 @@ def _demo_obs_to_array(obs):
 
 
 def _demo_obs_to_frame(obs, H=120, W=160):
-    """Extract H×W grayscale camera frame from flat DeepRacer obs tensor.
-    
+    """Extract H*W greyscale camera frame from flat DeepRacer obs tensor.
+
     The DeepRacer gym FlattenObservation wrapper concatenates sub-obs in
-    sorted key order. The camera image (H*W floats, values 0–255) is always
+    sorted key order. The camera image (H*W floats, values 0-255) is always
     the FIRST segment of the flat vector. Slicing flat[n:] (previously) was
-    grabbing lidar/physics floats near zero → white frames.
+    grabbing lidar/physics floats near zero -> white frames.
     Fix: slice flat[:n] for the camera pixels.
     """
     flat = _demo_obs_to_array(obs)
@@ -202,10 +202,24 @@ def _demo_obs_to_frame(obs, H=120, W=160):
     # Camera image is the FIRST n floats (values roughly 0-255).
     # Normalize to [0,1] for uint8 conversion downstream.
     frame = flat[:n].reshape(H, W).astype(np.float32)
-    # Values may be 0-255 range (raw uint8 cast to float) — normalize if needed
+    # Values may be 0-255 range (raw uint8 cast to float) -- normalize if needed
     if frame.max() > 1.0:
         frame = frame / 255.0
     return frame
+
+
+def _set_env_demo_mode(env, blend: float = 1.0):
+    """Safely call set_demo_mode on env or any wrapped layer.
+
+    Handles RecordEpisodeStatistics(FlattenObservation(DeepracerGymEnv))
+    wrapper stack produced by make_environment().
+    """
+    target = env
+    while target is not None:
+        if hasattr(target, 'set_demo_mode'):
+            target.set_demo_mode(blend=blend)
+            return
+        target = getattr(target, 'env', None)
 
 
 def demo(
@@ -216,16 +230,18 @@ def demo(
     ):
     """Export a demo .mp4 after training.
 
-    PATCH-DEMO v1.1.6c (2026-04-29).
+    PATCH-DEMO v1.1.7a.
     Fixes vs original utils.demo:
       DEMO-1: DeepRacer gym has no render_mode='rgb_array'; RecordVideo gave empty files.
-              Fix: capture frames from obs tensor (120×160 greyscale camera feed).
+              Fix: capture frames from obs tensor (120x160 greyscale camera feed).
       DEMO-2: process_action throttle remap was skipped so car reversed.
               Fix: accept action_post_processor kwarg (set to run.process_action).
       DEMO-3: ContextAwarePPOAgent.get_action needs context label.
               Fix: fallback ctx=zeros(1) on TypeError.
       DEMO-4: demo_progress was accessed before assignment when PROGRESS_MANAGER=None.
               Fix: guarded with is not None checks throughout.
+      DEMO-5: v1.1.7a FIX-DEMO-ARBITER: call _set_env_demo_mode(blend=1.0) after reset
+              so DeepracerGymEnv._arbiter_blend=1.0 activates RaceLineArbiter for demo.
     """
     import numpy as _npd
     try:
@@ -246,9 +262,11 @@ def demo(
     agent.eval().to(demo_device)
     os.makedirs(directory, exist_ok=True)
 
-    # No render_mode — DeepRacer gym does not support 'rgb_array'
+    # No render_mode -- DeepRacer gym does not support 'rgb_array'
     demo_environment = make_environment(environment_name)
     observation, _ = demo_environment.reset()
+    # v1.1.7a FIX-DEMO-ARBITER: enable race-line arbiter at full authority
+    _set_env_demo_mode(demo_environment, blend=1.0)
 
     video_path = os.path.join(directory, f'{world_name}-{race_type}-{agent.name}.mp4')
     frame_h, frame_w = 120, 160
@@ -309,6 +327,8 @@ def demo(
         if terminated or truncated:
             # v1.1.7a FIX-DEMO-RESET: reset instead of break so we capture full MAX_DEMO_STEPS
             observation, _ = demo_environment.reset()
+            # v1.1.7a: re-enable demo mode after mid-episode reset
+            _set_env_demo_mode(demo_environment, blend=1.0)
 
     if _HAS_CV2 and vid_writer is not None:
         vid_writer.release()
@@ -357,9 +377,9 @@ def demo(
         demo_progress.close()
 
     if frames_written == 0:
-        print(f'[demo] WARNING: No frames captured → {video_path}', flush=True)
+        print(f'[demo] WARNING: No frames captured -> {video_path}', flush=True)
     else:
-        print(f'[demo] Saved {frames_written}-frame video → {video_path}', flush=True)
+        print(f'[demo] Saved {frames_written}-frame video -> {video_path}', flush=True)
 
     try:
         clear_output(wait=True)
@@ -692,7 +712,7 @@ def plot_metrics(
         ax3 = axes[3]
         sigma2 = np.std(resid_c) * 2
         ax3.plot(x, resid_c, linewidth=0.6, color=TERRA_COTTA, alpha=0.7)
-        ax3.axhline(sigma2, color=MUTED_PURPLE, linewidth=0.8, linestyle=":", label="+2σ")
+        ax3.axhline(sigma2, color=MUTED_PURPLE, linewidth=0.8, linestyle=":", label="+2s")
         ax3.axhline(-sigma2, color=MUTED_PURPLE, linewidth=0.8, linestyle=":")
         ax3.axhline(0, color=MUTED_GRAY, linewidth=0.5, linestyle="--")
         ax3.fill_between(x, -sigma2, sigma2, alpha=0.06, color=MUTED_PURPLE)
