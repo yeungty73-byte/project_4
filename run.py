@@ -6,6 +6,7 @@ import math, socket, hashlib
 import sys; sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.dirname(__import__('os').path.abspath(__file__))))
 import yaml
 import time
+import traceback as tb
 import signal
 import torch
 import os
@@ -77,6 +78,7 @@ from utils import (
     BSTSTracker,          # AWS. (2020). DeepRacer log analysis
     ReplayBuffer,         # Fujimoto, S. et al. (2018). ICML
     make_environment,
+    demo,                 # PATCH-DEMO v1.1.6c — generates .mp4 after training
 )
 
 # v210: ContextAwarePPOAgent helpers
